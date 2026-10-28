@@ -7,7 +7,7 @@ description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinh
 
 Hedgehood runs one `CashOptionMarketV2` per tokenized stock on Robinhood Chain (testnet 46630 now, mainnet 4663 after
 audit). Instruments are European calls and puts, cash-settled in USDG at the 16:00 New York close of a weekday, strikes on
-a fixed grid around the price when the expiry was opened. There is no order book to watch: the agent asks the maker for a
+a fixed grid of listed per-share strikes around the price when the expiry was opened. There is no order book to watch: the agent asks the maker for a
 firm quote (RFQ), receives a signed order addressed to its account that lives for seconds, and fills it on chain from its
 session key. Collateral is the worst case of the position inside the expiry's price band (no liquidations, no margin
 calls); longs post nothing but the premium, short legs lock their worst case.
@@ -16,17 +16,27 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 
 ## The loop
 
-1. **Keys.** The *owner* wallet holds the funds and signs rarely: `authorizeSession(sessionKey, expiresAt, scope, maxRequirement)`
-   once, deposits, withdrawals. The *session key* lives on the agent's machine (`HEDGEHOOD_SESSION_KEY_FILE`, chmod 600) and
-   can only trade and cancel for the account; it can never withdraw, change sessions or receive funds. Prefer a
-   `maxRequirement` cap so a runaway agent can lock at most that much collateral.
+1. **Keys.** The *owner* wallet holds the funds and signs rarely: `authorizeSession(sessionKey, expiresAt, scope,
+   maxRequirement, maxSpend)` once, deposits, withdrawals. The *session key* lives on the agent's machine
+   (`HEDGEHOOD_SESSION_KEY_FILE`, chmod 600) and can only trade and cancel for the account; it can never withdraw, change
+   sessions or receive funds. Its reach is bounded on chain:
+   - `maxSpend` (required): the total premium + fees the key may make the account pay over the session; each buy
+     decrements `spendLeft`. `0` = it cannot buy at all; `unlimited` = `type(uint256).max`. Suggest a budget (e.g. 100
+     USDG, at most the deposit) rather than unlimited.
+   - `maxRequirement`: the account's total collateral requirement a session trade may push it to. `0` (the kit's
+     default) = no new requirement, i.e. the key can buy and close but not write options; `unlimited` = no cap.
+   - every leg it signs or takes settles in balance mode (never the account's wallet).
+   It can still sell longs the account holds at the price it accepts: hand it only to an agent trusted with the balance.
+   Re-authorizing (rotate, extend, top up the budget) resets `spendLeft` and voids every order the key signed before.
 2. **Deposit.** USDG goes into the market balance (`deposit(account, amount)` by the owner wallet, or the x402 gateway:
    tool `deposit_x402`). In balance mode the agent never needs an ERC-20 approval.
 3. **Quote.** `get_quote(instrument, side, quantity)` returns a verified quote: price per share, premium, taker fee
    (50 bps of the premium, rounded up), seconds left, `canFill`, and a `digest`. Quotes decay linearly between
    `startTime` and `validUntil`; the contract evaluates the premium at the fill block.
 4. **Fill.** `fill_quote(digest, confirm: true)` simulates (dry run) and, with `dryRun: false`, sends
-   `fillOrderAs(account, order, sig, qty, fromBalance = true)` from the session key. The tool returns the tx hash.
+   `fillOrderAs(account, order, sig, qty, fromBalance = true)` from the session key. The tool returns the tx hash. A
+   session key always fills with `fromBalance = true` (the market reverts `SessionWalletMode` otherwise); a buy's premium
+   + fee comes out of the session's `spendLeft`.
 5. **Watch.** `positions` is the ACTIVE book: every open position with quantity, average entry price, the desk's mark,
    unrealized P&L and time to expiry. `get_pnl` gives the totals (realized / unrealized / fees / total); `get_history` is
    the PAST: fills, settlements and redeems, newest first.
@@ -41,9 +51,14 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 ## Using the tools well
 
 - Start with `list_markets` (addresses, open expiries, strikes, fee) and `positions` (balance, free collateral, session
-  status). If `session.active` is false, stop: the owner must `authorize_session` first.
-- Instruments are named `NVDA-20261030-220-C` (New York date, USD strike, C/P); ids pack `(expiry << 96) | (strike << 1) |
-  isPut`. `list_instruments` gives both; `decode_instrument` reverses an id. `get_mark` says whether the desk is quoting
+  status: `spendLeft`, `maxRequirement`, `authorizedAt`). If `session.active` is false, stop: the owner must
+  `authorize_session` first. If `spendLeft` is below what a buy costs, the fill reverts `SessionLimit`: ask the owner.
+- Instruments are named `NVDA-20261030-220-C` (New York date, **listed per-share** strike, C/P). Ids pack `(expiry << 96) |
+  (strike << 1) | isPut` with the strike per token: the market stores `round(shareStrike x M / 1e18)`, M being the
+  token's `uiMultiplier` snapshotted when the expiry opened. With M = 1 the two are equal; NVDA on mainnet has M =
+  1.000775…, so the 220 strike is stored as 220.170535 per token. Always talk and trade in the listed strike; the tools
+  map names, `expiry + strike + kind` and ids for you. `list_instruments` gives names, ids and both strikes;
+  `decode_instrument` reverses an id. `get_mark` says whether the desk is quoting
   (`executable`); outside the listed US session it is not.
 - A quote with `backendDryRun` / `fillable: false` comes from a desk running without its signer key (testnet today): read
   it, do not try to fill it.
@@ -178,12 +193,14 @@ shown only as set/missing.
 
 | symptom | meaning | do |
 |---|---|---|
-| `NotAuthorizedSigner` | session not authorized, expired or revoked for this account | owner runs `authorize_session` (check `HEDGEHOOD_ACCOUNT` is the owner address, not the session address) |
-| `SessionLimit` | the fill would push the requirement above the session's `maxRequirement` | smaller size, or owner raises the cap |
+| `NotAuthorizedSigner` | session not authorized, expired or revoked for this account, or an order signed before the session was re-authorized | owner runs `authorize_session` (check `HEDGEHOOD_ACCOUNT` is the owner address, not the session address); quote again |
+| `SessionLimit` | the premium + fee exceeds the session's `spendLeft` (0 = it cannot buy), or the fill would push the requirement above `maxRequirement` (0 = no new requirement) | check `positions` -> `session`; smaller size, or the owner re-authorizes with a larger `maxSpend` / `maxRequirement` |
+| `SessionWalletMode` | a session-key leg was sent in wallet mode (`fromBalance = false`) | fill in balance mode (the kit's default; `close_position` forces it for a session key) |
 | `InsufficientCollateral` | balance below premium + fee (buy) or below the new requirement (sell) | `deposit_x402` / owner deposit |
 | `WrongTaker` | quote addressed to another account | your `HEDGEHOOD_ACCOUNT` differs from what `get_quote` sent; fix config, quote again |
 | `OrderExpired` | `validUntil` passed before the tx mined | quote again, fill faster, or ask for a longer `ttlSeconds` |
-| `TradingUnavailable` | within 15 min of expiry, market paused, or the stock token's multiplier changed | wait for the next expiry |
+| `TradingUnavailable` | within 15 min of expiry, market paused, or the quote was written under another `uiMultiplier` than the live one | quote again; near expiry, wait for the next one |
+| `StockMultiplierChanged` | the token's `uiMultiplier` moved more than 1% from the expiry's snapshot (a split) | that expiry no longer trades; the owner settles it |
 | `canFill: false` with `shortfall` | the maker predicts a revert | deposit the shortfall first |
 | `unknown digest` | the server restarted or the quote was never fetched here | `get_quote` again |
 | `not_executable:feed_not_healthy` after the built-in retry | the desk's pricing feed is between cycles (20 s) | wait 20 s, quote or close again |

@@ -1,6 +1,6 @@
 import type { Address } from "viem";
 import type { TxRequest } from "./calldata.js";
-import { decodeInstrumentId, instrumentName } from "./instrument.js";
+import { expiryOf, instrumentNameOf } from "./instrument.js";
 import type { MarketClient, Position, SendResult } from "./market.js";
 import type { RfqClient, VerifiedQuote } from "./rfq.js";
 
@@ -18,7 +18,10 @@ export interface CloseRequest {
   instrumentId: bigint;
   /** Shares to close (1e18); default and upper bound: the whole position. */
   quantityRaw?: bigint;
-  /** Settle premium, fee and collateral inside the deposited balance (default true, as the fill path). */
+  /**
+   * Settle premium, fee and collateral inside the deposited balance (default true, as the fill path). A session key
+   * must keep it true (the market reverts `SessionWalletMode`); false is only for a signer that is the account itself.
+   */
   fromBalance?: boolean;
   /** The session key that will send the fill, for the desk's SessionLimit preview. */
   sessionKey?: Address;
@@ -60,8 +63,8 @@ export async function planClose(req: CloseRequest): Promise<ClosePlan> {
   if (!account) throw new Error("no account configured (pass `account` or a signer)");
   const underlying = market.deployment.underlying;
   const position = await positionOf(market, req.instrumentId, account);
-  const d = decodeInstrumentId(req.instrumentId);
-  const name = instrumentName(underlying, d.expiry, d.strike, d.isPut);
+  const uiMultiplier = position?.uiMultiplier ?? (await market.expiryMultiplier(expiryOf(req.instrumentId)));
+  const name = instrumentNameOf(req.instrumentId, underlying, uiMultiplier);
   if (!position || position.quantityRaw === 0n) throw new Error(`no open position in ${name} for ${account}; nothing to close`);
   const size = position.quantityRaw < 0n ? -position.quantityRaw : position.quantityRaw;
   if (req.quantityRaw !== undefined && req.quantityRaw <= 0n) throw new RangeError("quantity to close must be positive");
@@ -69,7 +72,7 @@ export async function planClose(req: CloseRequest): Promise<ClosePlan> {
   const side: "buy" | "sell" = position.quantityRaw > 0n ? "sell" : "buy";
   const protocolFeeBps = req.protocolFeeBps ?? (await market.protocolFeeBps());
   const quote = await rfq.getQuote(
-    { chainId: market.chainId, market: market.market, instrumentId: req.instrumentId, side, quantityRaw, taker: account, sessionKey: req.sessionKey, underlying },
+    { chainId: market.chainId, market: market.market, instrumentId: req.instrumentId, side, quantityRaw, taker: account, sessionKey: req.sessionKey, underlying, uiMultiplier },
     { orderBook: market.orderBook, protocolFeeBps },
   );
   const request = market.fillOrderAs(quote.order, quote.signature, quantityRaw, req.fromBalance ?? true, account);

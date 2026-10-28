@@ -156,9 +156,14 @@ describe("premium decay (currentPremiumRaw)", () => {
     expect(currentPremiumRaw(risingBid, t)).toBe(4_500_000n + 58_333n); // bid: rise rounded down
   });
 
-  it("pro rata premium rounds up and the taker fee rounds up", () => {
+  it("pro rata premium rounds up for an ask, down for a bid; the taker fee rounds up", () => {
     const half = 5n * 10n ** 17n;
     expect(premiumFor(fixtureOrder, half, 1761600007n)).toBe((5_000_000n - 58_333n + 1n) / 2n); // 4941667 / 2 = 2470833.5 -> 2470834
+    const flatBid = { ...fixtureOrder, side: Side.Bid, premiumStartRaw: 5_000_001n, premiumEndRaw: 5_000_001n };
+    expect(premiumFor(flatBid, half, 1761600007n)).toBe(2_500_000n); // 2500000.5 -> floor (an ask: 2500001)
+    expect(premiumFor({ ...flatBid, side: Side.Ask }, half, 1761600007n)).toBe(2_500_001n);
+    // three split fills of a bid never pay more than its signed total
+    expect(premiumFor(flatBid, 10n ** 18n / 3n, 0n) * 3n).toBeLessThanOrEqual(5_000_001n);
     expect(takerFeeFor(2_470_834n, 50)).toBe(12_355n); // 12354.17 -> ceil
     expect(() => premiumFor(fixtureOrder, 0n, 0)).toThrow();
     expect(() => premiumFor(fixtureOrder, 2n * 10n ** 18n, 0)).toThrow();
@@ -173,5 +178,8 @@ describe("orderProblems", () => {
     expect(orderProblems(fixtureOrder, { now: 1761600060 })).toContain("order expired (validUntil passed)");
     expect(orderProblems({ ...fixtureOrder, validUntil: EXPIRY + 1n })).toContain("validUntil after the instrument's expiry");
     expect(orderProblems({ ...fixtureOrder, startTime: fixtureOrder.validUntil })).toContain("decay window invalid (startTime >= validUntil)");
+    // signer != maker (a session key) in wallet mode: the market reverts SessionWalletMode
+    expect(orderProblems({ ...fixtureOrder, fromBalance: false })).toContain("session-signed order is not fromBalance (the market reverts SessionWalletMode)");
+    expect(orderProblems({ ...fixtureOrder, signer: fixtureOrder.maker, fromBalance: false })).toEqual([]);
   });
 });

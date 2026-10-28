@@ -16,7 +16,9 @@ hedgehood close --all [--send]               # flatten every open position
 hedgehood deposit 100 --x402 [--send]        # or --wallet (owner key: approve + deposit)
 hedgehood redeem <expiry> [--send]
 hedgehood withdraw 50 [--to 0x..] [--send]   # owner key
-hedgehood session authorize|revoke|status
+hedgehood session authorize --max-spend 100 [--max-requirement 0|<usdg>|unlimited] [--send]   # owner key; --max-spend required
+hedgehood session status                     # expiry, authorizedAt, spendLeft, maxRequirement
+hedgehood session revoke <key> [--send]
 hedgehood register --name "my-agent"         # ERC-8004, mainnet, owner key
 
 # Stock Yield vaults (owner key; requests queue until the next epoch freeze, a redeem can take up to a week)
@@ -28,7 +30,9 @@ hedgehood --mainnet vault claim --vault hhNVDA-CC [--to 0x..] [--send]
 hedgehood --mainnet vault cancel deposit|redeem --vault hhNVDA-CC [--send]
 ```
 
-Instruments: a backend name (`NVDA-20261030-220-C`), a packed id, or `expiry:strike:call|put`. Vaults: an address, a
+Instruments: a backend name (`NVDA-20261030-220-C`), a packed id, or `expiry:strike:call|put`; strikes are the listed
+per-share strikes (mapped to the per-token strike in the id with the expiry's `uiMultiplier`). A session key fills in
+balance mode only and its buys come out of the session's spend budget (`SessionLimit` when exhausted). Vaults: an address, a
 share symbol (`hhNVDA-CC`, `NVDA-CC`) or a ticker that names one fund (`GOOGL`).
 Global options: `--testnet` (default) | `--mainnet` | `--chain <id>`, `--rpc`, `--rfq-url`, `--indexer-url`, `--gateway-url`,
 `--vault-api-url <url|off>`, `--account <owner>`, `--underlying NVDA`, `--session-key-file`, `--owner-key-file`, `--json`.

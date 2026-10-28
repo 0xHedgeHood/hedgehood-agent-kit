@@ -29,8 +29,10 @@ RFQ maker and filled on chain with a **session key that can never withdraw**.
 npx @hedgehood-io/cli join
 #    -> prints the session address and the `authorizeSession` call the OWNER wallet must make
 
-# 2. owner wallet (anywhere): authorize the session and deposit tUSDG
-cast send 0xC289617d613C9865a6595B365DaD88277282e0Ac 'authorizeSession(address,uint64,uint256,uint256)' <session> <expiresAt> 3 0 --rpc-url https://rpc.testnet.chain.robinhood.com
+# 2. owner wallet (anywhere): authorize the session with a spend budget (here 100 USDG of premium + fees) and deposit tUSDG
+cast send <market> 'authorizeSession(address,uint64,uint256,uint256,uint256)' <session> <expiresAt> 3 0 100000000 --rpc-url https://rpc.testnet.chain.robinhood.com
+#    (scope 3 = trade + cancel; maxRequirement 0 = the key cannot write options; maxSpend 100 USDG raw; or, with the
+#    owner key on this machine: `hedgehood session authorize --max-spend 100 --send`)
 cast send 0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d 'approve(address,uint256)' 0xC289617d613C9865a6595B365DaD88277282e0Ac 100000000 --rpc-url ...
 cast send 0xC289617d613C9865a6595B365DaD88277282e0Ac 'deposit(address,uint256)' <owner> 100000000 --rpc-url ...
 #    (or, once the gateway is up: `hedgehood deposit 100 --x402 --send` from the owner key)
@@ -156,11 +158,20 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
   the account in the `EpochFund`; only the account (or a position manager it approved on chain) can redeem, cancel or
   claim, so every vault write is sent from the owner key, never from a session key.
 - **Session keys.** The agent's key is authorized by the owner with `authorizeSession(key, expiresAt, scope,
-  maxRequirement)`: it can sign and take orders and cancel, for one account, until `expiresAt`, and may not push the
-  account's total collateral requirement above `maxRequirement`. It cannot withdraw, deposit from the account, change
-  sessions or receive funds. `revokeSession` is immediate and voids every unfilled order the key signed.
+  maxRequirement, maxSpend)`: it can sign and take orders and cancel, for one account, until `expiresAt`. `maxSpend` is
+  the total premium + fees it may make the account pay over the session (0 = it cannot buy; `type(uint256).max` =
+  unlimited; the kit requires an explicit value, `--max-spend <usdg|unlimited>`); `maxRequirement` caps the account's
+  total collateral requirement after a session trade (0, the kit's default = no new requirement, it cannot write
+  options; max = unlimited). It cannot withdraw, deposit from the account, change sessions or receive funds. Re-authorizing
+  resets the budget and voids every order the key signed before; `revokeSession` is immediate and voids every unfilled
+  order the key signed.
 - **Balance mode.** Fills settle premium, fee and collateral inside the deposited balance (`fillOrderAs(..., fromBalance =
-  true)`): no ERC-20 approvals, nothing is ever pulled from a wallet; a shortfall reverts.
+  true)`): no ERC-20 approvals, nothing is ever pulled from a wallet; a shortfall reverts. A session key can only fill
+  this way (the market reverts `SessionWalletMode` on a session leg in wallet mode), and the kit refuses or forces
+  `fromBalance = false` from a session key before anything is sent.
+- **Listed strikes.** Names (`NVDA-20261030-220-C`) carry the listed per-share strike; the id packs the per-token strike
+  the market stores, `round(shareStrike x uiMultiplier / 1e18)` with the multiplier the expiry snapshotted (NVDA mainnet
+  1.000775…: 220 is stored as 220.170535). The kit maps between the two with the expiry's `uiMultiplier`.
 - **Dry run by default.** Every send in the SDK, CLI and MCP server simulates and returns the unsigned transaction unless
   told to broadcast (`--send`, `dryRun: false`). Keys are read from files (`chmod 600` enforced) and never logged.
 - **Closing = the opposite fill.** `closePosition` / `hedgehood close` / `close_position` never use a special path: they
@@ -176,8 +187,11 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
 
 ## What it talks to
 
-- Contracts: `CashOptionMarketV2` + `CashOptionOrderBookV2` (hedgehood-options, branch `feat/market-v2-derive-style`,
-  commit `131c1ae`). ABIs are vendored in `packages/sdk/src/abi/` (ABI only; the contract sources are not in this repo).
+- Contracts: `CashOptionMarketV2` + `CashOptionOrderBookV2` (hedgehood-options PR #54, branch `contracts/audit-fixes-v2`,
+  commit `aa47f7f`: session spend budget, listed per-share grid, multiplier tolerance). ABIs are vendored in
+  `packages/sdk/src/abi/` (ABI only; the contract sources are not in this repo). The testnet market below was deployed
+  from the earlier `131c1ae` build: until it is redeployed from `aa47f7f`, session reads and `authorizeSession` from this
+  kit do not match it.
   Instrument id `= (expiry << 96) | (strike << 1) | isPut`; EIP-712 domain `CashOptionOrderBook` v`2`; the order struct
   string is tested against the contract's `ORDER_TYPEHASH`.
 - Testnet 46630 (RPC `https://rpc.testnet.chain.robinhood.com`): market `0xC289617d613C9865a6595B365DaD88277282e0Ac`,

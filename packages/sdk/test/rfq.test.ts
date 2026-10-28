@@ -107,10 +107,20 @@ describe("instrument names (backend convention)", () => {
     expect(expiryDateNY(EXPIRY)).toBe("20261030");
     expect(instrumentName("nvda", EXPIRY, 220_000_000n, false)).toBe(NAME);
     expect(instrumentName("NVDA", EXPIRY, 222_500_000n, true)).toBe("NVDA-20261030-222.5-P");
-    expect(parseInstrumentName("NVDA-20261030-222.5-P")).toEqual({ underlying: "NVDA", date: "20261030", strikeRaw: 222_500_000n, isPut: true });
+    expect(parseInstrumentName("NVDA-20261030-222.5-P")).toEqual({ underlying: "NVDA", date: "20261030", shareStrikeRaw: 222_500_000n, isPut: true });
     expect(resolveInstrumentName(NAME, [1792785600n, EXPIRY])).toBe(INSTRUMENT);
     expect(() => resolveInstrumentName(NAME, [1792785600n])).toThrow(/no opened expiry/);
     expect(() => parseInstrumentName("NVDA 220 C")).toThrow(/look like/);
+  });
+
+  it("requests a quote by the listed per-share strike under the expiry's uiMultiplier", async () => {
+    const M = 1_000_775_159_164_630_595n; // NVDA mainnet
+    const id = encodeInstrumentId(EXPIRY, 220_170_535n, false); // round(220e6 x M / 1e18)
+    const { client, calls } = clientWith({ ok: true });
+    await client.requestQuote({ ...req, instrumentId: id, uiMultiplier: M, underlying: "NVDA" });
+    await client.mark({ instrumentId: id, underlying: "NVDA", uiMultiplier: M });
+    expect(calls[0]!.body).toMatchObject({ instrument: NAME });
+    expect(calls[1]!.url.searchParams.get("instrument")).toBe(NAME);
   });
 
   it("sharesDecimal renders 18-decimal raw as the backend's decimal shares", () => {

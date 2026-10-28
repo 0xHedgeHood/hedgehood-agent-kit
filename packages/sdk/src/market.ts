@@ -25,7 +25,8 @@ import {
   type TxRequest,
 } from "./calldata.js";
 import { chains, getDeployment, getMarket, type MarketDeployment } from "./chains.js";
-import { decodeInstrumentId, encodeInstrumentId } from "./instrument.js";
+import { decodeMarketError, MarketRevertError } from "./errors.js";
+import { decodeInstrumentId, encodeInstrumentId, expiryDateNY, expiryOf, instrumentNameOf, parseInstrumentName, resolveInstrumentName, shareStrikeOf, UNIT_MULTIPLIER } from "./instrument.js";
 import { orderToTuple, SCOPE_CANCEL, SCOPE_TRADE, type Order } from "./order.js";
 import { sendTxRequest, type SendResult } from "./send.js";
 
@@ -54,14 +55,22 @@ export interface ExpiryInfo {
   capHigh: bigint;
   settlementPrice: bigint;
   rawSettlementPrice: bigint;
+  /** Per-token strikes (USDG raw per 1e18 token units), as stored and as packed into instrument ids. */
   strikes: bigint[];
+  /** The listed per-share strikes, `shareStrikeOf(strike, uiMultiplier)`, in the same order. */
+  shareStrikes: bigint[];
   tradingOpen: boolean;
 }
 
 export interface Position {
   instrumentId: bigint;
   expiry: bigint;
+  /** Per-token strike, as in the instrument id. */
   strike: bigint;
+  /** The listed per-share strike (what names and labels show). */
+  shareStrike: bigint;
+  /** The expiry's snapshotted uiMultiplier. */
+  uiMultiplier: bigint;
   isPut: boolean;
   /** 18-decimal shares, negative = short. */
   quantityRaw: bigint;
@@ -77,14 +86,41 @@ export interface AccountSnapshot {
   positions: Position[];
 }
 
+/** `type(uint256).max`: the "unlimited" value of a session's maxRequirement / maxSpend. */
+export const UNLIMITED = (1n << 256n) - 1n;
+
 export interface SessionInfo {
   key: Address;
   expiresAt: bigint;
+  /** When the session was (re-)authorized: orders the key signed with an earlier startTime are void. */
+  authorizedAt: bigint;
   scope: bigint;
+  /** Cap on the account's total requirement a session trade may push it to: 0 = no new requirement, UNLIMITED = no cap. */
   maxRequirement: bigint;
+  /** Premium + fee (USDG raw) the key may still make the account pay as buyer: 0 = cannot buy, UNLIMITED = no cap. */
+  spendLeft: bigint;
   canTrade: boolean;
   canCancel: boolean;
   active: boolean;
+}
+
+/** A session cap for display: "unlimited", "none (0)" or the USDG amount. */
+export function formatSessionCap(raw: bigint): string {
+  if (raw === UNLIMITED) return "unlimited";
+  if (raw === 0n) return "none (0)";
+  const whole = raw / 1_000_000n;
+  const frac = (raw % 1_000_000n).toString().padStart(6, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : whole.toString();
+}
+
+/** Options of `authorizeSession`; both caps are explicit because 0 means "none", not "unlimited". */
+export interface AuthorizeSessionOptions {
+  trade?: boolean;
+  cancel?: boolean;
+  /** USDG raw cap on the account's total requirement after a session trade: 0 = no new requirement (default), UNLIMITED = no cap. */
+  maxRequirement?: bigint;
+  /** USDG raw premium + fee the key may make the account pay over the session: 0 = it cannot buy, UNLIMITED = no cap. Required. */
+  maxSpend: bigint;
 }
 
 export type { SendResult } from "./send.js";
@@ -99,6 +135,8 @@ export class MarketClient {
   readonly account: Address | undefined;
   readonly usdg: Address;
   readonly rpcUrl: string;
+  /** Snapshotted uiMultiplier per opened expiry (immutable once the expiry is open). */
+  private readonly multipliers = new Map<bigint, bigint>();
 
   constructor(opts: MarketClientOptions) {
     this.chainId = opts.chainId;
@@ -145,6 +183,7 @@ export class MarketClient {
       this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "expiryInfo", args: [expiry] }),
       this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "tradingOpen", args: [expiry] }),
     ]);
+    if (BigInt(e.openedAt) !== 0n && e.uiMultiplier !== 0n) this.multipliers.set(expiry, e.uiMultiplier);
     return {
       expiry,
       openedAt: BigInt(e.openedAt),
@@ -157,8 +196,34 @@ export class MarketClient {
       settlementPrice: e.settlementPrice,
       rawSettlementPrice: e.rawSettlementPrice,
       strikes: [...e.strikes],
+      shareStrikes: e.strikes.map((k) => shareStrikeOf(k, e.uiMultiplier === 0n ? UNIT_MULTIPLIER : e.uiMultiplier)),
       tradingOpen: open,
     };
+  }
+
+  /** The uiMultiplier an opened expiry snapshotted (cached; 1e18 for an expiry that is not open). */
+  async expiryMultiplier(expiry: bigint): Promise<bigint> {
+    const hit = this.multipliers.get(expiry);
+    if (hit !== undefined) return hit;
+    const info = await this.expiryInfo(expiry);
+    return info.openedAt === 0n || info.uiMultiplier === 0n ? UNIT_MULTIPLIER : info.uiMultiplier;
+  }
+
+  /** Backend name of an instrument (`NVDA-20261030-220-C`) with the listed per-share strike of its expiry. */
+  async instrumentName(instrumentId: bigint): Promise<string> {
+    return instrumentNameOf(instrumentId, this.deployment.underlying, await this.expiryMultiplier(expiryOf(instrumentId)));
+  }
+
+  /**
+   * A backend name (`NVDA-20261030-220-C`, per-share strike) to a packed id: finds the opened expiry of that New York
+   * date and maps the per-share strike to the per-token strike it lists (see `resolveInstrumentName`).
+   */
+  async resolveInstrumentName(text: string): Promise<bigint> {
+    const p = parseInstrumentName(text);
+    const expiry = (await this.openedExpiries()).find((e) => expiryDateNY(e) === p.date);
+    if (expiry === undefined) throw new RangeError(`no opened expiry on ${p.date}`);
+    const info = await this.expiryInfo(expiry);
+    return resolveInstrumentName(text, [{ expiry, uiMultiplier: info.uiMultiplier === 0n ? UNIT_MULTIPLIER : info.uiMultiplier, strikes: info.strikes }]);
   }
 
   /** Every instrument id of an expiry: calls then puts per strike, in strike order. */
@@ -187,28 +252,33 @@ export class MarketClient {
     ]);
     const positions: Position[] = [];
     for (const expiry of expiries) {
-      const [strikes, q] = await Promise.all([
-        this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "strikesOf", args: [expiry] }),
+      const [e, q] = await Promise.all([
+        this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "expiryInfo", args: [expiry] }),
         this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "positions", args: [account, expiry] }),
       ]);
-      strikes.forEach((strike, i) => {
+      const uiMultiplier = e.uiMultiplier === 0n ? UNIT_MULTIPLIER : e.uiMultiplier;
+      this.multipliers.set(expiry, uiMultiplier);
+      e.strikes.forEach((strike, i) => {
         const call = q[2 * i] ?? 0n;
         const put = q[2 * i + 1] ?? 0n;
-        if (call !== 0n) positions.push({ instrumentId: encodeInstrumentId(expiry, strike, false), expiry, strike, isPut: false, quantityRaw: call });
-        if (put !== 0n) positions.push({ instrumentId: encodeInstrumentId(expiry, strike, true), expiry, strike, isPut: true, quantityRaw: put });
+        const shareStrike = shareStrikeOf(strike, uiMultiplier);
+        if (call !== 0n) positions.push({ instrumentId: encodeInstrumentId(expiry, strike, false), expiry, strike, shareStrike, uiMultiplier, isPut: false, quantityRaw: call });
+        if (put !== 0n) positions.push({ instrumentId: encodeInstrumentId(expiry, strike, true), expiry, strike, shareStrike, uiMultiplier, isPut: true, quantityRaw: put });
       });
     }
     return { account, collateralRaw, requirementRaw, freeCollateralRaw, walletUsdgRaw, expiries: [...expiries], positions };
   }
 
   async session(key: Address, account = this.requireAccount()): Promise<SessionInfo> {
-    const [expiresAt, scope, maxRequirement] = await this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "sessions", args: [account, key] });
+    const [expiresAt, authorizedAt, scope, maxRequirement, spendLeft] = await this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "sessions", args: [account, key] });
     const now = BigInt(Math.floor(Date.now() / 1000));
     return {
       key,
       expiresAt: BigInt(expiresAt),
+      authorizedAt: BigInt(authorizedAt),
       scope,
       maxRequirement,
+      spendLeft,
       canTrade: (scope & SCOPE_TRADE) !== 0n,
       canCancel: (scope & SCOPE_CANCEL) !== 0n,
       active: BigInt(expiresAt) > now && scope !== 0n,
@@ -237,7 +307,9 @@ export class MarketClient {
   }
 
   async describe(instrumentId: bigint) {
-    return { ...decodeInstrumentId(instrumentId), underlying: this.deployment.underlying };
+    const d = decodeInstrumentId(instrumentId);
+    const uiMultiplier = await this.expiryMultiplier(d.expiry);
+    return { ...d, shareStrike: shareStrikeOf(d.strike, uiMultiplier), uiMultiplier, underlying: this.deployment.underlying };
   }
 
   // ---------------------------------------------------------------- writes (dry run by default)
@@ -247,15 +319,33 @@ export class MarketClient {
    * both cases so a dry run still reports the revert reason a send would hit.
    */
   async send(request: TxRequest, opts: { dryRun?: boolean; simulate?: boolean } = {}): Promise<SendResult> {
-    return sendTxRequest(this, request, opts);
+    try {
+      return await sendTxRequest(this, request, opts);
+    } catch (e) {
+      const decoded = decodeMarketError(e);
+      if (decoded) throw new MarketRevertError(request.summary, decoded, e);
+      throw e;
+    }
   }
 
   async waitForReceipt(hash: Hash) {
     return this.publicClient.waitForTransactionReceipt({ hash });
   }
 
-  /** Take an RFQ quote for `account` from the session key (balance mode by default: no approvals). */
+  /** True when the configured signer is a session key acting for another account (not the account itself). */
+  get signsAsSession(): boolean {
+    return !!this.signer && !!this.account && this.signer.address.toLowerCase() !== this.account.toLowerCase();
+  }
+
+  /**
+   * Take an RFQ quote for `account` from the session key, in balance mode (premium, fee and collateral settle from the
+   * deposited balance; no approvals). A session key must fill in balance mode: the market reverts `SessionWalletMode`
+   * on a session leg in wallet mode, so `fromBalance = false` is refused here unless the signer is the account itself.
+   */
   fillOrderAs(order: Order, signature: Hex, fillQuantityRaw: bigint, fromBalance = true, account = this.requireAccount()): TxRequest {
+    if (!fromBalance && this.signer && this.signer.address.toLowerCase() !== account.toLowerCase()) {
+      throw new Error(`a session key must fill in balance mode: the market reverts SessionWalletMode on a session leg with fromBalance = false (signer ${this.signer.address} is not the account ${account}); keep fromBalance true, or sign with the account key for wallet mode`);
+    }
     return encodeFillOrderAs(this.orderBook, account, order, signature, fillQuantityRaw, fromBalance);
   }
 
@@ -276,9 +366,16 @@ export class MarketClient {
     return encodeWithdraw(this.market, amountRaw, to);
   }
 
-  authorizeSession(key: Address, expiresAt: bigint | number, opts: { trade?: boolean; cancel?: boolean; maxRequirement?: bigint } = {}): TxRequest {
+  /**
+   * `authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend)` from the owner. `maxSpend` is required: the
+   * total premium + fee the key may make the account pay (0 = it cannot buy, `UNLIMITED` = no cap). `maxRequirement`
+   * defaults to 0 (the key cannot raise the account's requirement, i.e. cannot write options). Re-authorizing resets
+   * the budget and voids every order the key signed before.
+   */
+  authorizeSession(key: Address, expiresAt: bigint | number, opts: AuthorizeSessionOptions): TxRequest {
+    if (opts?.maxSpend === undefined) throw new Error("authorizeSession: maxSpend is required (USDG raw the key may spend on premium + fees; 0 = cannot buy, UNLIMITED = no cap)");
     const scope = ((opts.trade ?? true) ? SCOPE_TRADE : 0n) | (opts.cancel ? SCOPE_CANCEL : 0n);
-    return encodeAuthorizeSession(this.market, key, expiresAt, scope, opts.maxRequirement ?? 0n);
+    return encodeAuthorizeSession(this.market, key, expiresAt, scope, opts.maxRequirement ?? 0n, opts.maxSpend);
   }
 
   revokeSession(key: Address): TxRequest {
