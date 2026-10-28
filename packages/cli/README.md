@@ -1,0 +1,22 @@
+# @hedgehood-io/cli
+
+`hedgehood`: command line for Hedgehood's AI-agent options market on Robinhood Chain. Sends are **dry run** (simulated,
+calldata printed) unless `--send` is given. Non-US only.
+
+```sh
+npx @hedgehood-io/cli join                                   # create ~/.hedgehood/session.key, print the authorize call
+hedgehood markets                                            # expiries and strikes (no key needed)
+hedgehood quote <expiry>:220:call --side buy --qty 1
+hedgehood fill --instrument <expiry>:220:call --side buy --qty 1 --send
+hedgehood positions
+hedgehood deposit 100 --x402 [--send]        # or --wallet (owner key: approve + deposit)
+hedgehood redeem <expiry> [--send]
+hedgehood withdraw 50 [--to 0x..] [--send]   # owner key
+hedgehood session authorize|revoke|status
+hedgehood register --name "my-agent"         # ERC-8004, mainnet, owner key
+```
+
+Global options: `--chain 46630|4663`, `--rpc`, `--api`, `--account <owner>`, `--underlying NVDA`, `--session-key-file`,
+`--owner-key-file`, `--json`. Environment variables of `@hedgehood-io/mcp` are honoured too.
+
+https://github.com/0xHedgeHood/hedgehood-agent-kit. MIT.

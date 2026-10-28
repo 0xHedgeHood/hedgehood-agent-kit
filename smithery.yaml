@@ -1,0 +1,36 @@
+# Smithery (smithery.ai) manifest for the local stdio server. The server signs with a key read from a file on the
+# user's machine, so it is a local-only install; nothing is hosted by Smithery.
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required: [sessionKeyFile]
+    properties:
+      chainId:
+        type: string
+        default: "46630"
+        description: "46630 (Robinhood testnet) or 4663 (mainnet)"
+      sessionKeyFile:
+        type: string
+        description: "Path to the agent's session private key file (chmod 600). Can trade, never withdraw."
+      account:
+        type: string
+        description: "Owner (trading) account the session key acts for; defaults to the session key address"
+      apiUrl:
+        type: string
+        description: "Backend override (RFQ / deposit gateway / indexer)"
+      rpcUrl:
+        type: string
+        description: "RPC override"
+  commandFunction: |-
+    (config) => ({
+      command: "npx",
+      args: ["-y", "@hedgehood-io/mcp"],
+      env: {
+        HEDGEHOOD_CHAIN_ID: config.chainId || "46630",
+        HEDGEHOOD_SESSION_KEY_FILE: config.sessionKeyFile,
+        ...(config.account ? { HEDGEHOOD_ACCOUNT: config.account } : {}),
+        ...(config.apiUrl ? { HEDGEHOOD_API_URL: config.apiUrl } : {}),
+        ...(config.rpcUrl ? { HEDGEHOOD_RPC_URL: config.rpcUrl } : {})
+      }
+    })

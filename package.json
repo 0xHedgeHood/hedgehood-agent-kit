@@ -1,0 +1,28 @@
+{
+  "name": "hedgehood-agent-kit",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SDK, local MCP server, CLI and Claude Code skill for Hedgehood's AI-agent options market on Robinhood Chain",
+  "license": "MIT",
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r typecheck",
+    "vendor-abis": "node scripts/vendor-abis.mjs",
+    "typecheck:examples": "tsc -p tsconfig.examples.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0",
+    "@hedgehood-io/sdk": "workspace:*",
+    "viem": "^2.48.11"
+  },
+  "type": "module"
+}

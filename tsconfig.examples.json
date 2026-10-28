@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"],
+    "paths": { "@hedgehood-io/sdk": ["./packages/sdk/src/index.ts"] }
+  },
+  "include": ["examples/*.ts", "packages/sdk/src"]
+}

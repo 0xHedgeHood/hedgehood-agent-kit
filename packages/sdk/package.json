@@ -1,0 +1,39 @@
+{
+  "name": "@hedgehood-io/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Hedgehood's cash-settled options market V2 on Robinhood Chain: instrument ids, EIP-712 orders, session keys, RFQ quotes and the x402 deposit gateway",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "README.md"],
+  "publishConfig": { "access": "public" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xHedgeHood/hedgehood-agent-kit.git",
+    "directory": "packages/sdk"
+  },
+  "keywords": ["hedgehood", "options", "robinhood-chain", "usdg", "x402", "agents", "viem"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@x402/core": "^2.28.0",
+    "@x402/evm": "^2.28.0",
+    "viem": "^2.48.11"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}

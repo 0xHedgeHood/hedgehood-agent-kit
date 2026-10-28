@@ -1,0 +1,9 @@
+# ~/.codex/config.toml  (or: codex mcp add hedgehood --env HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key -- npx -y @hedgehood-io/mcp)
+[mcp_servers.hedgehood]
+command = "npx"
+args = ["-y", "@hedgehood-io/mcp"]
+
+[mcp_servers.hedgehood.env]
+HEDGEHOOD_CHAIN_ID = "46630"
+HEDGEHOOD_SESSION_KEY_FILE = "~/.hedgehood/session.key"
+HEDGEHOOD_ACCOUNT = "0x0000000000000000000000000000000000000000"

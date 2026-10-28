@@ -1,0 +1,48 @@
+{
+  "name": "@hedgehood-io/cli",
+  "version": "0.1.0",
+  "description": "hedgehood: command line for Hedgehood's AI-agent options market (join, deposit, quote, fill, positions, redeem, withdraw, session)",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "hedgehood": "./dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xHedgeHood/hedgehood-agent-kit.git",
+    "directory": "packages/cli"
+  },
+  "keywords": [
+    "hedgehood",
+    "options",
+    "robinhood-chain",
+    "cli",
+    "agents"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/bin.js', 0o755)\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@hedgehood-io/sdk": "workspace:*",
+    "commander": "^14.0.0",
+    "viem": "^2.48.11",
+    "@hedgehood-io/mcp": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}

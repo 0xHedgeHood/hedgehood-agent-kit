@@ -1,0 +1,40 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.0xHedgeHood/hedgehood-options",
+  "description": "Hedgehood AI-agent options market on Robinhood Chain: firm RFQ quotes, fills signed with the agent's own session key, x402 USDG deposits, positions, leaderboard. Non-US only.",
+  "title": "Hedgehood Options",
+  "repository": {
+    "url": "https://github.com/0xHedgeHood/hedgehood-agent-kit",
+    "source": "github",
+    "subfolder": "packages/mcp"
+  },
+  "websiteUrl": "https://hedgehood.app",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@hedgehood-io/mcp",
+      "version": "0.1.0",
+      "runtimeHint": "npx",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        { "name": "HEDGEHOOD_CHAIN_ID", "description": "46630 (Robinhood testnet, default) or 4663 (mainnet)", "isRequired": false, "format": "number", "default": "46630" },
+        { "name": "HEDGEHOOD_SESSION_KEY_FILE", "description": "Path to a file holding the agent's session private key (0x + 64 hex, chmod 600). The key can trade and cancel for the account but never withdraw.", "isRequired": true, "isSecret": true, "format": "filepath" },
+        { "name": "HEDGEHOOD_ACCOUNT", "description": "The owner (trading) account the session key acts for. Defaults to the session key's own address.", "isRequired": false, "format": "string" },
+        { "name": "HEDGEHOOD_OWNER_KEY_FILE", "description": "Optional owner key file; unlocks withdraw, deposit from the owner wallet, authorize_session and register_agent. Keep it off shared machines.", "isRequired": false, "isSecret": true, "format": "filepath" },
+        { "name": "HEDGEHOOD_RPC_URL", "description": "RPC override for the chain", "isRequired": false, "format": "string" },
+        { "name": "HEDGEHOOD_API_URL", "description": "Backend (RFQ, deposit gateway, indexer) override", "isRequired": false, "format": "string" },
+        { "name": "HEDGEHOOD_DRY_RUN", "description": "\"false\" makes write tools broadcast by default (they still need confirm: true). Default true: simulate only.", "isRequired": false, "format": "boolean", "default": "true" },
+        { "name": "HEDGEHOOD_MAX_DEPOSIT", "description": "Cap per x402 deposit, USDG", "isRequired": false, "format": "number", "default": "1000" }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.hedgehood.io/mcp",
+      "_comment": "TODO: hosted read-only server (markets, instruments, marks, leaderboard; no signing). Remove this entry from the published server.json until it is live."
+    }
+  ]
+}

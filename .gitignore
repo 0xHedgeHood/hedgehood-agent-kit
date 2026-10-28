@@ -1,0 +1,26 @@
+# dependencies / build
+node_modules/
+dist/
+*.tsbuildinfo
+.pnpm-store/
+coverage/
+
+# keys and secrets: never commit
+*.key
+*.pem
+*.keystore
+keystore/
+keys/
+.hedgehood/
+session-key*
+owner-key*
+*.secret
+.env
+.env.*
+!.env.example
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.log

@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true,
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "@hedgehood-io/sdk": [
+        "../sdk/src/index.ts"
+      ],
+      "@hedgehood-io/mcp": [
+        "../mcp/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "test",
+    "../sdk/src",
+    "../mcp/src"
+  ]
+}
