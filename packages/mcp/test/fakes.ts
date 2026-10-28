@@ -8,8 +8,8 @@ import { privateKeyToAccount } from "viem/accounts";
 import { adaptiveCurveIrmAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
 
 export const ACCOUNT = "0x3333333333333333333333333333333333333333" as Address;
-export const BOOK = "0x7288a3D12e15379C3b64988b54Ab4Da759638cf5" as Address;
-export const MARKET = "0xC289617d613C9865a6595B365DaD88277282e0Ac" as Address;
+export const BOOK = "0x34BA908e8aaaD48c5c9478ad6B8bB5A7394aC709" as Address;
+export const MARKET = "0xeF80f9ABc9590DBC76ccEFBa0D8975FC79E305A1" as Address;
 export const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 export const EXPIRY = 1793390400n; // 2026-10-30 16:00 New York
 export const STRIKES = [210_000_000n, 220_000_000n];
