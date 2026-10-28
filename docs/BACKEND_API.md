@@ -21,8 +21,15 @@ kit reads and the `chainId` it expects in quotes. Today the backend's registry h
 Conventions: JSON; integers that may exceed 2^53 are decimal strings (`*Raw`: USDG raw 6 decimals, shares 18 decimals);
 prices per share (`bid`/`ask`/`mid`, `price.start/end`, `markPrice`) are JSON numbers in USDG per share; times unix
 seconds; errors `{ "error": <code>, "reason": <text> }`. Instruments are named `UNDERLYING-YYYYMMDD-STRIKE-C|P` with the
-New York date and the USD strike as Python `f"{usd:g}"` prints it (`NVDA-20261030-220-C`, `…-222.5-P`); the kit
-derives the name from an id with `instrumentName()` and resolves a name with `resolveInstrumentName()`.
+New York date and the **listed per-share** strike in USD as Python `f"{usd:g}"` prints it (`NVDA-20261030-220-C`,
+`…-222.5-P`). Since hedgehood-options PR #54 (`aa47f7f`) the market lays its grid in listed per-share USD and stores
+each strike per token as `k = round(shareStrike x M / 1e18)`, M = the expiry's snapshotted `uiMultiplier`; the name's
+strike is `round(k x 1e18 / M)` (NVDA mainnet M = 1.000775159164630595: id strike 220.170535, name `…-220-C`). The
+kit derives the name from an id with `instrumentName(…, uiMultiplier)` / `MarketClient.instrumentName(id)` and
+resolves a name against the expiry's strikes with `MarketClient.resolveInstrumentName()`; quote requests
+(`QuoteRequest.uiMultiplier`) and marks send the per-share name. With M = 1e18 (testnet tNVDA2) nothing changes. The
+backend must name and parse the same way (`rfq/registry.py` `strike_entry` / `instrument_key` keyed `usd = raw / 1e6`
+at `18d189c`: per-token, so it agrees only while M = 1e18).
 
 ## RFQ
 

@@ -17,14 +17,14 @@ const market = new MarketClient({ chainId: 46630, underlying: "NVDA", account: O
 const rfq = new RfqClient({ chainId: 46630 });
 
 const [expiry] = await market.openedExpiries();
-const { strikes } = await market.expiryInfo(expiry!);
-const id = encodeInstrumentId(expiry!, strikes[4]!, false); // a call
+const { strikes, uiMultiplier } = await market.expiryInfo(expiry!); // per-token strikes + the expiry's multiplier
+const id = encodeInstrumentId(expiry!, strikes[4]!, false); // a call (or: await market.resolveInstrumentName("NVDA-20261030-220-C"))
 const quote = await rfq.getQuote(
-  { chainId: 46630, market: market.market, instrumentId: id, side: "buy", quantityRaw: parseShares("1"), taker: OWNER },
+  { chainId: 46630, market: market.market, instrumentId: id, side: "buy", quantityRaw: parseShares("1"), taker: OWNER, uiMultiplier },
   { orderBook: market.orderBook, protocolFeeBps: await market.protocolFeeBps() },
 );
 console.log(`pay ${formatUsdg(quote.netNowRaw)} USDG, ${quote.secondsLeft}s left`);
-const tx = market.fillOrderAs(quote.order, quote.signature, parseShares("1"), true);
+const tx = market.fillOrderAs(quote.order, quote.signature, parseShares("1"), true); // a session key: balance mode only
 await market.send(tx, { dryRun: true }); // simulate; { dryRun: false } broadcasts
 ```
 
@@ -35,7 +35,8 @@ math, `signOrder`, `verifyOrderSignature`), `calldata` (every write as an unsign
 (`positionPnl`, `formatTimeToExpiry`), `x402` (`depositViaGateway`,
 USDG preset adapted from `@priors/x402`), `identity` (ERC-8004), `vault` (`VaultClient` for the Stock Yield vaults:
 `listVaults`, `status`, owner-wallet plans `requestDeposit` / `requestRedeem` / `cancelDeposit` / `cancelRedeem` /
-`claim`, dry run by default), `send` (`sendTxRequest`), `units`. ABIs: `marketV2Abi`, `orderBookV2Abi`, `erc20Abi`,
+`claim`, dry run by default), `send` (`sendTxRequest`), `errors` (`decodeMarketError`, `MarketRevertError`: market /
+book custom errors such as `SessionLimit` and `SessionWalletMode` with what to do), `units`. ABIs: `marketV2Abi`, `orderBookV2Abi`, `erc20Abi`,
 `identityRegistryAbi`, `epochFundAbi`, `vaultRegistryAbi`, `openDepositGateAbi`, `stakeThresholdGateAbi`.
 
 ```ts

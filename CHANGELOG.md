@@ -2,6 +2,51 @@
 
 ## 0.3.0 (unreleased)
 
+**Breaking: V2 audit fixes (hedgehood-options PR #54, `contracts/audit-fixes-v2` @ `aa47f7f`).** Market and book ABIs
+re-vendored with `scripts/vendor-abis.mjs` from that commit. The live testnet market `0xC289…e0Ac` was built from
+`131c1ae` (before the fixes): session reads and `authorizeSession` from this version only work against a market
+redeployed from `aa47f7f` (the registry entry stays until that redeploy exists).
+
+- Session authorize signature: `authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend)`. SDK
+  `encodeAuthorizeSession(…, maxRequirement, maxSpend)` and `MarketClient.authorizeSession(key, expiresAt, { maxSpend,
+  maxRequirement?, trade?, cancel? })` (`maxSpend` required). For both caps 0 now means none (0 `maxSpend`: the key
+  cannot buy; 0 `maxRequirement`, the new default: no new requirement, it cannot write options) and `UNLIMITED`
+  (`type(uint256).max`) means no cap; before, 0 `maxRequirement` meant unlimited. CLI `session authorize` and `join`
+  (with an owner key) require `--max-spend <usdg|unlimited>` and print a suggested budget when it is missing;
+  `--max-requirement <usdg|unlimited>` defaults to 0; the printed `cast` command takes five arguments. MCP
+  `authorize_session` takes `maxSpend` (required unless `revoke`) and `maxRequirement` (default `"0"`), both accepting
+  `"unlimited"`, and echoes the terms.
+- Session status: `MarketClient.session()` reads `(expiresAt, authorizedAt, scope, maxRequirement, spendLeft)`;
+  `SessionInfo` gains `authorizedAt` and `spendLeft`; `formatSessionCap` ("unlimited" / "none (0)" / USDG). Shown by
+  `hedgehood session status`, `hedgehood positions` and the MCP `positions` tool.
+- Balance mode is forced on the session path: `MarketClient.fillOrderAs(…, fromBalance = false)` from a session key
+  (signer != account) throws before anything is built (the market reverts `SessionWalletMode`); MCP `close_position`
+  forces `fromBalance: true` for a session key and says so; `orderProblems` flags a session-signed order that is not
+  `fromBalance`. Wallet mode stays available when the signer is the account itself.
+- Revert decoding: `decodeMarketError` / `MarketRevertError` (new `errors` module) decode market and book custom errors
+  from viem errors with a hint (`SessionLimit`: spend budget or requirement cap; `SessionWalletMode`;
+  `NotAuthorizedSigner` incl. orders signed before a re-authorization; `TradingUnavailable`; …). `MarketClient.send`
+  rethrows simulated or sent reverts as `MarketRevertError`, so the CLI and MCP errors carry the name and the hint.
+- Listed per-share strikes: names (`NVDA-20261030-220-C`) and labels show `round(k x 1e18 / M)`, M being the expiry's
+  snapshotted `uiMultiplier`, and map back to the per-token strike packed in the id (NVDA mainnet M =
+  1.000775159164630595: 220 is stored as 220.170535). New `shareStrikeOf`, `tokenStrikeOf`, `instrumentNameOf`,
+  `UNIT_MULTIPLIER`; `instrumentName` / `describeInstrument` take the multiplier (default 1e18); `parseInstrumentName`
+  returns `shareStrikeRaw` (was `strikeRaw`); `resolveInstrumentName` accepts `{ expiry, uiMultiplier, strikes }`
+  entries; `gridFor(anchor, multiplier, params)` mirrors the contract's `gridFor(uint256,uint256)` (the two-argument
+  form assumes 1e18). `MarketClient.expiryMultiplier` (cached), `instrumentName(id)`, `resolveInstrumentName(name)`;
+  `ExpiryInfo.shareStrikes`; `Position` gains `shareStrike` and `uiMultiplier` (the snapshot reads `expiryInfo` per
+  expiry). `QuoteRequest.uiMultiplier` and `RfqClient.mark({ …, uiMultiplier })` send the per-share name; `planClose`
+  uses the position's multiplier. CLI `markets`, `instruments`, `quote`, `fill`, `close`, `positions` and `decode`
+  (`--multiplier`, else read from the market) and MCP `list_markets`, `list_instruments`, `get_mark`, `get_quote`,
+  `positions`, `close_position`, `decode_instrument` (`uiMultiplier` input; now reads the expiry from the market) all
+  use the per-share strike; `expiry:strike:kind` and the MCP `strike` field take the per-share strike.
+- Bids' pro rata premium rounds down (asks still up): `premiumFor` follows the book.
+- Docs: skill (session limits, per-share strikes, troubleshooting rows for `SessionLimit`, `SessionWalletMode`,
+  `StockMultiplierChanged`), README security model and quickstart, `docs/BACKEND_API.md` (naming rule; the backend's
+  `rfq/registry.py` at `18d189c` still names by `raw / 1e6`, which agrees only while M = 1e18), package READMEs.
+  Tests: SDK 97 (+14), MCP 26 (+4), CLI 20 (+3), including maxSpend encoding, per-share naming under the NVDA mainnet
+  multiplier and the ORCL grid vector from the contract tests, and forced balance mode.
+
 Stock Yield vaults: agents deposit into and withdraw from Hedgehood's v2 `EpochFund`s through the same kit.
 
 - `@hedgehood-io/sdk`: `VaultClient` (`listVaults`, `status`, `vaultInfo`, `accountInfo`, `resolveVault`, and the

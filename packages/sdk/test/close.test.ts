@@ -64,6 +64,7 @@ function fakeMarket(positions: Position[]) {
     deployment: { underlying: "NVDA", market: MARKET, orderBook: BOOK },
     snapshot: async () => ({ account: AGENT, collateralRaw: 0n, requirementRaw: 0n, freeCollateralRaw: 0n, walletUsdgRaw: 0n, expiries: [EXPIRY], positions }),
     protocolFeeBps: async () => 50n,
+    expiryMultiplier: async () => positions[0]?.uiMultiplier ?? ONE,
     fillOrderAs: (o: Order, sig: Hex, qty: bigint, fromBalance = true, account: Address = AGENT) => encodeFillOrderAs(BOOK, account, o, sig, qty, fromBalance),
     send: async (request: TxRequest, opts: { dryRun?: boolean } = {}): Promise<SendResult> => {
       sends.push({ request, dryRun: opts.dryRun });
@@ -87,8 +88,8 @@ function fakeRfq(opts: { dryRun?: boolean } = {}) {
   return { rfq: new RfqClient({ chainId: 46630, hosts: { rfq: "https://rfq.test" }, fetch: fetchImpl, now: () => NOW + 5 }), bodies };
 }
 
-const long: Position = { instrumentId: CALL, expiry: EXPIRY, strike: 220_000_000n, isPut: false, quantityRaw: ONE };
-const short: Position = { instrumentId: PUT, expiry: EXPIRY, strike: 210_000_000n, isPut: true, quantityRaw: -(ONE / 2n) };
+const long: Position = { instrumentId: CALL, expiry: EXPIRY, strike: 220_000_000n, shareStrike: 220_000_000n, uiMultiplier: ONE, isPut: false, quantityRaw: ONE };
+const short: Position = { instrumentId: PUT, expiry: EXPIRY, strike: 210_000_000n, shareStrike: 210_000_000n, uiMultiplier: ONE, isPut: true, quantityRaw: -(ONE / 2n) };
 
 describe("planClose", () => {
   it("closes a long by selling the whole position to the maker's bid and builds the fillOrderAs calldata", async () => {
@@ -127,6 +128,22 @@ describe("planClose", () => {
     await expect(planClose({ market, rfq, instrumentId: CALL })).rejects.toThrow(/no open position in NVDA-20261030-220-C/);
     await expect(planClose({ market, rfq, instrumentId: PUT, quantityRaw: 0n })).rejects.toThrow(/positive/);
     expect(bodies.length).toBe(0);
+  });
+
+  it("names the close by the listed per-share strike when the expiry's uiMultiplier is not 1e18", async () => {
+    const M = 1_000_775_159_164_630_595n; // NVDA mainnet
+    const k = 220_170_535n; // round(220e6 x M / 1e18)
+    const id = encodeInstrumentId(EXPIRY, k, false);
+    const { market } = fakeMarket([{ instrumentId: id, expiry: EXPIRY, strike: k, shareStrike: 220_000_000n, uiMultiplier: M, isPut: false, quantityRaw: ONE }]);
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl: typeof fetch = (async (_u: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify(await quoteFor(order({ instrumentId: id, side: Side.Bid }))), { status: 200 });
+    }) as typeof fetch;
+    const rfq = new RfqClient({ chainId: 46630, hosts: { rfq: "https://rfq.test" }, fetch: fetchImpl, now: () => NOW + 5 });
+    const plan = await planClose({ market, rfq, instrumentId: id });
+    expect(bodies[0]).toMatchObject({ instrument: "NVDA-20261030-220-C", side: "sell" });
+    expect(plan.quote.order.instrumentId).toBe(id);
   });
 });
 

@@ -3,9 +3,9 @@
  * quoting both sides of every instrument, and an indexer with /v1/pnl and /v1/history rows. Everything goes through one
  * `fetch` so no network is touched.
  */
-import { decodeFunctionData, encodeAbiParameters, encodeFunctionResult, type Address, type Hex } from "viem";
+import { decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionResult, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { adaptiveCurveIrmAbi, encodeFillOrderAs, encodeInstrumentId, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
+import { adaptiveCurveIrmAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
 
 export const ACCOUNT = "0x3333333333333333333333333333333333333333" as Address;
 export const BOOK = "0x7288a3D12e15379C3b64988b54Ab4Da759638cf5" as Address;
@@ -13,6 +13,8 @@ export const MARKET = "0xC289617d613C9865a6595B365DaD88277282e0Ac" as Address;
 export const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 export const EXPIRY = 1793390400n; // 2026-10-30 16:00 New York
 export const STRIKES = [210_000_000n, 220_000_000n];
+/** NVDA's mainnet uiMultiplier (2026-10-28): per-token strikes are then not whole dollars. */
+export const NVDA_M = 1_000_775_159_164_630_595n;
 export const CALL220 = encodeInstrumentId(EXPIRY, 220_000_000n, false);
 export const PUT210 = encodeInstrumentId(EXPIRY, 210_000_000n, true);
 export const ONE = 10n ** 18n;
@@ -25,6 +27,12 @@ export interface ChainState {
   requirementRaw: bigint;
   /** eth_call payloads the node received for the book (simulated fills). */
   simulated: Hex[];
+  /** The expiry's snapshotted uiMultiplier; the listed per-share strikes stay 210 / 220, stored per token under it. */
+  uiMultiplier: bigint;
+  /** sessions(account, key): [expiresAt, authorizedAt, scope, maxRequirement, spendLeft]. */
+  session: [bigint, bigint, bigint, bigint, bigint];
+  /** A custom error the next simulated fill reverts with (e.g. "SessionLimit"). */
+  fillRevert?: string;
   /** The Stock Yield fund (testnet hhNVDA-CC addresses). */
   vault: VaultState;
   /** Share lending: the hhUSDG vault and the Blue market on the fund's shares. */
@@ -32,7 +40,13 @@ export interface ChainState {
 }
 
 export function defaultChain(): ChainState {
-  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [], vault: defaultVault(), lending: defaultLending() };
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [], uiMultiplier: ONE, session: [now + 86400n, now - 3600n, 3n, 0n, 40_000_000n], vault: defaultVault(), lending: defaultLending() };
+}
+
+/** The per-token strikes the fake market stores: STRIKES (per share) under the chain's uiMultiplier. */
+export function strikesOf(state: ChainState): bigint[] {
+  return STRIKES.map((s) => tokenStrikeOf(s, state.uiMultiplier));
 }
 
 // ---------------------------------------------------------------- Stock Yield vault fixtures (testnet 46630 hhNVDA-CC)
@@ -473,7 +487,7 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
     case "openedExpiries":
       return enc([EXPIRY]);
     case "strikesOf":
-      return enc(STRIKES);
+      return enc(strikesOf(state));
     case "positions":
       return enc(state.positions);
     case "protocolFeeBps":
@@ -485,22 +499,44 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
     case "uiMultiplier":
       return enc(ONE);
     case "expiryInfo":
-      return enc({ openedAt: 1792785600n, settled: false, settledByOwner: false, uiMultiplier: ONE, anchor: 215_000_000n, capLow: 150_500_000n, capHigh: 279_500_000n, settlementPrice: 0n, rawSettlementPrice: 0n, strikes: STRIKES });
+      return enc({ openedAt: 1792785600n, settled: false, settledByOwner: false, uiMultiplier: state.uiMultiplier, anchor: 215_000_000n, capLow: 150_500_000n, capHigh: 279_500_000n, settlementPrice: 0n, rawSettlementPrice: 0n, strikes: strikesOf(state) });
     case "sessions":
-      return enc([BigInt(Math.floor(Date.now() / 1000) + 86400), 3n, 0n]);
-    case "fillOrderAs":
+      return enc(state.session);
+    case "authorizeSession":
+    case "revokeSession":
       state.simulated.push(call.data);
       return "0x";
+    case "fillOrderAs": {
+      state.simulated.push(call.data);
+      const fromBalance = (args as unknown as unknown[])[4];
+      const signer = call.from?.toLowerCase();
+      // the market's rule: a session leg (signer != account) must settle from the balance
+      if (signer && signer !== String((args as unknown as unknown[])[0]).toLowerCase() && fromBalance !== true) throw new RevertWith("SessionWalletMode");
+      if (state.fillRevert) throw new RevertWith(state.fillRevert);
+      return "0x";
+    }
     default:
       throw new Error(`fake rpc: no fixture for ${functionName}(${(args as unknown as unknown[] | undefined)?.join(", ") ?? ""})`);
   }
 }
 
-/** The maker's `POST /v1/rfq` answer for a request body, signed for real so the SDK's verification passes. */
-export async function makerQuote(body: { instrument: string; side: "buy" | "sell"; quantity: string; taker: Address }, opts: { now?: number; dryRun?: boolean } = {}): Promise<QuoteResponse> {
+/** A JSON-RPC revert carrying a market custom error's data. */
+export class RevertWith extends Error {
+  readonly data: Hex;
+  constructor(errorName: string) {
+    super("execution reverted");
+    this.data = encodeErrorResult({ abi: marketV2Abi, errorName } as Parameters<typeof encodeErrorResult>[0]);
+  }
+}
+
+/**
+ * The maker's `POST /v1/rfq` answer for a request body, signed for real so the SDK's verification passes. The name
+ * carries the listed per-share strike; the order's id the per-token strike under `uiMultiplier`.
+ */
+export async function makerQuote(body: { instrument: string; side: "buy" | "sell"; quantity: string; taker: Address }, opts: { now?: number; dryRun?: boolean; uiMultiplier?: bigint } = {}): Promise<QuoteResponse> {
   const now = opts.now ?? Math.floor(Date.now() / 1000);
   const isPut = body.instrument.endsWith("-P");
-  const strike = BigInt(Math.round(Number(body.instrument.split("-")[2]) * 1e6));
+  const strike = tokenStrikeOf(BigInt(Math.round(Number(body.instrument.split("-")[2]) * 1e6)), opts.uiMultiplier ?? ONE);
   const instrumentId = encodeInstrumentId(EXPIRY, strike, isPut);
   const quantityRaw = BigInt(Math.round(Number(body.quantity) * 1e6)) * 10n ** 12n;
   const side = body.side === "buy" ? Side.Ask : Side.Bid;
@@ -575,6 +611,7 @@ export function fakeWorld(opts: { chain?: ChainState; quoteDryRun?: boolean; quo
         try {
           return { jsonrpc: "2.0", id: r.id, result: rpcResult(chain, r.method, r.params) };
         } catch (e) {
+          if (e instanceof RevertWith) return { jsonrpc: "2.0", id: r.id, error: { code: 3, message: e.message, data: e.data } };
           return { jsonrpc: "2.0", id: r.id, error: { code: -32000, message: e instanceof Error ? e.message : String(e) } };
         }
       };
@@ -588,7 +625,7 @@ export function fakeWorld(opts: { chain?: ChainState; quoteDryRun?: boolean; quo
     if (url.pathname === "/v1/rfq") {
       const f = failures.shift();
       if (f) return ok(f.body, f.status);
-      return ok(await makerQuote(body as Parameters<typeof makerQuote>[0], { dryRun: opts.quoteDryRun }));
+      return ok(await makerQuote(body as Parameters<typeof makerQuote>[0], { dryRun: opts.quoteDryRun, uiMultiplier: chain.uiMultiplier }));
     }
     if (opts.indexerDown) return ok({ error: "unavailable" }, 503);
     if (url.pathname === "/v1/pnl") return ok(pnlFixture(now));

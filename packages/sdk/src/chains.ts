@@ -178,7 +178,9 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
         source: "0xc599E3B843D30010b555A08E041Db77DAE33DBb9",
         deployBlock: 143952569n,
         protocolFeeBps: 50,
-        note: "tNVDA2 on Robinhood testnet, deployed 2026-10-28; fixture feeds, not mainnet configuration",
+        // built from hedgehood-options 131c1ae (before PR #54): its sessions()/authorizeSession predate the spend
+        // budget the vendored aa47f7f ABI encodes; replace with the redeployed market + book once they exist
+        note: "tNVDA2 on Robinhood testnet, deployed 2026-10-28 from the pre-audit-fix build; fixture feeds, not mainnet configuration",
       },
     ],
     vaults: {

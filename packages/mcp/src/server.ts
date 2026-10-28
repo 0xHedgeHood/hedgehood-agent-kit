@@ -7,6 +7,8 @@ import {
   describeInstrument,
   encodeInstrumentId,
   encodeRegisterAgent,
+  expiryOf,
+  formatSessionCap,
   formatShares,
   formatSignedUsdg,
   formatStrike,
@@ -14,7 +16,6 @@ import {
   identityRegistryFor,
   instrumentName,
   orderDigest,
-  resolveInstrumentName,
   orderFromJson,
   orderToJson,
   parseShares,
@@ -22,8 +23,10 @@ import {
   planClose,
   pnlByInstrument,
   positionPnl,
-  SCOPE_CANCEL,
-  SCOPE_TRADE,
+  shareStrikeOf,
+  tokenStrikeOf,
+  UNIT_MULTIPLIER,
+  UNLIMITED,
   LTV_WARN_FRACTION,
   type BorrowStatus,
   type ClosePlan,
@@ -49,6 +52,12 @@ import { describeConfig } from "./config.js";
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "address").transform((s) => s as Address);
 const uintString = z.string().regex(/^\d+$/, "unsigned integer string");
 const decimalAmount = z.string().regex(/^\d+(\.\d+)?$/, "decimal amount, e.g. \"25\" or \"0.5\"");
+const sessionCap = z.string().regex(/^(\d+(\.\d+)?|unlimited)$/i, "USDG amount, e.g. \"100\", or \"unlimited\"");
+
+/** "unlimited" -> type(uint256).max, else USDG -> raw. */
+function parseCap(v: string): bigint {
+  return /^unlimited$/i.test(v.trim()) ? UNLIMITED : parseUsdg(v);
+}
 
 const confirmField = z.boolean().default(false).describe("Must be true to act. Without it the tool only explains what it would do.");
 const dryRunField = z.boolean().optional().describe("true (default): simulate and return the unsigned transaction, send nothing. false: sign and broadcast.");
@@ -65,15 +74,18 @@ const instrumentFields = {
   instrument: z.string().regex(/^[A-Za-z]{1,8}-\d{8}-\d+(\.\d+)?-[CPcp]$/).optional().describe("Backend name, e.g. NVDA-20261030-220-C"),
   instrumentId: uintString.optional().describe("Packed id from list_instruments"),
   expiry: uintString.optional().describe("Unix seconds of the expiry"),
-  strike: decimalAmount.optional().describe("USDG per share, e.g. \"220\""),
+  strike: decimalAmount.optional().describe("Listed per-share strike in USDG, e.g. \"220\" (the name's strike, not the per-token raw)"),
   kind: z.enum(["call", "put"]).optional(),
 };
 
 /** An instrument from a backend name, a packed id, or expiry + strike + kind. */
 async function instrumentFrom(m: MarketClient, args: { instrument?: string; instrumentId?: string; expiry?: string; strike?: string; kind?: "call" | "put" }): Promise<bigint> {
   if (args.instrumentId) return BigInt(args.instrumentId);
-  if (args.instrument) return resolveInstrumentName(args.instrument, await m.openedExpiries());
-  if (args.expiry && args.strike && args.kind) return encodeInstrumentId(BigInt(args.expiry), parseUsdg(args.strike), args.kind === "put");
+  if (args.instrument) return m.resolveInstrumentName(args.instrument);
+  if (args.expiry && args.strike && args.kind) {
+    const expiry = BigInt(args.expiry);
+    return encodeInstrumentId(expiry, tokenStrikeOf(parseUsdg(args.strike), await m.expiryMultiplier(expiry)), args.kind === "put");
+  }
   throw new Error("give instrument (NVDA-20261030-220-C), or instrumentId, or expiry + strike + kind");
 }
 
@@ -101,11 +113,11 @@ function errorText(e: unknown): string {
   return msg.split("\n").slice(0, 6).join(" | ").slice(0, 800);
 }
 
-function quoteView(q: VerifiedQuote, underlying: string, side: "buy" | "sell", requestedQuantityRaw: bigint) {
+function quoteView(q: VerifiedQuote, underlying: string, side: "buy" | "sell", requestedQuantityRaw: bigint, uiMultiplier: bigint = UNIT_MULTIPLIER) {
   return {
     digest: q.digest,
     instrument: q.instrument,
-    label: describeInstrument(q.order.instrumentId, underlying),
+    label: describeInstrument(q.order.instrumentId, underlying, uiMultiplier),
     instrumentId: q.order.instrumentId.toString(),
     fillable: q.fillable,
     backendDryRun: q.dryRun ? "the desk runs without a signer key: this quote carries a placeholder signature and cannot be filled" : undefined,
@@ -131,13 +143,32 @@ function quoteView(q: VerifiedQuote, underlying: string, side: "buy" | "sell", r
 function closeView(plan: ClosePlan, underlying: string) {
   return {
     instrument: plan.instrument,
-    label: describeInstrument(plan.instrumentId, underlying),
+    label: describeInstrument(plan.instrumentId, underlying, plan.position.uiMultiplier),
     instrumentId: plan.instrumentId.toString(),
     position: formatShares(plan.position.quantityRaw),
     closes: formatShares(plan.quantityRaw),
     remainingAfter: formatShares(plan.remainingRaw),
     side: plan.side,
-    quote: quoteView(plan.quote, underlying, plan.side, plan.quantityRaw),
+    quote: quoteView(plan.quote, underlying, plan.side, plan.quantityRaw, plan.position.uiMultiplier),
+  };
+}
+
+const SESSION_LIMITS =
+  "A session key's fills always settle from the account's deposited balance (the market reverts SessionWalletMode on a session leg in wallet mode), the premium + fee it makes the account pay comes out of the session's spend budget (spendLeft; SessionLimit when exhausted, 0 = it cannot buy) and it cannot push the account's requirement above maxRequirement (SessionLimit).";
+
+function sessionView(s: Awaited<ReturnType<MarketClient["session"]>>) {
+  return {
+    key: s.key,
+    active: s.active,
+    canTrade: s.canTrade,
+    canCancel: s.canCancel,
+    expiresAt: s.expiresAt,
+    authorizedAt: s.authorizedAt,
+    authorizedAtIso: s.authorizedAt === 0n ? undefined : new Date(Number(s.authorizedAt) * 1000).toISOString(),
+    spendLeft: formatSessionCap(s.spendLeft),
+    maxRequirement: formatSessionCap(s.maxRequirement),
+    spendLeftRaw: s.spendLeft,
+    maxRequirementRaw: s.maxRequirement,
   };
 }
 
@@ -149,7 +180,7 @@ export function createServer(ctx: KitContext): McpServer {
     "list_markets",
     {
       title: "List markets",
-      description: "The option markets this server trades: underlying, chain, contract addresses, open expiries and taker fee. Read-only.",
+      description: "The option markets this server trades: underlying, chain, contract addresses, open expiries (with the uiMultiplier each snapshotted and its listed per-share strikes) and taker fee. Anchor and caps are per token. Read-only.",
       inputSchema: {},
     },
     async () => {
@@ -172,7 +203,7 @@ export function createServer(ctx: KitContext): McpServer {
         backendHosts: ctx.rfq.hosts,
         takerFeeBps: fee,
         uiMultiplier: mult,
-        expiries: infos.map((i) => ({ expiry: i.expiry, date: new Date(Number(i.expiry) * 1000).toISOString(), tradingOpen: i.tradingOpen, settled: i.settled, anchor: formatUsdg(i.anchor), capLow: formatUsdg(i.capLow), capHigh: formatUsdg(i.capHigh), strikes: i.strikes.map(formatStrike) })),
+        expiries: infos.map((i) => ({ expiry: i.expiry, date: new Date(Number(i.expiry) * 1000).toISOString(), tradingOpen: i.tradingOpen, settled: i.settled, uiMultiplier: i.uiMultiplier, anchor: formatUsdg(i.anchor), capLow: formatUsdg(i.capLow), capHigh: formatUsdg(i.capHigh), strikes: i.shareStrikes.map(formatStrike), perTokenStrikesRaw: i.uiMultiplier === UNIT_MULTIPLIER ? undefined : i.strikes })),
         backend,
         config: describeConfig(ctx.config),
       });
@@ -183,7 +214,7 @@ export function createServer(ctx: KitContext): McpServer {
     "list_instruments",
     {
       title: "List instruments",
-      description: "Calls and puts of one expiry (or all open expiries): instrument ids, strikes, whether trading is open, and the backend's indicative marks when available. Read-only.",
+      description: "Calls and puts of one expiry (or all open expiries): instrument names and ids, listed per-share strikes (and the per-token raw strike in the id when the expiry's uiMultiplier is not 1), whether trading is open, and whether the backend quotes them. Read-only.",
       inputSchema: { expiry: uintString.optional().describe("Unix seconds of the expiry; omit for every open expiry") },
     },
     async ({ expiry }) => {
@@ -204,10 +235,11 @@ export function createServer(ctx: KitContext): McpServer {
           date: new Date(Number(e) * 1000).toISOString(),
           tradingOpen: info.tradingOpen,
           settled: info.settled,
+          uiMultiplier: info.uiMultiplier,
           settlementPrice: info.settled ? formatUsdg(info.settlementPrice) : undefined,
           instruments: info.strikes.flatMap((s) => (["call", "put"] as const).map((k) => {
             const id = encodeInstrumentId(e, s, k === "put");
-            return { instrument: instrumentName(underlying, e, s, k === "put"), instrumentId: id.toString(), label: describeInstrument(id, underlying), strike: formatStrike(s), kind: k, listedOcc: listed[id.toString()]?.occ, quotedByBackend: id.toString() in listed };
+            return { instrument: instrumentName(underlying, e, s, k === "put", info.uiMultiplier), instrumentId: id.toString(), label: describeInstrument(id, underlying, info.uiMultiplier), strike: formatStrike(shareStrikeOf(s, info.uiMultiplier)), strikeRaw: s.toString(), kind: k, listedOcc: listed[id.toString()]?.occ, quotedByBackend: id.toString() in listed };
           })),
         });
       }
@@ -223,9 +255,11 @@ export function createServer(ctx: KitContext): McpServer {
       inputSchema: instrumentFields,
     },
     async (args) => {
-      const id = await instrumentFrom(ctx.market("none"), args);
-      const mark = await ctx.rfq.mark({ instrumentId: id, underlying });
-      return json({ ...mark, label: describeInstrument(id, underlying), note: mark.executable ? undefined : `not executable now (${mark.reason ?? "no row"}): no quote will be given; try during the listed session` });
+      const m = ctx.market("none");
+      const id = await instrumentFrom(m, args);
+      const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
+      const mark = await ctx.rfq.mark({ instrumentId: id, underlying, uiMultiplier });
+      return json({ ...mark, label: describeInstrument(id, underlying, uiMultiplier), note: mark.executable ? undefined : `not executable now (${mark.reason ?? "no row"}): no quote will be given; try during the listed session` });
     },
   );
 
@@ -246,10 +280,11 @@ export function createServer(ctx: KitContext): McpServer {
       const quantityRaw = parseShares(args.quantity);
       const fee = await m.protocolFeeBps();
       const sessionKey = ctx.session && ctx.session.address.toLowerCase() !== ctx.account.toLowerCase() ? ctx.session.address : undefined;
-      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: args.side, quantityRaw, taker: ctx.account, sessionKey, underlying }, { orderBook: m.orderBook, protocolFeeBps: fee });
+      const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
+      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: args.side, quantityRaw, taker: ctx.account, sessionKey, underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: fee });
       const digest = q.digest;
       ctx.quotes.set(digest, { quote: q, fetchedAt: Date.now(), side: args.side, requestedQuantityRaw: quantityRaw });
-      const view = quoteView(q, underlying, args.side, quantityRaw);
+      const view = quoteView(q, underlying, args.side, quantityRaw, uiMultiplier);
       let requirementAfter: string | undefined;
       try {
         requirementAfter = formatUsdg(await m.requirementIfTraded(id, args.side === "buy" ? quantityRaw : -quantityRaw));
@@ -264,7 +299,7 @@ export function createServer(ctx: KitContext): McpServer {
     "fill_quote",
     {
       title: "Fill a quote",
-      description: "Takes a quote from get_quote for your account via fillOrderAs from the session key, in balance mode (premium, fee and collateral settle from your deposited USDG; no approvals). Opens or adds to a position; to exit an existing position before expiry use close_position instead. dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash when sent.",
+      description: "Takes a quote from get_quote for your account via fillOrderAs from the session key, always in balance mode (premium, fee and collateral settle from your deposited USDG; no approvals). A buy is charged to the session's spend budget (spendLeft in `positions`); SessionLimit means the budget or the session's maxRequirement would be exceeded, SessionWalletMode that a session leg was not in balance mode. Opens or adds to a position; to exit an existing position before expiry use close_position instead. dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash when sent.",
       inputSchema: {
         digest: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional().describe("Digest returned by get_quote"),
         order: z.record(z.unknown()).optional().describe("Alternatively the order JSON from get_quote"),
@@ -340,7 +375,7 @@ export function createServer(ctx: KitContext): McpServer {
     "positions",
     {
       title: "Positions and balances (active)",
-      description: "Your ACTIVE book: market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument with average entry price, the desk's mark, unrealized P&L and time to expiry (when the indexer answers), plus the session's authority. Past activity is get_history; totals are get_pnl; to exit a position before expiry call close_position. Read-only.",
+      description: "Your ACTIVE book: market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument with average entry price, the desk's mark, unrealized P&L and time to expiry (when the indexer answers), plus the session's authority (expiry, authorizedAt, spendLeft = premium + fees it may still pay, maxRequirement). Past activity is get_history; totals are get_pnl; to exit a position before expiry call close_position. Read-only.",
       inputSchema: {},
     },
     async () => {
@@ -362,12 +397,12 @@ export function createServer(ctx: KitContext): McpServer {
         walletUsdg: formatUsdg(snap.walletUsdgRaw),
         positions: snap.positions.map((p) => {
           const f = positionPnl(p, underlying, rows, now);
-          return { instrumentId: p.instrumentId, instrument: f.instrument, label: describeInstrument(p.instrumentId, underlying), quantity: formatShares(p.quantityRaw), side: p.quantityRaw > 0n ? "long" : "short", avgPrice: f.avgPrice, mark: f.mark, markBid: f.markBid, markAsk: f.markAsk, unrealized: f.unrealized, expiry: p.expiry, expiresIn: f.expiresIn, secondsToExpiry: f.secondsToExpiry, closeWith: `close_position { instrument: "${f.instrument}" }` };
+          return { instrumentId: p.instrumentId, instrument: f.instrument, label: describeInstrument(p.instrumentId, underlying, p.uiMultiplier), strike: formatStrike(p.shareStrike), quantity: formatShares(p.quantityRaw), side: p.quantityRaw > 0n ? "long" : "short", avgPrice: f.avgPrice, mark: f.mark, markBid: f.markBid, markAsk: f.markAsk, unrealized: f.unrealized, expiry: p.expiry, expiresIn: f.expiresIn, secondsToExpiry: f.secondsToExpiry, closeWith: `close_position { instrument: "${f.instrument}" }` };
         }),
         pnl: pnl ? { asOf: pnl.asOf, realized: formatSignedUsdg(pnl.realizedRaw), unrealized: formatSignedUsdg(pnl.unrealizedRaw), feesPaid: formatUsdg(BigInt(pnl.feesPaidRaw)), total: formatSignedUsdg(pnl.totalRaw), note: pnl.note } : "indexer unavailable: no marks or P&L",
         expiries: snap.expiries,
         settledAwaitingRedeem: settledPending,
-        session: session ? { key: session.key, active: session.active, canTrade: session.canTrade, canCancel: session.canCancel, expiresAt: session.expiresAt, maxRequirement: session.maxRequirement === 0n ? "unlimited" : formatUsdg(session.maxRequirement) } : "no session key configured",
+        session: session ? sessionView(session) : "no session key configured",
       });
     },
   );
@@ -380,7 +415,7 @@ export function createServer(ctx: KitContext): McpServer {
       inputSchema: {
         ...instrumentFields,
         quantity: decimalAmount.optional().describe("Shares to close; default and maximum: the whole position"),
-        fromBalance: z.boolean().default(true).describe("Settle inside the deposited balance (default); false pays/receives from the session key's wallet"),
+        fromBalance: z.boolean().default(true).describe("Settle inside the deposited balance (default). A session key always settles in balance mode (the market reverts SessionWalletMode otherwise), so false is ignored for it; false (wallet mode) only applies when the signing key is the account itself"),
         confirm: confirmField,
         dryRun: dryRunField,
       },
@@ -388,15 +423,19 @@ export function createServer(ctx: KitContext): McpServer {
     async (args) => {
       const m = ctx.market("session");
       let plan: ClosePlan;
+      // a session key cannot fill in wallet mode (SessionWalletMode): force balance mode and say so
+      const forced = !args.fromBalance && m.signsAsSession;
+      const fromBalance = forced ? true : args.fromBalance;
       try {
         const instrumentId = await instrumentFrom(m, args);
         const sessionKey = ctx.session && ctx.session.address.toLowerCase() !== ctx.account.toLowerCase() ? ctx.session.address : undefined;
-        plan = await planClose({ market: m, rfq: ctx.rfq, instrumentId, quantityRaw: args.quantity ? parseShares(args.quantity) : undefined, fromBalance: args.fromBalance, sessionKey, protocolFeeBps: await m.protocolFeeBps() });
+        plan = await planClose({ market: m, rfq: ctx.rfq, instrumentId, quantityRaw: args.quantity ? parseShares(args.quantity) : undefined, fromBalance, sessionKey, protocolFeeBps: await m.protocolFeeBps() });
       } catch (e) {
         return fail(`close failed: ${errorText(e)}`);
       }
       ctx.quotes.set(plan.quote.digest, { quote: plan.quote, fetchedAt: Date.now(), side: plan.side, requestedQuantityRaw: plan.quantityRaw });
-      const view = closeView(plan, underlying);
+      const view: ReturnType<typeof closeView> & { fromBalance: boolean; note?: string } = { ...closeView(plan, underlying), fromBalance };
+      if (forced) view.note = "fromBalance: false ignored: a session key always settles in balance mode (the market reverts SessionWalletMode on a session leg in wallet mode)";
       if (!plan.quote.fillable) return json({ ...view, ok: false, fillable: false, note: "the desk runs without a signer key: this quote carries a placeholder signature and cannot be filled; nothing to send" });
       if (plan.quote.canFill === false) view.quote.fundingPreview = { ...view.quote.fundingPreview, note: `maker predicts canFill=false${plan.quote.shortfallRaw > 0n ? ` (shortfall ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}` };
       return sendOrExplain(ctx, "session", plan.request, args.confirm, args.dryRun, view);
@@ -469,27 +508,28 @@ export function createServer(ctx: KitContext): McpServer {
     "authorize_session",
     {
       title: "Authorize session key (owner key only)",
-      description: "authorizeSession(key, expiresAt, scope, maxRequirement) from the owner: lets the session key trade for the account (never withdraw). Set maxRequirement to cap the collateral a session may lock. Also used to rotate or extend. dryRun default true. Requires confirm: true.",
+      description: "authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend) from the owner: lets the session key trade for the account (never withdraw). maxSpend (required) is the total premium + fees the key may make the account pay over the session (\"0\" = it cannot buy; \"unlimited\" = no cap; a budget such as \"100\" is recommended). maxRequirement caps the collateral requirement a session trade may push the account to (default \"0\" = no new requirement, i.e. it cannot write options; \"unlimited\" = no cap). " + SESSION_LIMITS + " Re-authorizing (rotate or extend) replaces the terms, resets the budget and voids every order the key signed before. dryRun default true. Requires confirm: true.",
       inputSchema: {
         key: address.optional().describe("Session key address; default: the configured session key"),
         days: z.number().int().min(1).max(365).default(30),
-        maxRequirement: decimalAmount.optional().describe("USDG cap on total requirement; omit or \"0\" for unlimited"),
+        maxSpend: sessionCap.optional().describe("Required unless revoke: USDG of premium + fees the key may spend for the account over the session, e.g. \"100\"; \"0\" = cannot buy; \"unlimited\" = no cap"),
+        maxRequirement: sessionCap.default("0").describe("USDG cap on the account's total requirement after a session trade; \"0\" (default) = no new requirement (cannot write options); \"unlimited\" = no cap"),
         cancel: z.boolean().default(true).describe("Also grant SCOPE_CANCEL"),
         revoke: z.boolean().default(false).describe("true: revokeSession(key) instead"),
         confirm: confirmField,
         dryRun: dryRunField,
       },
     },
-    async ({ key, days, maxRequirement, cancel, revoke, confirm, dryRun }) => {
+    async ({ key, days, maxSpend, maxRequirement, cancel, revoke, confirm, dryRun }) => {
       requireOwner(ctx);
       const k = key ?? ctx.session?.address;
       if (!k) return fail("no session key to authorize: pass key or set HEDGEHOOD_SESSION_KEY_FILE");
       const m = ctx.market("owner");
       if (revoke) return sendOrExplain(ctx, "owner", m.revokeSession(k), confirm, dryRun);
+      if (maxSpend === undefined) return fail("maxSpend is required: the USDG of premium + fees this key may spend for the account over the session (e.g. \"100\"; \"0\" = it cannot buy; \"unlimited\" = no cap)");
       const expiresAt = Math.floor(Date.now() / 1000) + days * 86400;
-      const scope = SCOPE_TRADE | (cancel ? SCOPE_CANCEL : 0n);
-      void scope;
-      return sendOrExplain(ctx, "owner", m.authorizeSession(k, expiresAt, { trade: true, cancel, maxRequirement: maxRequirement ? parseUsdg(maxRequirement) : 0n }), confirm, dryRun);
+      const terms = { maxSpend: formatSessionCap(parseCap(maxSpend)), maxRequirement: formatSessionCap(parseCap(maxRequirement)), expiresAt, note: "re-authorizing resets the spend budget and voids orders this key signed before" };
+      return sendOrExplain(ctx, "owner", m.authorizeSession(k, expiresAt, { trade: true, cancel, maxRequirement: parseCap(maxRequirement), maxSpend: parseCap(maxSpend) }), confirm, dryRun, { terms });
     },
   );
 
@@ -550,10 +590,18 @@ export function createServer(ctx: KitContext): McpServer {
 
   server.registerTool(
     "decode_instrument",
-    { title: "Decode instrument id", description: "Expiry, strike and kind of an instrument id. Pure.", inputSchema: { instrumentId: uintString } },
-    async ({ instrumentId }) => {
-      const d = decodeInstrumentId(BigInt(instrumentId));
-      return json({ ...d, strike: formatStrike(d.strike), date: new Date(Number(d.expiry) * 1000).toISOString(), label: describeInstrument(BigInt(instrumentId), underlying) });
+    {
+      title: "Decode instrument id",
+      description: "Expiry, strike and kind of an instrument id, with its backend name. The id packs the per-token strike; `strike` is the listed per-share strike under the expiry's snapshotted uiMultiplier (read from the market when the expiry is open, else 1, or pass uiMultiplier). Read-only.",
+      inputSchema: { instrumentId: uintString, uiMultiplier: uintString.optional().describe("The expiry's uiMultiplier (1e18 = 1.0); default: read from the market") },
+    },
+    async ({ instrumentId, uiMultiplier }) => {
+      const id = BigInt(instrumentId);
+      const d = decodeInstrumentId(id);
+      let m = uiMultiplier ? BigInt(uiMultiplier) : undefined;
+      if (m === undefined && ctx.marketDeployment) m = await ctx.market("none").expiryMultiplier(d.expiry).catch(() => undefined);
+      const mult = m && m > 0n ? m : UNIT_MULTIPLIER;
+      return json({ ...d, strike: formatStrike(shareStrikeOf(d.strike, mult)), strikeRaw: d.strike, uiMultiplier: mult, date: new Date(Number(d.expiry) * 1000).toISOString(), instrument: instrumentName(underlying, d.expiry, d.strike, d.isPut, mult), label: describeInstrument(id, underlying, mult) });
     },
   );
 

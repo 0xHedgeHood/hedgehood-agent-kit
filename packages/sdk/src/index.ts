@@ -11,6 +11,7 @@ export * from "./rfq.js";
 export * from "./close.js";
 export * from "./pnl.js";
 export * from "./x402.js";
+export * from "./errors.js";
 export * from "./identity.js";
 export { marketV2Abi } from "./abi/cashOptionMarketV2.js";
 export { orderBookV2Abi } from "./abi/cashOptionOrderBookV2.js";

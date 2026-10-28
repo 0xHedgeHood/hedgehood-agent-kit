@@ -11,8 +11,13 @@ import {
   depositViaGateway,
   describeInstrument,
   encodeInstrumentId,
+  expiryOf,
+  formatSessionCap,
   instrumentName,
-  resolveInstrumentName,
+  shareStrikeOf,
+  tokenStrikeOf,
+  UNIT_MULTIPLIER,
+  UNLIMITED,
   encodeRegisterAgent,
   formatShares,
   formatSignedUsdg,
@@ -175,7 +180,7 @@ function closePlanHuman(plan: ClosePlan, underlying: string): string {
   const q = plan.quote;
   return [
     `close ${plan.instrument}: position ${plan.position.quantityRaw > 0n ? "+" : ""}${formatShares(plan.position.quantityRaw)} -> ${plan.side} ${formatShares(plan.quantityRaw)} (remaining ${plan.remainingRaw > 0n ? "+" : ""}${formatShares(plan.remainingRaw)})`,
-    quoteHuman(q, underlying, plan.quantityRaw),
+    quoteHuman(q, underlying, plan.quantityRaw, plan.position.uiMultiplier),
   ].join("\n");
 }
 
@@ -184,18 +189,46 @@ function closePlanJson(plan: ClosePlan) {
   return { instrument: plan.instrument, instrumentId: plan.instrumentId, positionRaw: plan.position.quantityRaw, side: plan.side, quantityRaw: plan.quantityRaw, remainingRaw: plan.remainingRaw, digest: q.digest, pricePerShareRaw: q.pricePerShareRaw, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, secondsLeft: q.secondsLeft, fillable: q.fillable, backendDryRun: q.dryRun };
 }
 
-/** "<instrumentId>", "NVDA-20261030-220-C" (backend name) or "<expiry>:<strike>:<call|put>". */
+/**
+ * "<instrumentId>", "NVDA-20261030-220-C" (backend name, listed per-share strike) or "<expiry>:<strike>:<call|put>"
+ * (per-share strike, mapped to the per-token strike under the expiry's uiMultiplier).
+ */
 async function instrumentArg(ctx: KitContext, v: string): Promise<bigint> {
   if (/^\d+$/.test(v)) return BigInt(v);
   const m = /^(\d+):(\d+(?:\.\d+)?):(call|put|c|p)$/i.exec(v);
-  if (m) return encodeInstrumentId(BigInt(m[1]!), parseUsdg(m[2]!), /^p/i.test(m[3]!));
-  return resolveInstrumentName(v, await ctx.market("none").openedExpiries());
+  const market = ctx.market("none");
+  if (m) {
+    const expiry = BigInt(m[1]!);
+    return encodeInstrumentId(expiry, tokenStrikeOf(parseUsdg(m[2]!), await market.expiryMultiplier(expiry)), /^p/i.test(m[3]!));
+  }
+  return market.resolveInstrumentName(v);
 }
 
-function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint): string {
+/** "unlimited" -> type(uint256).max, else USDG -> raw. */
+export function parseCap(v: string, flag: string): bigint {
+  const t = v.trim();
+  if (/^unlimited$/i.test(t)) return UNLIMITED;
+  try {
+    return parseUsdg(t);
+  } catch {
+    throw new Error(`${flag} must be a USDG amount or "unlimited", got ${v}`);
+  }
+}
+
+const MAX_SPEND_HELP = "USDG of premium + fees the session key may spend for the account over the session (0 = it cannot buy; unlimited = no cap)";
+const MAX_REQUIREMENT_HELP = "USDG cap on the account's collateral requirement after a session trade (0 = no new requirement, it cannot write options; unlimited = no cap)";
+const MAX_SPEND_MISSING =
+  "--max-spend is required: the most premium + fees this session key may spend for the account over the session. Suggested: --max-spend 100 (or the budget you mean to trade, at most your deposit); --max-spend 0 lets it only sell/close longs; --max-spend unlimited removes the cap (not recommended).";
+
+function sessionLine(s: { key: string; active: boolean; canTrade: boolean; canCancel: boolean; expiresAt: bigint; authorizedAt: bigint; spendLeft: bigint; maxRequirement: bigint }): string {
+  const at = (t: bigint) => (t === 0n ? "-" : iso(Number(t)));
+  return `session ${s.key} ${s.active ? "ACTIVE" : "inactive"} trade=${s.canTrade} cancel=${s.canCancel} authorized ${at(s.authorizedAt)} until ${at(s.expiresAt)} spendLeft ${formatSessionCap(s.spendLeft)} maxRequirement ${formatSessionCap(s.maxRequirement)}`;
+}
+
+function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint, uiMultiplier: bigint = UNIT_MULTIPLIER): string {
   const pays = q.netNowRaw > 0n;
   return [
-    `${q.instrument}  (${describeInstrument(q.order.instrumentId, underlying)})  qty ${formatShares(qty)}${q.dryRun ? "  [BACKEND DRY RUN: placeholder signature, not fillable]" : ""}`,
+    `${q.instrument}  (${describeInstrument(q.order.instrumentId, underlying, uiMultiplier)})  qty ${formatShares(qty)}${q.dryRun ? "  [BACKEND DRY RUN: placeholder signature, not fillable]" : ""}`,
     `  price/share ${formatUsdg(q.pricePerShareRaw)}  premium ${formatUsdg(q.premiumNowRaw)}  fee ${formatUsdg(q.feeNowRaw)}  ${pays ? "you pay" : "you receive"} ${formatUsdg(pays ? q.netNowRaw : -q.netNowRaw)}`,
     `  valid ${q.secondsLeft}s (until ${q.order.validUntil})  canFill ${q.canFill ?? "unknown"}${q.shortfallRaw > 0n ? `  shortfall ${formatUsdg(q.shortfallRaw)}` : ""}${q.funding.note ? `  (${q.funding.note})` : ""}`,
     `  digest ${q.digest}  maker ${q.order.maker}  mark mid ${q.markPrice}`,
@@ -224,9 +257,10 @@ export function buildProgram(): Command {
     .command("join")
     .description("Create a session key (if none), show the addresses, and (with an owner key) authorize it on the market")
     .option("--days <n>", "session validity in days", "30")
-    .option("--max-requirement <usdg>", "cap on collateral the session may lock (0 = unlimited)", "0")
+    .option("--max-spend <usdg|unlimited>", `${MAX_SPEND_HELP}; required to authorize`)
+    .option("--max-requirement <usdg|unlimited>", MAX_REQUIREMENT_HELP, "0")
     .option("--send", "broadcast instead of dry run")
-    .action(async (opts: { days: string; maxRequirement: string; send?: boolean }, cmd: Command) => {
+    .action(async (opts: { days: string; maxSpend?: string; maxRequirement: string; send?: boolean }, cmd: Command) => {
       const g = cmd.optsWithGlobals() as GlobalOpts;
       const file = expand(g.sessionKeyFile ?? process.env.HEDGEHOOD_SESSION_KEY_FILE ?? DEFAULT_SESSION_KEY_FILE);
       let created = false;
@@ -245,12 +279,15 @@ export function buildProgram(): Command {
         `account         ${ctx.account}${ctx.owner ? " (owner key loaded)" : ""}`,
         `chain ${ctx.chainId}  market ${ctx.deployment.market}  book ${ctx.deployment.orderBook}`,
       ];
+      const maxRequirement = parseCap(opts.maxRequirement, "--max-requirement");
+      const maxSpend = opts.maxSpend === undefined ? undefined : parseCap(opts.maxSpend, "--max-spend");
       if (!ctx.owner) {
         lines.push(
           "",
           "Next, from the OWNER wallet (not this machine, if you can): authorize the session key on the market:",
-          `  cast send ${ctx.deployment.market} 'authorizeSession(address,uint64,uint256,uint256)' ${session.address} ${Math.floor(Date.now() / 1000) + Number(opts.days) * 86400} 3 ${parseUsdg(opts.maxRequirement)} --rpc-url <rpc>`,
-          "  (scope 3 = trade + cancel; last arg = maxRequirement in USDG raw, 0 = unlimited)",
+          `  cast send ${ctx.deployment.market} 'authorizeSession(address,uint64,uint256,uint256,uint256)' ${session.address} ${Math.floor(Date.now() / 1000) + Number(opts.days) * 86400} 3 ${maxRequirement} ${maxSpend ?? "<maxSpendRaw>"} --rpc-url <rpc>`,
+          "  (scope 3 = trade + cancel; then maxRequirement and maxSpend in USDG raw (6 decimals): 0 = none, 115792089237316195423570985008687907853269984665640564039457584007913129639935 = unlimited.",
+          "   maxSpend is the most premium + fees the key may spend over the session, e.g. 100000000 = 100 USDG; maxRequirement 0 = it cannot write options)",
           "then deposit USDG: `hedgehood deposit <amount> --x402` or `cast send <usdg> 'approve(address,uint256)' ...; cast send <market> 'deposit(address,uint256)' ...`",
           "",
           "MCP config for Claude Code / Codex:",
@@ -259,8 +296,9 @@ export function buildProgram(): Command {
         out(cmd, { sessionKeyFile: file, sessionAddress: session.address, account: ctx.account, chainId: ctx.chainId, created }, lines.join("\n"));
         return;
       }
+      if (maxSpend === undefined) throw new Error(MAX_SPEND_MISSING);
       process.stdout.write(lines.join("\n") + "\n");
-      const tx = ctx.market("owner").authorizeSession(session.address, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: true, maxRequirement: parseUsdg(opts.maxRequirement) });
+      const tx = ctx.market("owner").authorizeSession(session.address, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: true, maxRequirement, maxSpend });
       await send(cmd, ctx, "owner", tx, opts.send);
     });
 
@@ -273,7 +311,7 @@ export function buildProgram(): Command {
       const expiries = await m.openedExpiries();
       const infos = await Promise.all(expiries.map((e) => m.expiryInfo(e)));
       const fee = await m.protocolFeeBps();
-      const human = [`${ctx.deployment.underlying} on chain ${ctx.chainId}  market ${m.market}  book ${m.orderBook}  taker fee ${fee} bps`, ...infos.map((i) => `  expiry ${i.expiry} ${new Date(Number(i.expiry) * 1000).toISOString().slice(0, 16)}Z  ${i.settled ? `settled @ ${formatUsdg(i.settlementPrice)}` : i.tradingOpen ? "trading" : "closed"}  anchor ${formatUsdg(i.anchor)}  strikes ${i.strikes.map(formatStrike).join(" ")}`)];
+      const human = [`${ctx.deployment.underlying} on chain ${ctx.chainId}  market ${m.market}  book ${m.orderBook}  taker fee ${fee} bps`, ...infos.map((i) => `  expiry ${i.expiry} ${new Date(Number(i.expiry) * 1000).toISOString().slice(0, 16)}Z  ${i.settled ? `settled @ ${formatUsdg(i.settlementPrice)}` : i.tradingOpen ? "trading" : "closed"}  anchor ${formatUsdg(i.anchor)}${i.uiMultiplier === UNIT_MULTIPLIER ? "" : ` (per token; uiMultiplier ${formatUnits(i.uiMultiplier, 18)})`}  strikes ${i.shareStrikes.map(formatStrike).join(" ")}`)];
       out(cmd, { chainId: ctx.chainId, market: m.market, orderBook: m.orderBook, takerFeeBps: fee, expiries: infos }, human.join("\n"));
     });
 
@@ -284,8 +322,8 @@ export function buildProgram(): Command {
     .action(async (expiry: string, _o: unknown, cmd: Command) => {
       const ctx = ctxFrom(cmd, true);
       const info = await ctx.market("none").expiryInfo(BigInt(expiry));
-      const rows = info.strikes.flatMap((s) => [false, true].map((p) => ({ instrument: instrumentName(ctx.deployment.underlying, info.expiry, s, p), instrumentId: encodeInstrumentId(info.expiry, s, p), label: describeInstrument(encodeInstrumentId(info.expiry, s, p), ctx.deployment.underlying) })));
-      out(cmd, { expiry: info.expiry, tradingOpen: info.tradingOpen, instruments: rows }, rows.map((r) => `${r.instrument}  ${r.instrumentId}`).join("\n"));
+      const rows = info.strikes.flatMap((s) => [false, true].map((p) => ({ instrument: instrumentName(ctx.deployment.underlying, info.expiry, s, p, info.uiMultiplier), instrumentId: encodeInstrumentId(info.expiry, s, p), strike: formatStrike(shareStrikeOf(s, info.uiMultiplier)), strikeRaw: s, label: describeInstrument(encodeInstrumentId(info.expiry, s, p), ctx.deployment.underlying, info.uiMultiplier) })));
+      out(cmd, { expiry: info.expiry, tradingOpen: info.tradingOpen, uiMultiplier: info.uiMultiplier, instruments: rows }, rows.map((r) => `${r.instrument}  ${r.instrumentId}`).join("\n"));
     });
 
   program
@@ -300,15 +338,16 @@ export function buildProgram(): Command {
       const m = ctx.market("none");
       const id = await instrumentArg(ctx, instrument);
       const qty = parseShares(opts.qty);
-      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+      const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
+      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
       const file = { order: orderToJson(q.order), signature: q.signature, side: opts.side, quantityRaw: qty.toString(), chainId: ctx.chainId, dryRun: q.dryRun };
       if (opts.out) writeFileSync(opts.out, JSON.stringify(file, null, 2));
-      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable }, quoteHuman(q, ctx.deployment.underlying, qty) + (opts.out ? `\n  saved to ${opts.out}` : ""));
+      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable }, quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + (opts.out ? `\n  saved to ${opts.out}` : ""));
     });
 
   program
     .command("fill")
-    .description("Fill a saved quote file, or quote-and-fill an instrument in one go (session key, balance mode)")
+    .description("Fill a saved quote file, or quote-and-fill an instrument in one go (session key, always balance mode; a buy is charged to the session's spend budget)")
     .argument("[quoteFile]")
     .option("--instrument <x>", "quote-and-fill: instrument id or expiry:strike:call|put")
     .option("--side <buy|sell>")
@@ -327,8 +366,10 @@ export function buildProgram(): Command {
       } else {
         if (!opts.instrument || !opts.side) throw new Error("give a quote file, or --instrument and --side");
         qty = parseShares(opts.qty ?? "1");
-        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: await instrumentArg(ctx, opts.instrument), side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
-        process.stdout.write(quoteHuman(q, ctx.deployment.underlying, qty) + "\n");
+        const id = await instrumentArg(ctx, opts.instrument);
+        const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
+        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+        process.stdout.write(quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + "\n");
         if (!q.fillable) throw new Error("backend dry-run quote (placeholder signature): nothing to fill");
         if (q.canFill === false) process.stdout.write(`  maker says canFill=false${q.shortfallRaw > 0n ? ` (short ${formatUsdg(q.shortfallRaw)} USDG)` : ""}; the fill will likely revert\n`);
         order = q.order;
@@ -375,7 +416,7 @@ export function buildProgram(): Command {
             human.push(r.human);
             if (r.failed) process.exitCode = 1;
           } catch (e) {
-            const name = describeInstrument(p.instrumentId, underlying);
+            const name = describeInstrument(p.instrumentId, underlying, p.uiMultiplier);
             results.push({ instrumentId: p.instrumentId, positionRaw: p.quantityRaw, error: e instanceof Error ? e.message : String(e) });
             human.push(`close ${name}: FAILED ${e instanceof Error ? e.message : String(e)}`);
             process.exitCode = 1;
@@ -403,7 +444,7 @@ export function buildProgram(): Command {
       const [indexed, pnl] = await Promise.all([ctx.rfq.positions(ctx.account).catch(() => undefined), ctx.rfq.getPnl(ctx.account).catch(() => undefined)]);
       const rows = pnlByInstrument(pnl);
       const now = Math.floor(Date.now() / 1000);
-      const positions = s.positions.map((p) => ({ ...p, ...positionPnl(p, underlying, rows, now), label: describeInstrument(p.instrumentId, underlying) }));
+      const positions = s.positions.map((p) => ({ ...p, ...positionPnl(p, underlying, rows, now), label: describeInstrument(p.instrumentId, underlying, p.uiMultiplier) }));
       const lines = [
         `account ${s.account}`,
         `collateral ${formatUsdg(s.collateralRaw)}  locked ${formatUsdg(s.requirementRaw)}  free ${formatUsdg(s.freeCollateralRaw)}  wallet USDG ${formatUsdg(s.walletUsdgRaw)}`,
@@ -416,7 +457,7 @@ export function buildProgram(): Command {
               .map((l) => `  ${l}`)
               .join("\n")
           : "  no positions",
-        sess ? `session ${sess.key} ${sess.active ? "ACTIVE" : "inactive"} trade=${sess.canTrade} cancel=${sess.canCancel} until ${sess.expiresAt} maxRequirement ${sess.maxRequirement === 0n ? "unlimited" : formatUsdg(sess.maxRequirement)}` : "session: none configured",
+        sess ? sessionLine(sess) : "session: none configured",
         pnl ? `pnl: realized ${usdgOf(pnl.realizedRaw)}  unrealized ${usdgOf(pnl.unrealizedRaw)}  fees ${formatUsdg(BigInt(pnl.feesPaidRaw))}  total ${usdgOf(pnl.totalRaw)}` : "pnl: indexer unavailable",
         indexed ? `indexer: ${indexed.positions.length} position(s), fills ${indexed.leaderboard?.fills ?? 0}, settled PnL ${formatUsdg(BigInt(indexed.leaderboard?.settledPnlRaw ?? "0"))}, agentId ${indexed.agentId ?? "none"}` : "indexer: unavailable",
       ];
@@ -493,16 +534,21 @@ export function buildProgram(): Command {
   const session = program.command("session").description("Session key management (owner key)");
   session
     .command("authorize")
+    .description("authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend); re-authorizing resets the spend budget and voids orders the key signed before")
     .option("--key <address>", "default: the configured session key")
     .option("--days <n>", "validity", "30")
-    .option("--max-requirement <usdg>", "0 = unlimited", "0")
+    .option("--max-spend <usdg|unlimited>", `${MAX_SPEND_HELP}; required, e.g. 100`)
+    .option("--max-requirement <usdg|unlimited>", MAX_REQUIREMENT_HELP, "0")
     .option("--no-cancel", "do not grant SCOPE_CANCEL")
     .option("--send")
-    .action(async (opts: { key?: string; days: string; maxRequirement: string; cancel: boolean; send?: boolean }, cmd: Command) => {
+    .action(async (opts: { key?: string; days: string; maxSpend?: string; maxRequirement: string; cancel: boolean; send?: boolean }, cmd: Command) => {
+      if (opts.maxSpend === undefined) throw new Error(MAX_SPEND_MISSING);
+      const maxSpend = parseCap(opts.maxSpend, "--max-spend");
+      const maxRequirement = parseCap(opts.maxRequirement, "--max-requirement");
       const ctx = ctxFrom(cmd);
       const key = (opts.key ?? ctx.session?.address) as Address | undefined;
       if (!key) throw new Error("no session key: pass --key or create one with `hedgehood join`");
-      await send(cmd, ctx, "owner", ctx.market("owner").authorizeSession(key, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: opts.cancel, maxRequirement: parseUsdg(opts.maxRequirement) }), opts.send);
+      await send(cmd, ctx, "owner", ctx.market("owner").authorizeSession(key, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: opts.cancel, maxRequirement, maxSpend }), opts.send);
     });
   session
     .command("revoke")
@@ -520,7 +566,7 @@ export function buildProgram(): Command {
       const key = (opts.key ?? ctx.session?.address) as Address | undefined;
       if (!key) throw new Error("no session key configured");
       const s = await ctx.market("none").session(key, ctx.account);
-      out(cmd, s, `session ${s.key} for ${ctx.account}: ${s.active ? "ACTIVE" : "inactive"} trade=${s.canTrade} cancel=${s.canCancel} expiresAt ${s.expiresAt} maxRequirement ${s.maxRequirement === 0n ? "unlimited" : formatUsdg(s.maxRequirement)}`);
+      out(cmd, s, `${sessionLine(s)}\n  account ${ctx.account}; a session key fills in balance mode only, buys come out of spendLeft (SessionLimit when exhausted)`);
     });
 
   program
@@ -538,11 +584,23 @@ export function buildProgram(): Command {
 
   program
     .command("decode")
-    .description("Decode an instrument id")
+    .description("Decode an instrument id; the strike shown is the listed per-share strike under the expiry's uiMultiplier (read from the market unless --multiplier)")
     .argument("<instrumentId>")
-    .action((id: string, _o: unknown, cmd: Command) => {
+    .option("--multiplier <raw>", "the expiry's uiMultiplier (1e18 = 1.0); default: read from the market, else 1e18")
+    .action(async (id: string, opts: { multiplier?: string }, cmd: Command) => {
       const d = decodeInstrumentId(BigInt(id));
-      out(cmd, d, `${describeInstrument(BigInt(id))}  expiry ${d.expiry}  strike ${formatStrike(d.strike)}  ${d.isPut ? "put" : "call"}`);
+      let m = opts.multiplier ? BigInt(opts.multiplier) : undefined;
+      if (m === undefined) {
+        try {
+          m = await ctxFrom(cmd, true).market("none").expiryMultiplier(d.expiry);
+        } catch {
+          m = UNIT_MULTIPLIER;
+        }
+      }
+      const shareStrike = shareStrikeOf(d.strike, m);
+      const g = cmd.optsWithGlobals() as GlobalOpts;
+      const underlying = g.underlying ?? "";
+      out(cmd, { ...d, shareStrike, uiMultiplier: m }, `${describeInstrument(BigInt(id), underlying, m)}  expiry ${d.expiry}  strike ${formatStrike(shareStrike)}${m === UNIT_MULTIPLIER ? "" : ` (per token ${formatStrike(d.strike)}, uiMultiplier ${formatUnits(m, 18)})`}  ${d.isPut ? "put" : "call"}`);
     });
 
   registerVaultCommands(program);
