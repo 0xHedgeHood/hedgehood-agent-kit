@@ -30,7 +30,7 @@ server that signs with the agent's key), `packages/cli` (`hedgehood`), the Claud
 ## Layout
 
 ```
-packages/sdk/src/{chains,instrument,order,calldata,units,market,rfq,x402,identity}.ts, abi/
+packages/sdk/src/{chains,instrument,order,calldata,units,market,rfq,close,pnl,x402,identity}.ts, abi/
 packages/mcp/src/{config,context,server,http,bin}.ts, server.json
 packages/cli/src/{cli,bin}.ts
 skills/hedgehood-options/SKILL.md   .claude-plugin/{plugin,marketplace}.json

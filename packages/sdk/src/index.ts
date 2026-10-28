@@ -5,6 +5,8 @@ export * from "./calldata.js";
 export * from "./units.js";
 export * from "./market.js";
 export * from "./rfq.js";
+export * from "./close.js";
+export * from "./pnl.js";
 export * from "./x402.js";
 export * from "./identity.js";
 export { marketV2Abi } from "./abi/cashOptionMarketV2.js";

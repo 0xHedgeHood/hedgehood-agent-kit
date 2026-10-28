@@ -30,7 +30,9 @@ await market.send(tx, { dryRun: true }); // simulate; { dryRun: false } broadcas
 
 Modules: `chains` (deployments 46630/4663), `instrument` (id packing, `gridFor`), `order` (EIP-712 V2 orders, decay
 math, `signOrder`, `verifyOrderSignature`), `calldata` (every write as an unsigned `TxRequest`), `market`
-(`MarketClient` reads and dry-run-first sends), `rfq` (`RfqClient`, assumed backend API), `x402` (`depositViaGateway`,
+(`MarketClient` reads and dry-run-first sends), `rfq` (`RfqClient`: quotes with one retry on `feed_not_healthy`,
+`getPnl`, `getHistory`), `close` (`planClose` / `closePosition`: the opposite-side fill that exits a position), `pnl`
+(`positionPnl`, `formatTimeToExpiry`), `x402` (`depositViaGateway`,
 USDG preset adapted from `@priors/x402`), `identity` (ERC-8004), `units`. ABIs: `marketV2Abi`, `orderBookV2Abi`,
 `erc20Abi`, `identityRegistryAbi`.
 

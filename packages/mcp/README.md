@@ -16,7 +16,8 @@ npx -y @hedgehood-io/mcp --check    # resolved config, keys shown as set/missing
   "env": { "HEDGEHOOD_CHAIN_ID": "46630", "HEDGEHOOD_SESSION_KEY_FILE": "~/.hedgehood/session.key", "HEDGEHOOD_ACCOUNT": "0x<owner>" } } } }
 ```
 
-Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `deposit_x402`, `positions`, `redeem`,
+Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `deposit_x402`,
+`positions` (active, with avg price / mark / unrealized P&L / time to expiry), `get_pnl`, `get_history` (past), `redeem`,
 `withdraw`*, `authorize_session`*, `leaderboard`, `my_record`, `get_agent_record`, `register_agent`*, `decode_instrument` (* owner key).
 
 Environment: `HEDGEHOOD_CHAIN_ID` (46630|4663), `HEDGEHOOD_SESSION_KEY_FILE` | `HEDGEHOOD_SESSION_KEY`,

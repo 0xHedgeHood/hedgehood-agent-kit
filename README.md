@@ -16,9 +16,9 @@ RFQ maker and filled on chain with a **session key that can never withdraw**.
 
 | package | what | install |
 |---|---|---|
-| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, x402 USDG payer, ERC-8004 helpers | `pnpm add @hedgehood-io/sdk viem` |
-| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 14 tools, every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
-| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `deposit`, `quote`, `fill`, `positions`, `redeem`, `withdraw`, `session authorize\|revoke\|status` | `npx @hedgehood-io/cli --help` |
+| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, P&L and history readers, x402 USDG payer, ERC-8004 helpers | `pnpm add @hedgehood-io/sdk viem` |
+| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 18 tools, every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
+| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw`, `session authorize\|revoke\|status` | `npx @hedgehood-io/cli --help` |
 | [`skills/hedgehood-options`](skills/hedgehood-options/SKILL.md) | the skill an agent reads: market model, the loop, key hygiene, troubleshooting | `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` |
 | [`examples/`](examples) | a 30-line "agent buys a weekly call" script and an MCP config snippet | `pnpm tsx examples/buy-weekly-call.ts` |
 
@@ -41,11 +41,22 @@ hedgehood markets                                   # open expiries, strikes
 hedgehood quote NVDA-20261030-220-C --side buy --qty 1                    # firm RFQ quote, verified locally
 hedgehood fill --instrument NVDA-20261030-220-C --side buy --qty 1        # dry run: simulates, prints calldata
 hedgehood fill --instrument NVDA-20261030-220-C --side buy --qty 1 --send # broadcasts, prints the tx hash
-hedgehood positions
+hedgehood positions                                 # open positions: qty, avg price, mark, unrealized P&L, time to expiry
+hedgehood pnl                                       # realized / unrealized / fees / total (indexer)
+hedgehood history --limit 20                        # past fills, settlements, redeems, newest first
+hedgehood close NVDA-20261030-220-C                 # exit before expiry: quotes the opposite side, dry run
+hedgehood close NVDA-20261030-220-C --qty 0.5 --send
+hedgehood close --all --send                        # flatten every open position
 ```
 
+Positions are signed and net out on chain, and the maker quotes both sides of every instrument, so closing is a fill of
+the opposite side of the same instrument (a long is sold to the bid, a short bought back at the ask). `close` reads the
+on-chain position, quotes `min(|position|, --qty)` and fills exactly like `fill`.
+
 Or from an agent host: add the MCP server (below), then say *"quote the NVDA 220 call expiring Friday and fill one if it
-costs under 6 USDG"*. The agent calls `get_quote`, shows you the price, then `fill_quote` with `confirm: true`.
+costs under 6 USDG"*. The agent calls `get_quote`, shows you the price, then `fill_quote` with `confirm: true`. Later,
+*"how am I doing?"* is `positions` / `get_pnl`, *"what did I trade?"* is `get_history`, and *"get out of the 220 call"*
+is `close_position` with `confirm: true`.
 
 ## MCP server
 
@@ -75,10 +86,13 @@ costs under 6 USDG"*. The agent calls `get_quote`, shows you the price, then `fi
   hosts that want a URL: `npx -y @hedgehood-io/mcp --http 7402` serves `http://127.0.0.1:7402/mcp` (localhost only; it signs).
 - `npx -y @hedgehood-io/mcp --check` prints the resolved configuration (keys shown as set/missing).
 
-Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `deposit_x402`, `positions`, `redeem`,
-`withdraw` (owner key), `authorize_session` (owner key), `leaderboard`, `my_record`, `get_agent_record`, `register_agent`
-(ERC-8004, owner key), `decode_instrument`. Write tools do nothing without `confirm: true`; with it they simulate and return the unsigned
-transaction unless `dryRun: false`, and then report the tx hash.
+Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `deposit_x402`,
+`positions` (active: open positions with avg price, mark, unrealized P&L, time to expiry), `get_pnl`, `get_history`
+(past: fills, settlements, redeems), `redeem`, `withdraw` (owner key), `authorize_session` (owner key), `leaderboard`,
+`my_record`, `get_agent_record`, `register_agent` (ERC-8004, owner key), `decode_instrument`. Write tools
+(`fill_quote`, `close_position`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`) do nothing
+without `confirm: true`; with it they simulate and return the unsigned transaction unless `dryRun: false`, and then
+report the tx hash.
 
 ## Security model
 
@@ -92,6 +106,10 @@ transaction unless `dryRun: false`, and then report the tx hash.
   true)`): no ERC-20 approvals, nothing is ever pulled from a wallet; a shortfall reverts.
 - **Dry run by default.** Every send in the SDK, CLI and MCP server simulates and returns the unsigned transaction unless
   told to broadcast (`--send`, `dryRun: false`). Keys are read from files (`chmod 600` enforced) and never logged.
+- **Closing = the opposite fill.** `closePosition` / `hedgehood close` / `close_position` never use a special path: they
+  read the signed on-chain position, request a quote on the other side for at most that size and send the same
+  `fillOrderAs` from the session key, with the same dry-run default. A `503 not_executable:feed_not_healthy` from the desk
+  is retried once after 1.5 s (the feed cycles every 20 s); nothing else is retried.
 - **Quote verification.** `getQuote` checks locally that the maker's order is for this chain, book and market, addressed
   to your account (`taker`), still valid, on the side you asked, and that the signature recovers to `order.signer`, before
   anything is handed to a wallet.

@@ -208,6 +208,76 @@ describe("RfqClient.getQuote", () => {
     expect((err as RfqError).message).toMatch(/503 not_executable: not_executable:stale/);
   });
 
+  it("retries a 503 not_executable:feed_not_healthy once, then surfaces it; other refusals are not retried", async () => {
+    const order = makeOrder();
+    const good = await backendQuote(order);
+    const unhealthy = () => new Response(JSON.stringify({ error: "not_executable", reason: "not_executable:feed_not_healthy" }), { status: 503, headers: { "content-type": "application/json" } });
+    const make = (responses: Array<() => Response>) => {
+      const calls: number[] = [];
+      const fetchImpl: typeof fetch = (async () => {
+        calls.push(Date.now());
+        const next = responses.shift();
+        return next ? next() : new Response("{}", { status: 500 });
+      }) as typeof fetch;
+      return { calls, client: new RfqClient({ chainId: 46630, hosts: { rfq: "https://rfq.test" }, fetch: fetchImpl, now: () => NOW + 7, feedRetryMs: 30 }) };
+    };
+    // feed recovers: one retry, quote verified as usual
+    const a = make([unhealthy, () => new Response(JSON.stringify(good), { status: 200 })]);
+    const q = await a.client.getQuote(req, expect712);
+    expect(q.digest).toBe(orderDigest(order));
+    expect(a.calls.length).toBe(2);
+    expect(a.calls[1]! - a.calls[0]!).toBeGreaterThanOrEqual(25);
+    // still unhealthy: exactly one retry, then the 503 surfaces with its code
+    const b = make([unhealthy, unhealthy, unhealthy]);
+    const err = await b.client.getQuote(req, expect712).catch((e: unknown) => e as RfqError);
+    expect(err).toBeInstanceOf(RfqError);
+    expect((err as RfqError).status).toBe(503);
+    expect((err as RfqError).message).toMatch(/feed_not_healthy/);
+    expect(b.calls.length).toBe(2);
+    // a different 503 reason is not retried
+    const c = make([() => new Response(JSON.stringify({ error: "not_executable", reason: "not_executable:stale" }), { status: 503 }), unhealthy]);
+    await expect(c.client.getQuote(req, expect712)).rejects.toThrow(/stale/);
+    expect(c.calls.length).toBe(1);
+  });
+
+  it("getPnl and getHistory read the indexer with the documented queries and shapes", async () => {
+    const seen: string[] = [];
+    const pnl = {
+      account: AGENT,
+      asOf: NOW,
+      positions: [{ instrument: NAME, market: MARKET, expiry: Number(EXPIRY), strike: "220000000", isPut: false, quantityRaw: "1000000000000000000", costRaw: "5045100", avgPriceRaw: "5045100", markMid: 5.6, markBid: 5.5, markAsk: 5.7, markSource: "desk", markAt: NOW, unrealizedRaw: "554900", settledAt: null, settlementRaw: null }],
+      realizedRaw: "0",
+      unrealizedRaw: "554900",
+      feesPaidRaw: "25100",
+      totalRaw: "529800",
+      note: "marks at desk mid",
+    };
+    const history = {
+      account: AGENT,
+      events: [
+        { type: "fill", at: NOW, txHash: "0x01", instrument: NAME, side: "buy", quantityRaw: "1000000000000000000", priceRaw: "5020000", premiumRaw: "5020000", feeRaw: "25100", counterparty: maker.address },
+        { type: "settlement", at: NOW - 86400, instrument: "NVDA-20261023-200-C", settlementPrice: 210.5, payoutRaw: "10500000" },
+        { type: "redeem", at: NOW - 80000, txHash: "0x02", expiry: 1792785600, amountRaw: "10500000" },
+      ],
+    };
+    const fetchImpl: typeof fetch = (async (url: string | URL) => {
+      const u = new URL(String(url));
+      seen.push(u.toString());
+      return new Response(JSON.stringify(u.pathname.endsWith("/pnl") ? pnl : history), { status: 200 });
+    }) as typeof fetch;
+    const client = new RfqClient({ chainId: 46630, hosts: { indexer: "https://index.test" }, fetch: fetchImpl });
+    const p = await client.getPnl(AGENT);
+    expect(p.positions[0]!.unrealizedRaw).toBe("554900");
+    expect(p.totalRaw).toBe("529800");
+    const h = await client.getHistory(AGENT, { limit: 5, since: NOW - 100000 });
+    expect(h.events.map((e) => e.type)).toEqual(["fill", "settlement", "redeem"]);
+    expect(seen[0]).toBe(`https://index.test/v1/pnl?account=${AGENT}`);
+    expect(seen[1]).toBe(`https://index.test/v1/history?account=${AGENT}&limit=5&since=${NOW - 100000}`);
+    const h2 = await client.getHistory(AGENT);
+    expect(seen[2]).toBe(`https://index.test/v1/history?account=${AGENT}`);
+    expect(h2.events.length).toBe(3);
+  });
+
   it("getSignerSideOrder uses the JSON-RPC face", async () => {
     const order = makeOrder();
     const quote = await backendQuote(order);

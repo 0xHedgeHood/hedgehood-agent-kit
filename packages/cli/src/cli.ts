@@ -15,6 +15,7 @@ import {
   resolveInstrumentName,
   encodeRegisterAgent,
   formatShares,
+  formatSignedUsdg,
   formatStrike,
   formatUsdg,
   orderDigest,
@@ -22,6 +23,12 @@ import {
   orderToJson,
   parseShares,
   parseUsdg,
+  planClose,
+  pnlByInstrument,
+  positionPnl,
+  type ClosePlan,
+  type HistoryEvent,
+  type PnlView,
   type TxRequest,
   type VerifiedQuote,
 } from "@hedgehood-io/sdk";
@@ -83,19 +90,86 @@ const out = (cmd: Command, v: unknown, human?: string) => {
   else process.stdout.write(human + "\n");
 };
 
-async function send(cmd: Command, ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined) {
+/** Simulates, then (with `--send`) broadcasts and waits; returns what to print instead of printing it. */
+async function sendResult(ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined): Promise<{ json: Record<string, unknown>; human: string; failed: boolean }> {
   const dryRun = !sendFlag;
   if (who === "owner") requireOwner(ctx);
   else requireSession(ctx);
   const m = ctx.market(who);
   const r = await m.send(tx, { dryRun });
   if (r.dryRun) {
-    out(cmd, { dryRun: true, from: r.from, to: tx.to, data: tx.data, summary: tx.summary }, `DRY RUN (simulation passed): ${tx.summary}\n  from ${r.from}\n  to   ${tx.to}\n  add --send to broadcast`);
-    return;
+    return { json: { dryRun: true, from: r.from, to: tx.to, data: tx.data, summary: tx.summary }, human: `DRY RUN (simulation passed): ${tx.summary}\n  from ${r.from}\n  to   ${tx.to}\n  add --send to broadcast`, failed: false };
   }
   const receipt = await m.waitForReceipt(r.hash!);
-  out(cmd, { txHash: r.hash, status: receipt.status, blockNumber: receipt.blockNumber, summary: tx.summary }, `${receipt.status === "success" ? "OK" : "REVERTED"} ${tx.summary}\n  tx ${r.hash}\n  ${m.chain.blockExplorers?.default.url}/tx/${r.hash}`);
-  if (receipt.status !== "success") process.exitCode = 1;
+  return {
+    json: { txHash: r.hash, status: receipt.status, blockNumber: receipt.blockNumber, summary: tx.summary },
+    human: `${receipt.status === "success" ? "OK" : "REVERTED"} ${tx.summary}\n  tx ${r.hash}\n  ${m.chain.blockExplorers?.default.url}/tx/${r.hash}`,
+    failed: receipt.status !== "success",
+  };
+}
+
+async function send(cmd: Command, ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined) {
+  const r = await sendResult(ctx, who, tx, sendFlag);
+  out(cmd, r.json, r.human);
+  if (r.failed) process.exitCode = 1;
+}
+
+/** Fixed-width text table; numeric-looking cells are right-aligned. */
+function table(header: string[], rows: string[][]): string {
+  const all = [header, ...rows];
+  const widths = header.map((_, i) => Math.max(...all.map((r) => (r[i] ?? "").length)));
+  const numeric = /^[+-]?\d/;
+  return all.map((r) => r.map((c, i) => (numeric.test(c) && i > 0 ? c.padStart(widths[i]!) : c.padEnd(widths[i]!))).join("  ").trimEnd()).join("\n");
+}
+
+/** `--since`: ISO-8601 date/time or unix seconds (milliseconds accepted) -> unix seconds. */
+export function parseSince(v: string): number {
+  const t = v.trim();
+  if (/^\d+$/.test(t)) {
+    const n = Number(t);
+    return n > 1e11 ? Math.floor(n / 1000) : n;
+  }
+  const ms = Date.parse(t);
+  if (Number.isNaN(ms)) throw new RangeError(`--since must be an ISO date/time or unix seconds, got ${v}`);
+  return Math.floor(ms / 1000);
+}
+
+const usdgOf = (raw: string | null | undefined) => (raw == null ? "-" : formatSignedUsdg(raw)!);
+const iso = (unix: number) => new Date(unix * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+function pnlHuman(p: PnlView): string {
+  const rows = p.positions.map((x) => [x.instrument, formatShares(BigInt(x.quantityRaw)), x.avgPriceRaw == null ? "-" : formatUsdg(BigInt(x.avgPriceRaw)), x.markMid == null ? "-" : String(x.markMid), x.settlementRaw != null ? `settled ${usdgOf(x.settlementRaw)}` : usdgOf(x.unrealizedRaw)]);
+  return [
+    `account ${p.account}  as of ${iso(p.asOf)}`,
+    rows.length ? table(["instrument", "qty", "avg", "mark", "unrealized"], rows) : "  no open positions",
+    `realized ${usdgOf(p.realizedRaw)}  unrealized ${usdgOf(p.unrealizedRaw)}  fees ${formatUsdg(BigInt(p.feesPaidRaw))}  total ${usdgOf(p.totalRaw)}${p.note ? `\n  (${p.note})` : ""}`,
+  ].join("\n");
+}
+
+function historyLine(e: HistoryEvent): string {
+  switch (e.type) {
+    case "fill":
+      return `${iso(e.at)}  fill        ${e.side.padEnd(4)} ${formatShares(BigInt(e.quantityRaw))} ${e.instrument} @ ${formatUsdg(BigInt(e.priceRaw))}  premium ${formatUsdg(BigInt(e.premiumRaw))}  fee ${formatUsdg(BigInt(e.feeRaw))}  tx ${e.txHash}`;
+    case "settlement":
+      return `${iso(e.at)}  settlement  ${e.instrument} @ ${e.settlementPrice}  payout ${usdgOf(e.payoutRaw)}`;
+    case "redeem":
+      return `${iso(e.at)}  redeem      expiry ${e.expiry}  ${usdgOf(e.amountRaw)}  tx ${e.txHash}`;
+    default:
+      return JSON.stringify(e);
+  }
+}
+
+function closePlanHuman(plan: ClosePlan, underlying: string): string {
+  const q = plan.quote;
+  return [
+    `close ${plan.instrument}: position ${plan.position.quantityRaw > 0n ? "+" : ""}${formatShares(plan.position.quantityRaw)} -> ${plan.side} ${formatShares(plan.quantityRaw)} (remaining ${plan.remainingRaw > 0n ? "+" : ""}${formatShares(plan.remainingRaw)})`,
+    quoteHuman(q, underlying, plan.quantityRaw),
+  ].join("\n");
+}
+
+function closePlanJson(plan: ClosePlan) {
+  const q = plan.quote;
+  return { instrument: plan.instrument, instrumentId: plan.instrumentId, positionRaw: plan.position.quantityRaw, side: plan.side, quantityRaw: plan.quantityRaw, remainingRaw: plan.remainingRaw, digest: q.digest, pricePerShareRaw: q.pricePerShareRaw, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, secondsLeft: q.secondsLeft, fillable: q.fillable, backendDryRun: q.dryRun };
 }
 
 /** "<instrumentId>", "NVDA-20261030-220-C" (backend name) or "<expiry>:<strike>:<call|put>". */
@@ -252,22 +326,110 @@ export function buildProgram(): Command {
     });
 
   program
+    .command("close")
+    .description("Close an open position before expiry: quotes the opposite side of the same instrument and fills it (session key, balance mode). --all closes every open position")
+    .argument("[instrument]", "NVDA-20261030-220-C, an id, or expiry:strike:call|put")
+    .option("--all", "close every open position of the account")
+    .option("--qty <shares>", "shares to close (default and maximum: the whole position)")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (instrument: string | undefined, opts: { all?: boolean; qty?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireSession(ctx);
+      const m = ctx.market("session");
+      const underlying = ctx.deployment.underlying;
+      const fee = await m.protocolFeeBps();
+      const sessionKey = sessionKeyOf(ctx);
+      const g = cmd.optsWithGlobals() as GlobalOpts;
+      const closeOne = async (instrumentId: bigint, quantityRaw?: bigint) => {
+        const plan = await planClose({ market: m, rfq: ctx.rfq, instrumentId, quantityRaw, sessionKey, protocolFeeBps: fee });
+        const human = [closePlanHuman(plan, underlying)];
+        if (!plan.quote.fillable) throw new Error(`${plan.instrument}: backend dry-run quote (placeholder signature): nothing to fill`);
+        if (plan.quote.canFill === false) human.push(`  maker says canFill=false${plan.quote.shortfallRaw > 0n ? ` (short ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}; the fill will likely revert`);
+        const r = await sendResult(ctx, "session", plan.request, opts.send);
+        human.push(r.human);
+        return { json: { ...closePlanJson(plan), ...r.json }, human: human.join("\n"), failed: r.failed };
+      };
+      if (opts.all) {
+        if (instrument || opts.qty) throw new Error("--all takes no instrument or --qty");
+        const now = Math.floor(Date.now() / 1000);
+        const open = (await m.snapshot(ctx.account)).positions.filter((p) => Number(p.expiry) > now);
+        const results: Array<Record<string, unknown>> = [];
+        const human: string[] = [];
+        for (const p of open) {
+          try {
+            const r = await closeOne(p.instrumentId);
+            results.push(r.json);
+            human.push(r.human);
+            if (r.failed) process.exitCode = 1;
+          } catch (e) {
+            const name = describeInstrument(p.instrumentId, underlying);
+            results.push({ instrumentId: p.instrumentId, positionRaw: p.quantityRaw, error: e instanceof Error ? e.message : String(e) });
+            human.push(`close ${name}: FAILED ${e instanceof Error ? e.message : String(e)}`);
+            process.exitCode = 1;
+          }
+        }
+        out(cmd, { account: ctx.account, dryRun: !opts.send, closed: results }, human.length ? human.join("\n\n") : "no open positions to close");
+        return;
+      }
+      if (!instrument) throw new Error("give an instrument, or --all");
+      const r = await closeOne(await instrumentArg(ctx, instrument), opts.qty ? parseShares(opts.qty) : undefined);
+      if (g.json) out(cmd, r.json);
+      else process.stdout.write(r.human + "\n");
+      if (r.failed) process.exitCode = 1;
+    });
+
+  program
     .command("positions")
-    .description("Balances, positions and session status")
+    .description("Balances, open positions (with average price, mark, unrealized P&L and time to expiry) and session status")
     .action(async (_o: unknown, cmd: Command) => {
       const ctx = ctxFrom(cmd);
       const m = ctx.market("none");
+      const underlying = ctx.deployment.underlying;
       const s = await m.snapshot(ctx.account);
       const sess = ctx.session ? await m.session(ctx.session.address, ctx.account) : undefined;
-      const indexed = await ctx.rfq.positions(ctx.account).catch(() => undefined);
+      const [indexed, pnl] = await Promise.all([ctx.rfq.positions(ctx.account).catch(() => undefined), ctx.rfq.getPnl(ctx.account).catch(() => undefined)]);
+      const rows = pnlByInstrument(pnl);
+      const now = Math.floor(Date.now() / 1000);
+      const positions = s.positions.map((p) => ({ ...p, ...positionPnl(p, underlying, rows, now), label: describeInstrument(p.instrumentId, underlying) }));
       const lines = [
         `account ${s.account}`,
         `collateral ${formatUsdg(s.collateralRaw)}  locked ${formatUsdg(s.requirementRaw)}  free ${formatUsdg(s.freeCollateralRaw)}  wallet USDG ${formatUsdg(s.walletUsdgRaw)}`,
-        ...(s.positions.length ? s.positions.map((p) => `  ${p.quantityRaw > 0n ? "+" : ""}${formatShares(p.quantityRaw)}  ${describeInstrument(p.instrumentId, ctx.deployment.underlying)}  id ${p.instrumentId}`) : ["  no positions"]),
+        positions.length
+          ? table(
+              ["instrument", "qty", "avg", "mark", "unrealized", "expires in", "id"],
+              positions.map((p) => [p.instrument, `${p.quantityRaw > 0n ? "+" : ""}${formatShares(p.quantityRaw)}`, p.avgPrice ?? "-", p.mark == null ? "-" : String(p.mark), p.unrealized ?? "-", p.expiresIn, p.instrumentId.toString()]),
+            )
+              .split("\n")
+              .map((l) => `  ${l}`)
+              .join("\n")
+          : "  no positions",
         sess ? `session ${sess.key} ${sess.active ? "ACTIVE" : "inactive"} trade=${sess.canTrade} cancel=${sess.canCancel} until ${sess.expiresAt} maxRequirement ${sess.maxRequirement === 0n ? "unlimited" : formatUsdg(sess.maxRequirement)}` : "session: none configured",
+        pnl ? `pnl: realized ${usdgOf(pnl.realizedRaw)}  unrealized ${usdgOf(pnl.unrealizedRaw)}  fees ${formatUsdg(BigInt(pnl.feesPaidRaw))}  total ${usdgOf(pnl.totalRaw)}` : "pnl: indexer unavailable",
         indexed ? `indexer: ${indexed.positions.length} position(s), fills ${indexed.leaderboard?.fills ?? 0}, settled PnL ${formatUsdg(BigInt(indexed.leaderboard?.settledPnlRaw ?? "0"))}, agentId ${indexed.agentId ?? "none"}` : "indexer: unavailable",
       ];
-      out(cmd, { ...s, session: sess, indexed }, lines.join("\n"));
+      out(cmd, { ...s, positions, session: sess, pnl, indexed }, lines.join("\n"));
+    });
+
+  program
+    .command("pnl")
+    .description("Profit and loss: every open position marked at the desk's mid, then realized / unrealized / fees / total (indexer)")
+    .action(async (_o: unknown, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      const p = await ctx.rfq.getPnl(ctx.account);
+      out(cmd, p, pnlHuman(p));
+    });
+
+  program
+    .command("history")
+    .description("Past activity of the account (fills, settlements, redeems), newest first (indexer)")
+    .option("--limit <n>", "at most n events")
+    .option("--since <iso|unix>", "only events at or after this time")
+    .action(async (opts: { limit?: string; since?: string }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      const limit = opts.limit === undefined ? undefined : Number(opts.limit);
+      if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) throw new Error("--limit must be a positive integer");
+      const h = await ctx.rfq.getHistory(ctx.account, { limit, since: opts.since === undefined ? undefined : parseSince(opts.since) });
+      out(cmd, h, [`account ${h.account}  ${h.events.length} event(s)`, ...(h.events.length ? h.events.map(historyLine) : ["  no activity"])].join("\n"));
     });
 
   program
