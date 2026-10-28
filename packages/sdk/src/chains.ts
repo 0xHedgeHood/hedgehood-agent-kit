@@ -62,6 +62,42 @@ export interface ChainDeployment {
   markets: MarketDeployment[];
   /** The Stock Yield vaults (v2 `EpochFund` hub) on this chain, when deployed. */
   vaults?: VaultDeployment;
+  /** Share lending (a Morpho Blue market on fund shares + the USDG lending vault) on this chain, when deployed. */
+  lending?: LendingDeployment;
+}
+
+/** One Morpho Blue market; its id is `keccak256(abi.encode(loanToken, collateralToken, oracle, irm, lltv))`. */
+export interface LendingMarket {
+  id: `0x${string}`;
+  loanToken: Address;
+  /** The fund share token (an `EpochFund`) pledged as collateral. */
+  collateralToken: Address;
+  /** `ShareRiskOracle`: a conservative share value in Blue's 1e36 price format, marked weekly after the Monday lock. */
+  oracle: Address;
+  irm: Address;
+  /** Liquidation loan-to-value, WAD (625000000000000000n = 62.5%). */
+  lltv: bigint;
+  note?: string;
+}
+
+/**
+ * Share lending on one chain: the Morpho Blue core, the USDG lending vault (Morpho Vault V2, ERC-4626, "hhUSDG") whose
+ * liquidity adapter supplies the Blue market, and the market list at the time of writing. The vault is the source of
+ * truth at runtime: `LendingClient.discoverMarkets()` reads its liquidity adapter / data and the adapter's allocated
+ * market ids, and only falls back to `markets` here when that fails, so a market migration (a new oracle means a new
+ * market id) needs no code change for agents.
+ */
+export interface LendingDeployment {
+  /** Morpho Blue core (canonical on mainnet; a test instance on testnet). */
+  blue: Address;
+  /** The USDG lending vault (Morpho Vault V2, ERC-4626). */
+  vault: Address;
+  /** The vault's `MorphoMarketV1AdapterV2` at the time of writing (re-read from the vault at runtime). */
+  adapter?: Address;
+  usdg: Address;
+  markets: LendingMarket[];
+  deployBlock?: bigint;
+  note?: string;
 }
 
 /** One Stock Yield fund: an `EpochFund` holding one tokenized stock and USDG, issuing transferable NAV shares. */
@@ -142,7 +178,9 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
         source: "0xc599E3B843D30010b555A08E041Db77DAE33DBb9",
         deployBlock: 143952569n,
         protocolFeeBps: 50,
-        note: "tNVDA2 on Robinhood testnet, deployed 2026-10-28; fixture feeds, not mainnet configuration",
+        // built from hedgehood-options 131c1ae (before PR #54): its sessions()/authorizeSession predate the spend
+        // budget the vendored aa47f7f ABI encodes; replace with the redeployed market + book once they exist
+        note: "tNVDA2 on Robinhood testnet, deployed 2026-10-28 from the pre-audit-fix build; fixture feeds, not mainnet configuration",
       },
     ],
     vaults: {
@@ -153,6 +191,25 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
       funds: [{ symbol: "hhNVDA-CC", vault: "0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4", stock: "0x267ddeE02B44FDF4D073E124869DaA5BDbF1759D", stockSymbol: "NVDA", strategy: "CC" }],
       deployBlock: 134760389n,
       note: "v2 hub pilot redeployed 2026-10-14 (hedgehood-vaults local/testnet-hub-20261013-2359/deployment.json); the fund's depositGate() is an OpenDepositGate (read on chain 2026-10-28); open-mint tNVDA2, fixture feed, TestnetOwnerModule owner: not mainnet configuration",
+    },
+    lending: {
+      blue: "0xa0BA91A2F99894044CCD82cA48e5C795BA7570B6",
+      vault: "0x6ab073F0E3F1610C4Ad9e7Dc19Ca25F831682f00",
+      adapter: "0x89ace3cb69f676d41aBa380563F267cD7b8A98f3",
+      usdg: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d",
+      markets: [
+        {
+          id: "0x375cd2da2b6d1cdd8288331d388f795784917a0ac704732e91c92bde6b9832df",
+          loanToken: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d",
+          collateralToken: "0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4",
+          oracle: "0x1291A39e96Cd1ce736084548b15532D9a8D4bE77",
+          irm: "0xAf61C1DEDffD90D39E7D90641A8AB1B59497a9fF",
+          lltv: 625000000000000000n,
+          note: "v5 oracle market on the test Blue instance (hedgehood-vaults local/share-collateral-a/deployment-46630-v5.json)",
+        },
+      ],
+      deployBlock: 139866161n,
+      note: "test Blue instance + AdaptiveCurveIrm copy, hhNVDA-CC shares vs tUSDG, v5 ShareRiskOracle; lending vault hhUSDG (local/share-collateral-a/lending-vault-46630.json, timelock 0, EOA curator): PoC parameters, not mainnet configuration",
     },
   },
   4663: {
@@ -182,8 +239,33 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
       api: "https://hedgehood.app/api/stockyield/funds",
       note: "deployed 2026-10-15, OpenDepositGate since 2026-10-18 (hedgehood-vaults docs/OPTION_VAULT_V2.md, contracts/script/config/v2.4663.json); owner Safe 0xB5C9…489b; Sourcify-verified",
     },
+    lending: {
+      blue: "0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010",
+      vault: "0x54Bc097643BB9fd4ab004f11859893655529E954",
+      adapter: "0xdEbAd49D242967CBf0DDAe8626873ad54cF7878A",
+      usdg: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      markets: [
+        {
+          id: "0x789202f84d066bdad8115d39d5dea0af80ccd52dd6727461d98daa638ed9b7aa",
+          loanToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+          collateralToken: "0x4a1c42b0E0D229B677D574d3dCdc2A5Dff848373",
+          oracle: "0x6EcA44BBB41D3176A451910C4f735A51AdAb4237",
+          irm: "0x2BD3d5965B26B51814AC95127B2b80dD6CcC0fa1",
+          lltv: 625000000000000000n,
+          note: "collateral-01: hhNVDA-CC shares vs USDG, live 2026-10-26 (hedgehood-vaults local/share-collateral-a/deployment-4663.json). Scheduled to migrate to a new ShareRiskOracle (new market id) before 2026-12-24; the vault's liquidity market is read at runtime",
+        },
+      ],
+      note: "canonical Morpho Blue on Robinhood Chain, AdaptiveCurveIrm 0x2BD3…0fa1, LLTV 62.5%; lending vault hhUSDG = Morpho Vault V2 (local/share-collateral-a/lending-vault-4663.json): owner/curator/allocator Safe 0xB5C9…489b, 24 h timelock, absolute cap 20k USDG on the market, performance fee 10%",
+    },
   },
 };
+
+/** The share lending deployment of a chain, or a clear error. */
+export function getLending(chainId: number): LendingDeployment {
+  const l = getDeployment(chainId).lending;
+  if (!l) throw new Error(`share lending is not deployed on chain ${chainId}`);
+  return l;
+}
 
 /** The Stock Yield vault deployment of a chain, or a clear error. */
 export function getVaults(chainId: number): VaultDeployment {

@@ -11,8 +11,13 @@ import {
   depositViaGateway,
   describeInstrument,
   encodeInstrumentId,
+  expiryOf,
+  formatSessionCap,
   instrumentName,
-  resolveInstrumentName,
+  shareStrikeOf,
+  tokenStrikeOf,
+  UNIT_MULTIPLIER,
+  UNLIMITED,
   encodeRegisterAgent,
   formatShares,
   formatSignedUsdg,
@@ -26,8 +31,15 @@ import {
   planClose,
   pnlByInstrument,
   positionPnl,
+  LTV_WARN_FRACTION,
+  type BorrowStatus,
   type ClosePlan,
   type HistoryEvent,
+  type LendStatus,
+  type LendingPlan,
+  type OracleStatus,
+  type PlanStep,
+  type PlanStepResult,
   type PnlView,
   type TxRequest,
   type VaultInfo,
@@ -168,7 +180,7 @@ function closePlanHuman(plan: ClosePlan, underlying: string): string {
   const q = plan.quote;
   return [
     `close ${plan.instrument}: position ${plan.position.quantityRaw > 0n ? "+" : ""}${formatShares(plan.position.quantityRaw)} -> ${plan.side} ${formatShares(plan.quantityRaw)} (remaining ${plan.remainingRaw > 0n ? "+" : ""}${formatShares(plan.remainingRaw)})`,
-    quoteHuman(q, underlying, plan.quantityRaw),
+    quoteHuman(q, underlying, plan.quantityRaw, plan.position.uiMultiplier),
   ].join("\n");
 }
 
@@ -177,18 +189,46 @@ function closePlanJson(plan: ClosePlan) {
   return { instrument: plan.instrument, instrumentId: plan.instrumentId, positionRaw: plan.position.quantityRaw, side: plan.side, quantityRaw: plan.quantityRaw, remainingRaw: plan.remainingRaw, digest: q.digest, pricePerShareRaw: q.pricePerShareRaw, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, secondsLeft: q.secondsLeft, fillable: q.fillable, backendDryRun: q.dryRun };
 }
 
-/** "<instrumentId>", "NVDA-20261030-220-C" (backend name) or "<expiry>:<strike>:<call|put>". */
+/**
+ * "<instrumentId>", "NVDA-20261030-220-C" (backend name, listed per-share strike) or "<expiry>:<strike>:<call|put>"
+ * (per-share strike, mapped to the per-token strike under the expiry's uiMultiplier).
+ */
 async function instrumentArg(ctx: KitContext, v: string): Promise<bigint> {
   if (/^\d+$/.test(v)) return BigInt(v);
   const m = /^(\d+):(\d+(?:\.\d+)?):(call|put|c|p)$/i.exec(v);
-  if (m) return encodeInstrumentId(BigInt(m[1]!), parseUsdg(m[2]!), /^p/i.test(m[3]!));
-  return resolveInstrumentName(v, await ctx.market("none").openedExpiries());
+  const market = ctx.market("none");
+  if (m) {
+    const expiry = BigInt(m[1]!);
+    return encodeInstrumentId(expiry, tokenStrikeOf(parseUsdg(m[2]!), await market.expiryMultiplier(expiry)), /^p/i.test(m[3]!));
+  }
+  return market.resolveInstrumentName(v);
 }
 
-function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint): string {
+/** "unlimited" -> type(uint256).max, else USDG -> raw. */
+export function parseCap(v: string, flag: string): bigint {
+  const t = v.trim();
+  if (/^unlimited$/i.test(t)) return UNLIMITED;
+  try {
+    return parseUsdg(t);
+  } catch {
+    throw new Error(`${flag} must be a USDG amount or "unlimited", got ${v}`);
+  }
+}
+
+const MAX_SPEND_HELP = "USDG of premium + fees the session key may spend for the account over the session (0 = it cannot buy; unlimited = no cap)";
+const MAX_REQUIREMENT_HELP = "USDG cap on the account's collateral requirement after a session trade (0 = no new requirement, it cannot write options; unlimited = no cap)";
+const MAX_SPEND_MISSING =
+  "--max-spend is required: the most premium + fees this session key may spend for the account over the session. Suggested: --max-spend 100 (or the budget you mean to trade, at most your deposit); --max-spend 0 lets it only sell/close longs; --max-spend unlimited removes the cap (not recommended).";
+
+function sessionLine(s: { key: string; active: boolean; canTrade: boolean; canCancel: boolean; expiresAt: bigint; authorizedAt: bigint; spendLeft: bigint; maxRequirement: bigint }): string {
+  const at = (t: bigint) => (t === 0n ? "-" : iso(Number(t)));
+  return `session ${s.key} ${s.active ? "ACTIVE" : "inactive"} trade=${s.canTrade} cancel=${s.canCancel} authorized ${at(s.authorizedAt)} until ${at(s.expiresAt)} spendLeft ${formatSessionCap(s.spendLeft)} maxRequirement ${formatSessionCap(s.maxRequirement)}`;
+}
+
+function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint, uiMultiplier: bigint = UNIT_MULTIPLIER): string {
   const pays = q.netNowRaw > 0n;
   return [
-    `${q.instrument}  (${describeInstrument(q.order.instrumentId, underlying)})  qty ${formatShares(qty)}${q.dryRun ? "  [BACKEND DRY RUN: placeholder signature, not fillable]" : ""}`,
+    `${q.instrument}  (${describeInstrument(q.order.instrumentId, underlying, uiMultiplier)})  qty ${formatShares(qty)}${q.dryRun ? "  [BACKEND DRY RUN: placeholder signature, not fillable]" : ""}`,
     `  price/share ${formatUsdg(q.pricePerShareRaw)}  premium ${formatUsdg(q.premiumNowRaw)}  fee ${formatUsdg(q.feeNowRaw)}  ${pays ? "you pay" : "you receive"} ${formatUsdg(pays ? q.netNowRaw : -q.netNowRaw)}`,
     `  valid ${q.secondsLeft}s (until ${q.order.validUntil})  canFill ${q.canFill ?? "unknown"}${q.shortfallRaw > 0n ? `  shortfall ${formatUsdg(q.shortfallRaw)}` : ""}${q.funding.note ? `  (${q.funding.note})` : ""}`,
     `  digest ${q.digest}  maker ${q.order.maker}  mark mid ${q.markPrice}`,
@@ -217,9 +257,10 @@ export function buildProgram(): Command {
     .command("join")
     .description("Create a session key (if none), show the addresses, and (with an owner key) authorize it on the market")
     .option("--days <n>", "session validity in days", "30")
-    .option("--max-requirement <usdg>", "cap on collateral the session may lock (0 = unlimited)", "0")
+    .option("--max-spend <usdg|unlimited>", `${MAX_SPEND_HELP}; required to authorize`)
+    .option("--max-requirement <usdg|unlimited>", MAX_REQUIREMENT_HELP, "0")
     .option("--send", "broadcast instead of dry run")
-    .action(async (opts: { days: string; maxRequirement: string; send?: boolean }, cmd: Command) => {
+    .action(async (opts: { days: string; maxSpend?: string; maxRequirement: string; send?: boolean }, cmd: Command) => {
       const g = cmd.optsWithGlobals() as GlobalOpts;
       const file = expand(g.sessionKeyFile ?? process.env.HEDGEHOOD_SESSION_KEY_FILE ?? DEFAULT_SESSION_KEY_FILE);
       let created = false;
@@ -238,12 +279,15 @@ export function buildProgram(): Command {
         `account         ${ctx.account}${ctx.owner ? " (owner key loaded)" : ""}`,
         `chain ${ctx.chainId}  market ${ctx.deployment.market}  book ${ctx.deployment.orderBook}`,
       ];
+      const maxRequirement = parseCap(opts.maxRequirement, "--max-requirement");
+      const maxSpend = opts.maxSpend === undefined ? undefined : parseCap(opts.maxSpend, "--max-spend");
       if (!ctx.owner) {
         lines.push(
           "",
           "Next, from the OWNER wallet (not this machine, if you can): authorize the session key on the market:",
-          `  cast send ${ctx.deployment.market} 'authorizeSession(address,uint64,uint256,uint256)' ${session.address} ${Math.floor(Date.now() / 1000) + Number(opts.days) * 86400} 3 ${parseUsdg(opts.maxRequirement)} --rpc-url <rpc>`,
-          "  (scope 3 = trade + cancel; last arg = maxRequirement in USDG raw, 0 = unlimited)",
+          `  cast send ${ctx.deployment.market} 'authorizeSession(address,uint64,uint256,uint256,uint256)' ${session.address} ${Math.floor(Date.now() / 1000) + Number(opts.days) * 86400} 3 ${maxRequirement} ${maxSpend ?? "<maxSpendRaw>"} --rpc-url <rpc>`,
+          "  (scope 3 = trade + cancel; then maxRequirement and maxSpend in USDG raw (6 decimals): 0 = none, 115792089237316195423570985008687907853269984665640564039457584007913129639935 = unlimited.",
+          "   maxSpend is the most premium + fees the key may spend over the session, e.g. 100000000 = 100 USDG; maxRequirement 0 = it cannot write options)",
           "then deposit USDG: `hedgehood deposit <amount> --x402` or `cast send <usdg> 'approve(address,uint256)' ...; cast send <market> 'deposit(address,uint256)' ...`",
           "",
           "MCP config for Claude Code / Codex:",
@@ -252,8 +296,9 @@ export function buildProgram(): Command {
         out(cmd, { sessionKeyFile: file, sessionAddress: session.address, account: ctx.account, chainId: ctx.chainId, created }, lines.join("\n"));
         return;
       }
+      if (maxSpend === undefined) throw new Error(MAX_SPEND_MISSING);
       process.stdout.write(lines.join("\n") + "\n");
-      const tx = ctx.market("owner").authorizeSession(session.address, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: true, maxRequirement: parseUsdg(opts.maxRequirement) });
+      const tx = ctx.market("owner").authorizeSession(session.address, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: true, maxRequirement, maxSpend });
       await send(cmd, ctx, "owner", tx, opts.send);
     });
 
@@ -266,7 +311,7 @@ export function buildProgram(): Command {
       const expiries = await m.openedExpiries();
       const infos = await Promise.all(expiries.map((e) => m.expiryInfo(e)));
       const fee = await m.protocolFeeBps();
-      const human = [`${ctx.deployment.underlying} on chain ${ctx.chainId}  market ${m.market}  book ${m.orderBook}  taker fee ${fee} bps`, ...infos.map((i) => `  expiry ${i.expiry} ${new Date(Number(i.expiry) * 1000).toISOString().slice(0, 16)}Z  ${i.settled ? `settled @ ${formatUsdg(i.settlementPrice)}` : i.tradingOpen ? "trading" : "closed"}  anchor ${formatUsdg(i.anchor)}  strikes ${i.strikes.map(formatStrike).join(" ")}`)];
+      const human = [`${ctx.deployment.underlying} on chain ${ctx.chainId}  market ${m.market}  book ${m.orderBook}  taker fee ${fee} bps`, ...infos.map((i) => `  expiry ${i.expiry} ${new Date(Number(i.expiry) * 1000).toISOString().slice(0, 16)}Z  ${i.settled ? `settled @ ${formatUsdg(i.settlementPrice)}` : i.tradingOpen ? "trading" : "closed"}  anchor ${formatUsdg(i.anchor)}${i.uiMultiplier === UNIT_MULTIPLIER ? "" : ` (per token; uiMultiplier ${formatUnits(i.uiMultiplier, 18)})`}  strikes ${i.shareStrikes.map(formatStrike).join(" ")}`)];
       out(cmd, { chainId: ctx.chainId, market: m.market, orderBook: m.orderBook, takerFeeBps: fee, expiries: infos }, human.join("\n"));
     });
 
@@ -277,8 +322,8 @@ export function buildProgram(): Command {
     .action(async (expiry: string, _o: unknown, cmd: Command) => {
       const ctx = ctxFrom(cmd, true);
       const info = await ctx.market("none").expiryInfo(BigInt(expiry));
-      const rows = info.strikes.flatMap((s) => [false, true].map((p) => ({ instrument: instrumentName(ctx.deployment.underlying, info.expiry, s, p), instrumentId: encodeInstrumentId(info.expiry, s, p), label: describeInstrument(encodeInstrumentId(info.expiry, s, p), ctx.deployment.underlying) })));
-      out(cmd, { expiry: info.expiry, tradingOpen: info.tradingOpen, instruments: rows }, rows.map((r) => `${r.instrument}  ${r.instrumentId}`).join("\n"));
+      const rows = info.strikes.flatMap((s) => [false, true].map((p) => ({ instrument: instrumentName(ctx.deployment.underlying, info.expiry, s, p, info.uiMultiplier), instrumentId: encodeInstrumentId(info.expiry, s, p), strike: formatStrike(shareStrikeOf(s, info.uiMultiplier)), strikeRaw: s, label: describeInstrument(encodeInstrumentId(info.expiry, s, p), ctx.deployment.underlying, info.uiMultiplier) })));
+      out(cmd, { expiry: info.expiry, tradingOpen: info.tradingOpen, uiMultiplier: info.uiMultiplier, instruments: rows }, rows.map((r) => `${r.instrument}  ${r.instrumentId}`).join("\n"));
     });
 
   program
@@ -293,15 +338,16 @@ export function buildProgram(): Command {
       const m = ctx.market("none");
       const id = await instrumentArg(ctx, instrument);
       const qty = parseShares(opts.qty);
-      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+      const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
+      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
       const file = { order: orderToJson(q.order), signature: q.signature, side: opts.side, quantityRaw: qty.toString(), chainId: ctx.chainId, dryRun: q.dryRun };
       if (opts.out) writeFileSync(opts.out, JSON.stringify(file, null, 2));
-      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable }, quoteHuman(q, ctx.deployment.underlying, qty) + (opts.out ? `\n  saved to ${opts.out}` : ""));
+      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable }, quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + (opts.out ? `\n  saved to ${opts.out}` : ""));
     });
 
   program
     .command("fill")
-    .description("Fill a saved quote file, or quote-and-fill an instrument in one go (session key, balance mode)")
+    .description("Fill a saved quote file, or quote-and-fill an instrument in one go (session key, always balance mode; a buy is charged to the session's spend budget)")
     .argument("[quoteFile]")
     .option("--instrument <x>", "quote-and-fill: instrument id or expiry:strike:call|put")
     .option("--side <buy|sell>")
@@ -320,8 +366,10 @@ export function buildProgram(): Command {
       } else {
         if (!opts.instrument || !opts.side) throw new Error("give a quote file, or --instrument and --side");
         qty = parseShares(opts.qty ?? "1");
-        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: await instrumentArg(ctx, opts.instrument), side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
-        process.stdout.write(quoteHuman(q, ctx.deployment.underlying, qty) + "\n");
+        const id = await instrumentArg(ctx, opts.instrument);
+        const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
+        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+        process.stdout.write(quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + "\n");
         if (!q.fillable) throw new Error("backend dry-run quote (placeholder signature): nothing to fill");
         if (q.canFill === false) process.stdout.write(`  maker says canFill=false${q.shortfallRaw > 0n ? ` (short ${formatUsdg(q.shortfallRaw)} USDG)` : ""}; the fill will likely revert\n`);
         order = q.order;
@@ -368,7 +416,7 @@ export function buildProgram(): Command {
             human.push(r.human);
             if (r.failed) process.exitCode = 1;
           } catch (e) {
-            const name = describeInstrument(p.instrumentId, underlying);
+            const name = describeInstrument(p.instrumentId, underlying, p.uiMultiplier);
             results.push({ instrumentId: p.instrumentId, positionRaw: p.quantityRaw, error: e instanceof Error ? e.message : String(e) });
             human.push(`close ${name}: FAILED ${e instanceof Error ? e.message : String(e)}`);
             process.exitCode = 1;
@@ -396,7 +444,7 @@ export function buildProgram(): Command {
       const [indexed, pnl] = await Promise.all([ctx.rfq.positions(ctx.account).catch(() => undefined), ctx.rfq.getPnl(ctx.account).catch(() => undefined)]);
       const rows = pnlByInstrument(pnl);
       const now = Math.floor(Date.now() / 1000);
-      const positions = s.positions.map((p) => ({ ...p, ...positionPnl(p, underlying, rows, now), label: describeInstrument(p.instrumentId, underlying) }));
+      const positions = s.positions.map((p) => ({ ...p, ...positionPnl(p, underlying, rows, now), label: describeInstrument(p.instrumentId, underlying, p.uiMultiplier) }));
       const lines = [
         `account ${s.account}`,
         `collateral ${formatUsdg(s.collateralRaw)}  locked ${formatUsdg(s.requirementRaw)}  free ${formatUsdg(s.freeCollateralRaw)}  wallet USDG ${formatUsdg(s.walletUsdgRaw)}`,
@@ -409,7 +457,7 @@ export function buildProgram(): Command {
               .map((l) => `  ${l}`)
               .join("\n")
           : "  no positions",
-        sess ? `session ${sess.key} ${sess.active ? "ACTIVE" : "inactive"} trade=${sess.canTrade} cancel=${sess.canCancel} until ${sess.expiresAt} maxRequirement ${sess.maxRequirement === 0n ? "unlimited" : formatUsdg(sess.maxRequirement)}` : "session: none configured",
+        sess ? sessionLine(sess) : "session: none configured",
         pnl ? `pnl: realized ${usdgOf(pnl.realizedRaw)}  unrealized ${usdgOf(pnl.unrealizedRaw)}  fees ${formatUsdg(BigInt(pnl.feesPaidRaw))}  total ${usdgOf(pnl.totalRaw)}` : "pnl: indexer unavailable",
         indexed ? `indexer: ${indexed.positions.length} position(s), fills ${indexed.leaderboard?.fills ?? 0}, settled PnL ${formatUsdg(BigInt(indexed.leaderboard?.settledPnlRaw ?? "0"))}, agentId ${indexed.agentId ?? "none"}` : "indexer: unavailable",
       ];
@@ -486,16 +534,21 @@ export function buildProgram(): Command {
   const session = program.command("session").description("Session key management (owner key)");
   session
     .command("authorize")
+    .description("authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend); re-authorizing resets the spend budget and voids orders the key signed before")
     .option("--key <address>", "default: the configured session key")
     .option("--days <n>", "validity", "30")
-    .option("--max-requirement <usdg>", "0 = unlimited", "0")
+    .option("--max-spend <usdg|unlimited>", `${MAX_SPEND_HELP}; required, e.g. 100`)
+    .option("--max-requirement <usdg|unlimited>", MAX_REQUIREMENT_HELP, "0")
     .option("--no-cancel", "do not grant SCOPE_CANCEL")
     .option("--send")
-    .action(async (opts: { key?: string; days: string; maxRequirement: string; cancel: boolean; send?: boolean }, cmd: Command) => {
+    .action(async (opts: { key?: string; days: string; maxSpend?: string; maxRequirement: string; cancel: boolean; send?: boolean }, cmd: Command) => {
+      if (opts.maxSpend === undefined) throw new Error(MAX_SPEND_MISSING);
+      const maxSpend = parseCap(opts.maxSpend, "--max-spend");
+      const maxRequirement = parseCap(opts.maxRequirement, "--max-requirement");
       const ctx = ctxFrom(cmd);
       const key = (opts.key ?? ctx.session?.address) as Address | undefined;
       if (!key) throw new Error("no session key: pass --key or create one with `hedgehood join`");
-      await send(cmd, ctx, "owner", ctx.market("owner").authorizeSession(key, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: opts.cancel, maxRequirement: parseUsdg(opts.maxRequirement) }), opts.send);
+      await send(cmd, ctx, "owner", ctx.market("owner").authorizeSession(key, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: opts.cancel, maxRequirement, maxSpend }), opts.send);
     });
   session
     .command("revoke")
@@ -513,7 +566,7 @@ export function buildProgram(): Command {
       const key = (opts.key ?? ctx.session?.address) as Address | undefined;
       if (!key) throw new Error("no session key configured");
       const s = await ctx.market("none").session(key, ctx.account);
-      out(cmd, s, `session ${s.key} for ${ctx.account}: ${s.active ? "ACTIVE" : "inactive"} trade=${s.canTrade} cancel=${s.canCancel} expiresAt ${s.expiresAt} maxRequirement ${s.maxRequirement === 0n ? "unlimited" : formatUsdg(s.maxRequirement)}`);
+      out(cmd, s, `${sessionLine(s)}\n  account ${ctx.account}; a session key fills in balance mode only, buys come out of spendLeft (SessionLimit when exhausted)`);
     });
 
   program
@@ -531,14 +584,27 @@ export function buildProgram(): Command {
 
   program
     .command("decode")
-    .description("Decode an instrument id")
+    .description("Decode an instrument id; the strike shown is the listed per-share strike under the expiry's uiMultiplier (read from the market unless --multiplier)")
     .argument("<instrumentId>")
-    .action((id: string, _o: unknown, cmd: Command) => {
+    .option("--multiplier <raw>", "the expiry's uiMultiplier (1e18 = 1.0); default: read from the market, else 1e18")
+    .action(async (id: string, opts: { multiplier?: string }, cmd: Command) => {
       const d = decodeInstrumentId(BigInt(id));
-      out(cmd, d, `${describeInstrument(BigInt(id))}  expiry ${d.expiry}  strike ${formatStrike(d.strike)}  ${d.isPut ? "put" : "call"}`);
+      let m = opts.multiplier ? BigInt(opts.multiplier) : undefined;
+      if (m === undefined) {
+        try {
+          m = await ctxFrom(cmd, true).market("none").expiryMultiplier(d.expiry);
+        } catch {
+          m = UNIT_MULTIPLIER;
+        }
+      }
+      const shareStrike = shareStrikeOf(d.strike, m);
+      const g = cmd.optsWithGlobals() as GlobalOpts;
+      const underlying = g.underlying ?? "";
+      out(cmd, { ...d, shareStrike, uiMultiplier: m }, `${describeInstrument(BigInt(id), underlying, m)}  expiry ${d.expiry}  strike ${formatStrike(shareStrike)}${m === UNIT_MULTIPLIER ? "" : ` (per token ${formatStrike(d.strike)}, uiMultiplier ${formatUnits(m, 18)})`}  ${d.isPut ? "put" : "call"}`);
     });
 
   registerVaultCommands(program);
+  registerLendingCommands(program);
 
   program.addOption(new Option("--dry-run", "default; sends are simulated unless --send is given").hideHelp());
   return program;
@@ -586,20 +652,24 @@ function vaultStatusHuman(v: VaultInfo): string {
   ].join("\n");
 }
 
-/** Runs a vault plan from the owner key: dry run unless --send; prints every step. */
-async function runPlan(cmd: Command, ctx: KitContext, plan: VaultPlan, sendFlag: boolean | undefined) {
-  requireOwner(ctx);
-  const v = ctx.vault("owner");
-  const results = await v.sendPlan(plan, { dryRun: !sendFlag });
-  const lines = [plan.summary, `  ${VAULT_NOTE}`];
+/** Runs a plan of owner-key steps (vault or lending): dry run unless --send; prints every step. */
+async function runSteps(cmd: Command, client: { sendPlan: (p: never, o: { dryRun: boolean }) => Promise<PlanStepResult[]>; chain: { blockExplorers?: { default: { url: string } } } }, plan: { steps: PlanStep[]; summary: string }, header: string[], jsonHead: Record<string, unknown>, sendFlag: boolean | undefined) {
+  const results = await client.sendPlan(plan as never, { dryRun: !sendFlag });
+  const lines = [...header];
   for (const r of results) {
     if (r.dryRun) lines.push(`DRY RUN${r.simulated ? " (simulation passed)" : " (not simulated: needs the approval above mined first)"}: ${r.request.summary}\n  from ${r.from}\n  to   ${r.request.to}\n  data ${r.request.data}`);
-    else lines.push(`${r.status === "success" ? "OK" : "REVERTED"} ${r.request.summary}\n  tx ${r.hash}\n  ${v.chain.blockExplorers?.default.url}/tx/${r.hash}`);
+    else lines.push(`${r.status === "success" ? "OK" : "REVERTED"} ${r.request.summary}\n  tx ${r.hash}\n  ${client.chain.blockExplorers?.default.url}/tx/${r.hash}`);
   }
   if (results.some((r) => r.dryRun)) lines.push("  add --send to broadcast");
   const failed = !results.every((r) => r.dryRun || r.status === "success") || results.length !== plan.steps.length;
-  out(cmd, { vault: plan.vault, symbol: plan.symbol, account: plan.account, summary: plan.summary, dryRun: !sendFlag, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated, txHash: r.hash, status: r.status, blockNumber: r.blockNumber })) }, lines.join("\n"));
+  out(cmd, { ...jsonHead, summary: plan.summary, dryRun: !sendFlag, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated, txHash: r.hash, status: r.status, blockNumber: r.blockNumber })) }, lines.join("\n"));
   if (failed) process.exitCode = 1;
+}
+
+/** Runs a vault plan from the owner key: dry run unless --send; prints every step. */
+async function runPlan(cmd: Command, ctx: KitContext, plan: VaultPlan, sendFlag: boolean | undefined) {
+  requireOwner(ctx);
+  await runSteps(cmd, ctx.vault("owner"), plan, [plan.summary, `  ${VAULT_NOTE}`], { vault: plan.vault, symbol: plan.symbol, account: plan.account }, sendFlag);
 }
 
 function registerVaultCommands(program: Command) {
@@ -685,6 +755,121 @@ function registerVaultCommands(program: Command) {
       const plan = which === "deposit" ? await v.planCancelDeposit({ vault: addr, to: opts.to as Address | undefined }) : await v.planCancelRedeem({ vault: addr });
       await runPlan(cmd, ctx, plan, opts.send);
     });
+}
+
+// ---------------------------------------------------------------- Share lending
+
+const LENDING_NOTE = "Instant (no epochs). Borrowers are liquidated below health factor 1; the collateral oracle is re-marked weekly after the Monday lock, so keep LTV <= 70% of the LLTV. The market id is read from the lending vault (it changes on an oracle migration).";
+
+const pctOf = (x: number | null | undefined) => (x === null || x === undefined ? "-" : `${(x * 100).toFixed(2)}%`);
+const oracleLine = (o: OracleStatus) => `oracle ${o.address} ${o.state}${o.collateralPriceUsdgRaw !== undefined ? ` ${formatUsdg(o.collateralPriceUsdgRaw)} USDG/share` : ""}${o.spotRaw !== undefined ? ` (stock ${formatUnits(o.spotRaw, 18)})` : ""}${o.error ? ` ${o.error}` : ""}`;
+
+function lendHuman(s: LendStatus): string {
+  const lines = [
+    `${s.symbol} ${s.vault} (${s.name})  total ${formatUsdg(s.totalAssetsRaw)} USDG  idle ${formatUsdg(s.idleRaw)}  supplied ${formatUsdg(s.allocatedRaw)}  cap ${formatUsdg(s.capRaw)} (room ${formatUsdg(s.capLeftRaw)})`,
+    `  supply rate ${pctOf(s.supplyApy)}  utilization ${pctOf(s.utilization)}  withdrawable now ${formatUsdg(s.liquidityRaw)}  performance fee ${pctOf(s.performanceFee)}${s.supplyApyNote ? `\n  (${s.supplyApyNote})` : ""}`,
+  ];
+  if (s.market) lines.push(`  market ${s.market.id}  borrow rate ${pctOf(s.market.borrowRate)}  borrowed ${formatUsdg(s.market.totalBorrowRaw)} of ${formatUsdg(s.market.totalSupplyRaw)}  ${oracleLine(s.market.oracleStatus)}`);
+  if (s.discovery === "config") lines.push("  (vault unreadable: market from the deployment registry)");
+  if (s.my) lines.push(`  my ${formatUnits(s.my.sharesRaw, 18)} ${s.symbol} = ${formatUsdg(s.my.assetsRaw)} USDG  wallet ${formatUsdg(s.my.walletUsdgRaw)} USDG  canDeposit ${s.my.canDeposit}  canWithdraw ${s.my.canWithdraw}`);
+  lines.push(`  ${LENDING_NOTE}`);
+  return lines.join("\n");
+}
+
+function borrowHuman(s: BorrowStatus): string {
+  const m = s.market;
+  const my = s.my;
+  const lines = [
+    `market ${m.id}${m.isLiquidityMarket ? " (the vault's liquidity market)" : ""}  LLTV ${pctOf(Number(m.lltv) / 1e18)}  collateral ${m.collateralToken}  loan ${m.loanToken}`,
+    `  ${oracleLine(m.oracleStatus)}`,
+    `  borrow rate ${pctOf(m.borrowRate)} APR  utilization ${pctOf(m.utilization)}  supplied ${formatUsdg(m.totalSupplyRaw)}  borrowed ${formatUsdg(m.totalBorrowRaw)}  available ${formatUsdg(m.available)}`,
+    `  my collateral ${formatShares(my.collateralRaw)} shares${my.collateralValueRaw !== null ? ` = ${formatUsdg(my.collateralValueRaw)} USDG` : ""}  debt ${formatUsdg(my.borrowAssetsRaw)} USDG  max borrow ${my.maxBorrowRaw === null ? "-" : formatUsdg(my.maxBorrowRaw)}  borrowable ${my.borrowableRaw === null ? "-" : formatUsdg(my.borrowableRaw)} (recommended ${my.recommendedBorrowableRaw === null ? "-" : formatUsdg(my.recommendedBorrowableRaw)})`,
+    `  health factor ${my.healthFactor ?? "-"}  LTV ${pctOf(my.ltv)}  liquidation at ${my.liquidationPriceUsdgRaw === null ? "-" : formatUsdg(my.liquidationPriceUsdgRaw) + " USDG/share"}  wallet ${formatShares(my.walletSharesRaw)} shares, ${formatUsdg(my.walletUsdgRaw)} USDG`,
+  ];
+  for (const w of s.warnings) lines.push(`  ! ${w}`);
+  lines.push(`  ${LENDING_NOTE}`);
+  return lines.join("\n");
+}
+
+function lendingJson(s: LendStatus | BorrowStatus) {
+  return s;
+}
+
+async function runLendingPlan(cmd: Command, ctx: KitContext, plan: LendingPlan, sendFlag: boolean | undefined) {
+  requireOwner(ctx);
+  const header = [plan.summary, ...plan.warnings.map((w) => `  ! ${w}`)];
+  if (plan.after) header.push(`  after: collateral ${formatShares(plan.after.collateralRaw)} shares, debt ${formatUsdg(plan.after.borrowAssetsRaw)} USDG, health factor ${plan.after.healthFactor ?? "-"}, LTV ${pctOf(plan.after.ltv)}, liquidation at ${plan.after.liquidationPriceUsdgRaw === null ? "-" : formatUsdg(plan.after.liquidationPriceUsdgRaw) + " USDG/share"}`);
+  header.push(`  ${LENDING_NOTE}`);
+  await runSteps(cmd, ctx.lending("owner"), plan, header, { action: plan.action, account: plan.account, market: plan.market?.id, warnings: plan.warnings, after: plan.after }, sendFlag);
+}
+
+function registerLendingCommands(program: Command) {
+  const lend = program.command("lend").description("Lend USDG in the hhUSDG lending vault (Morpho Vault V2; instant; owner key for writes, dry run unless --send). " + LENDING_NOTE);
+  lend
+    .command("status")
+    .description("The lending vault: size, cap, liquidity, supply rate, the market it supplies, your hhUSDG shares")
+    .action(async (_o: unknown, cmd: Command) => {
+      const ctx = ctxFrom(cmd, true);
+      const withAccount = ctx.account.toLowerCase() !== ZERO;
+      const s = await ctx.lending("none").lendStatus(withAccount ? ctx.account : null);
+      out(cmd, { account: withAccount ? ctx.account : undefined, ...lendingJson(s) }, lendHuman(s));
+    });
+  lend
+    .command("deposit")
+    .description("Lend USDG: approve + deposit(usdg, account) into the vault")
+    .argument("<usdg>")
+    .option("--receiver <address>", "account credited with the hhUSDG shares; default: the account")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (usdg: string, opts: { receiver?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const plan = await ctx.lending("owner").planLendDeposit({ usdgRaw: parseUsdg(usdg), receiver: opts.receiver as Address | undefined });
+      await runLendingPlan(cmd, ctx, plan, opts.send);
+    });
+  lend
+    .command("withdraw")
+    .description("Withdraw lent USDG (an amount, or `all` = redeem every share); instant while the vault has liquidity")
+    .argument("<usdg|all>")
+    .option("--receiver <address>", "recipient; default: the owner address")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (usdg: string, opts: { receiver?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const plan = await ctx.lending("owner").planLendWithdraw({ usdg, receiver: opts.receiver as Address | undefined });
+      await runLendingPlan(cmd, ctx, plan, opts.send);
+    });
+
+  const borrow = program.command("borrow").description("Borrow USDG against Stock Yield fund shares on Morpho Blue (owner key for writes, dry run unless --send). " + LENDING_NOTE);
+  const marketOpt = (c: Command) => c.option("--market <id>", "Blue market id; default: the market the lending vault supplies");
+  marketOpt(borrow.command("status").description("The market (LLTV, oracle, rate, liquidity) and your position (collateral, debt, health factor, LTV, liquidation price)")).action(async (opts: { market?: string }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    const s = await ctx.lending("none").borrowStatus(ctx.account, opts.market);
+    out(cmd, { account: ctx.account, ...lendingJson(s) }, borrowHuman(s));
+  });
+  marketOpt(borrow.command("collateral").description("Pledge fund shares from the wallet (or `all`): approve + supplyCollateral; claim them from the fund first (`vault claim`)").argument("<shares|all>").option("--send", "broadcast instead of dry run")).action(async (shares: string, opts: { market?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planSupplyCollateral({ shares, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
+  marketOpt(borrow.command("take").description(`Borrow USDG against the pledged shares; refused below health factor 1 or without an oracle price, warns above ${LTV_WARN_FRACTION * 100}% of the LLTV`).argument("<usdg>").option("--receiver <address>", "recipient; default: the owner address").option("--send", "broadcast instead of dry run")).action(async (usdg: string, opts: { market?: string; receiver?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planBorrow({ usdgRaw: parseUsdg(usdg), receiver: opts.receiver as Address | undefined, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
+  marketOpt(borrow.command("repay").description("Repay USDG debt (an amount, or `all` = by borrow shares, exact): approve + repay").argument("<usdg|all>").option("--send", "broadcast instead of dry run")).action(async (usdg: string, opts: { market?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planRepay({ usdg, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
+  marketOpt(borrow.command("withdraw-collateral").description("Take pledged shares back (an amount, or `all` once the debt is repaid); the health factor after must stay >= 1").argument("<shares|all>").option("--receiver <address>", "recipient; default: the owner address").option("--send", "broadcast instead of dry run")).action(async (shares: string, opts: { market?: string; receiver?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planWithdrawCollateral({ shares, receiver: opts.receiver as Address | undefined, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
 }
 
 export { privateKeyToAccount };

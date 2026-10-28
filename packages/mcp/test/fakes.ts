@@ -3,9 +3,9 @@
  * quoting both sides of every instrument, and an indexer with /v1/pnl and /v1/history rows. Everything goes through one
  * `fetch` so no network is touched.
  */
-import { decodeFunctionData, encodeFunctionResult, type Address, type Hex } from "viem";
+import { decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionResult, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { encodeFillOrderAs, encodeInstrumentId, epochFundAbi, erc20Abi, instrumentName, marketV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, Side, signOrder, vaultRegistryAbi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
+import { adaptiveCurveIrmAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
 
 export const ACCOUNT = "0x3333333333333333333333333333333333333333" as Address;
 export const BOOK = "0x7288a3D12e15379C3b64988b54Ab4Da759638cf5" as Address;
@@ -13,6 +13,8 @@ export const MARKET = "0xC289617d613C9865a6595B365DaD88277282e0Ac" as Address;
 export const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 export const EXPIRY = 1793390400n; // 2026-10-30 16:00 New York
 export const STRIKES = [210_000_000n, 220_000_000n];
+/** NVDA's mainnet uiMultiplier (2026-10-28): per-token strikes are then not whole dollars. */
+export const NVDA_M = 1_000_775_159_164_630_595n;
 export const CALL220 = encodeInstrumentId(EXPIRY, 220_000_000n, false);
 export const PUT210 = encodeInstrumentId(EXPIRY, 210_000_000n, true);
 export const ONE = 10n ** 18n;
@@ -25,12 +27,26 @@ export interface ChainState {
   requirementRaw: bigint;
   /** eth_call payloads the node received for the book (simulated fills). */
   simulated: Hex[];
+  /** The expiry's snapshotted uiMultiplier; the listed per-share strikes stay 210 / 220, stored per token under it. */
+  uiMultiplier: bigint;
+  /** sessions(account, key): [expiresAt, authorizedAt, scope, maxRequirement, spendLeft]. */
+  session: [bigint, bigint, bigint, bigint, bigint];
+  /** A custom error the next simulated fill reverts with (e.g. "SessionLimit"). */
+  fillRevert?: string;
   /** The Stock Yield fund (testnet hhNVDA-CC addresses). */
   vault: VaultState;
+  /** Share lending: the hhUSDG vault and the Blue market on the fund's shares. */
+  lending: LendingState;
 }
 
 export function defaultChain(): ChainState {
-  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [], vault: defaultVault() };
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [], uiMultiplier: ONE, session: [now + 86400n, now - 3600n, 3n, 0n, 40_000_000n], vault: defaultVault(), lending: defaultLending() };
+}
+
+/** The per-token strikes the fake market stores: STRIKES (per share) under the chain's uiMultiplier. */
+export function strikesOf(state: ChainState): bigint[] {
+  return STRIKES.map((s) => tokenStrikeOf(s, state.uiMultiplier));
 }
 
 // ---------------------------------------------------------------- Stock Yield vault fixtures (testnet 46630 hhNVDA-CC)
@@ -125,13 +141,19 @@ function vaultRpc(state: ChainState, call: { to: Address; data: Hex; from?: Addr
   }
   if (to === VAULT_USDG.toLowerCase() || to === VAULT_STOCK.toLowerCase()) {
     const usdg = to === VAULT_USDG.toLowerCase();
+    const holder = typeof a[0] === "string" ? a[0].toLowerCase() : "";
     switch (functionName) {
       case "symbol":
         return enc(usdg ? "tUSDG" : "NVDA");
       case "balanceOf":
-        return enc((a[0] as string).toLowerCase() === VAULT.toLowerCase() ? 0n : usdg ? v.walletUsdg : v.walletStock);
-      case "allowance":
+        if (holder === LEND_VAULT.toLowerCase()) return enc(usdg ? state.lending.vaultIdle : 0n);
+        return enc(holder === VAULT.toLowerCase() ? 0n : usdg ? v.walletUsdg : v.walletStock);
+      case "allowance": {
+        const spender = (a[1] as string).toLowerCase();
+        if (usdg && spender === LEND_VAULT.toLowerCase()) return enc(state.lending.usdgAllowanceVault);
+        if (usdg && spender === LEND_BLUE.toLowerCase()) return enc(state.lending.usdgAllowanceBlue);
         return enc(usdg ? v.usdgAllowance : v.stockAllowance);
+      }
       case "approve":
         state.simulated.push(call.data);
         return enc(true);
@@ -139,6 +161,11 @@ function vaultRpc(state: ChainState, call: { to: Address; data: Hex; from?: Addr
   }
   if (to === VAULT.toLowerCase()) {
     switch (functionName) {
+      case "allowance":
+        return enc((a[1] as string).toLowerCase() === LEND_BLUE.toLowerCase() ? state.lending.shareAllowanceBlue : 0n);
+      case "approve":
+        state.simulated.push(call.data);
+        return enc(true);
       case "name":
         return enc("Hedgehood Covered Call NVDA");
       case "symbol":
@@ -209,6 +236,202 @@ function vaultRpc(state: ChainState, call: { to: Address; data: Hex; from?: Addr
 
 const VAULT_ADDRESSES = new Set([VAULT, VAULT_REGISTRY, VAULT_GATE, VAULT_STOCK, VAULT_USDG, VAULT_ORACLE].map((x) => x.toLowerCase()));
 
+// ---------------------------------------------------------------- Share lending fixtures (testnet 46630 v5 market + hhUSDG vault)
+
+export const LEND_BLUE = "0xa0BA91A2F99894044CCD82cA48e5C795BA7570B6" as Address;
+export const LEND_VAULT = "0x6ab073F0E3F1610C4Ad9e7Dc19Ca25F831682f00" as Address;
+export const LEND_ADAPTER = "0x89ace3cb69f676d41aBa380563F267cD7b8A98f3" as Address;
+export const LEND_ORACLE = "0x1291A39e96Cd1ce736084548b15532D9a8D4bE77" as Address;
+export const LEND_IRM = "0xAf61C1DEDffD90D39E7D90641A8AB1B59497a9fF" as Address;
+export const LEND_LLTV = 625000000000000000n;
+/** The fixture market: hhNVDA-CC (VAULT) shares vs tUSDG. */
+export const LEND_PARAMS = { loanToken: VAULT_USDG, collateralToken: VAULT, oracle: LEND_ORACLE, irm: LEND_IRM, lltv: LEND_LLTV } as const;
+export const LEND_MARKET_ID = marketIdOf(LEND_PARAMS);
+/** A second market (another oracle) the vault does not supply: what a migration target looks like before the switch. */
+export const LEND_ORACLE_2 = "0x2222222222222222222222222222222222222222" as Address;
+export const LEND_PARAMS_2 = { ...LEND_PARAMS, oracle: LEND_ORACLE_2 } as const;
+export const LEND_MARKET_ID_2 = marketIdOf(LEND_PARAMS_2);
+/** 0.95 USDG per share in Blue's 1e36 format (USDG raw per 1e18 shares x 1e18). */
+export const LEND_PRICE = 950_000n * 10n ** 18n;
+/** ~1.16% APR per second, WAD. */
+export const LEND_RATE = 367_843_366n;
+
+export interface LendingState {
+  /** Vault V2 (hhUSDG). */
+  liquidityAdapter: Address;
+  /** The market the vault supplies (its liquidityData encodes these params). */
+  liquidityParams: typeof LEND_PARAMS | typeof LEND_PARAMS_2;
+  adapterMarketIds: Hex[];
+  vaultTotalAssets: bigint;
+  vaultTotalSupply: bigint;
+  /** USDG held idle by the vault. */
+  vaultIdle: bigint;
+  /** The account's hhUSDG shares (18 decimals: 1 USDG = 1e18 shares at par). */
+  vaultShares: bigint;
+  performanceFee: bigint;
+  maxRate: bigint;
+  absoluteCap: bigint;
+  allocation: bigint;
+  canReceiveShares: boolean;
+  canSendShares: boolean;
+  /** Blue market and the account's position. */
+  market: { totalSupplyAssets: bigint; totalSupplyShares: bigint; totalBorrowAssets: bigint; totalBorrowShares: bigint; lastUpdate: bigint; fee: bigint };
+  position: { supplyShares: bigint; borrowShares: bigint; collateral: bigint };
+  borrowRate: bigint;
+  isAuthorized: boolean;
+  /** null = the oracle reverts Unavailable (fail-closed). */
+  oraclePrice: bigint | null;
+  spot: bigint;
+  spotLive: boolean;
+  nav: bigint;
+  liabilities: bigint;
+  /** Allowances from the account. */
+  shareAllowanceBlue: bigint;
+  usdgAllowanceBlue: bigint;
+  usdgAllowanceVault: bigint;
+}
+
+export function defaultLending(): LendingState {
+  return {
+    liquidityAdapter: LEND_ADAPTER,
+    liquidityParams: LEND_PARAMS,
+    adapterMarketIds: [LEND_MARKET_ID],
+    vaultTotalAssets: 1_500_000_000n,
+    vaultTotalSupply: 1500n * ONE,
+    vaultIdle: 0n,
+    vaultShares: 100n * ONE,
+    performanceFee: 10n ** 17n,
+    maxRate: 15_854_895_991n,
+    absoluteCap: 100_000_000_000n,
+    allocation: 1_500_000_000n,
+    canReceiveShares: true,
+    canSendShares: true,
+    // 1,500 supplied, 670 borrowed (44.7% utilisation), shares at 1e6 per asset, no accrual pending
+    market: { totalSupplyAssets: 1_500_000_000n, totalSupplyShares: 1_500_000_000_000_000n, totalBorrowAssets: 670_000_000n, totalBorrowShares: 670_000_000_000_000n, lastUpdate: VAULT_NOW, fee: 0n },
+    // 100 shares pledged, no debt
+    position: { supplyShares: 0n, borrowShares: 0n, collateral: 100n * ONE },
+    borrowRate: LEND_RATE,
+    isAuthorized: false,
+    oraclePrice: LEND_PRICE,
+    spot: 217n * ONE,
+    spotLive: true,
+    nav: 22_206_000_000n,
+    liabilities: 372_000_000n,
+    shareAllowanceBlue: 0n,
+    usdgAllowanceBlue: 0n,
+    usdgAllowanceVault: 0n,
+  };
+}
+
+const marketParamsAbi = [{ type: "tuple", components: [{ name: "loanToken", type: "address" }, { name: "collateralToken", type: "address" }, { name: "oracle", type: "address" }, { name: "irm", type: "address" }, { name: "lltv", type: "uint256" }] }] as const;
+const LENDING_ADDRESSES = new Set([LEND_BLUE, LEND_VAULT, LEND_ADAPTER, LEND_ORACLE, LEND_ORACLE_2, LEND_IRM].map((x) => x.toLowerCase()));
+
+function lendingRpc(state: ChainState, call: { to: Address; data: Hex }): unknown {
+  const l = state.lending;
+  const to = call.to.toLowerCase();
+  const pick = <A extends readonly unknown[]>(abi: A) => {
+    const { functionName, args } = decodeFunctionData({ abi: abi as never, data: call.data }) as { functionName: string; args?: readonly unknown[] };
+    const a = (args ?? []) as unknown[];
+    const enc = (result: unknown) => encodeFunctionResult({ abi: abi as never, functionName, result } as Parameters<typeof encodeFunctionResult>[0]);
+    return { functionName, a, enc };
+  };
+  const paramsOf = (id: string) => (id.toLowerCase() === LEND_MARKET_ID.toLowerCase() ? LEND_PARAMS : id.toLowerCase() === LEND_MARKET_ID_2.toLowerCase() ? LEND_PARAMS_2 : undefined);
+  if (to === LEND_BLUE.toLowerCase()) {
+    const { functionName, a, enc } = pick(morphoBlueAbi);
+    switch (functionName) {
+      case "market": {
+        if (!paramsOf(String(a[0]))) return enc([0n, 0n, 0n, 0n, 0n, 0n]);
+        const m = l.market;
+        return enc([m.totalSupplyAssets, m.totalSupplyShares, m.totalBorrowAssets, m.totalBorrowShares, m.lastUpdate, m.fee]);
+      }
+      case "position": {
+        const p = String(a[0]).toLowerCase() === LEND_MARKET_ID.toLowerCase() ? l.position : { supplyShares: 0n, borrowShares: 0n, collateral: 0n };
+        return enc([p.supplyShares, p.borrowShares, p.collateral]);
+      }
+      case "idToMarketParams": {
+        const p = paramsOf(String(a[0]));
+        return enc(p ? [p.loanToken, p.collateralToken, p.oracle, p.irm, p.lltv] : ["0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000000", 0n]);
+      }
+      case "isAuthorized":
+        return enc(l.isAuthorized);
+      case "supplyCollateral":
+      case "borrow":
+      case "repay":
+      case "withdrawCollateral":
+        state.simulated.push(call.data);
+        return "0x";
+    }
+  }
+  if (to === LEND_VAULT.toLowerCase()) {
+    const { functionName, a, enc } = pick(vaultV2Abi);
+    switch (functionName) {
+      case "liquidityAdapter":
+        return enc(l.liquidityAdapter);
+      case "liquidityData":
+        return enc(l.liquidityAdapter === "0x0000000000000000000000000000000000000000" ? "0x" : encodeAbiParameters(marketParamsAbi, [l.liquidityParams]));
+      case "totalAssets":
+        return enc(l.vaultTotalAssets);
+      case "totalSupply":
+        return enc(l.vaultTotalSupply);
+      case "name":
+        return enc("Hedgehood USDG Lending");
+      case "symbol":
+        return enc("hhUSDG");
+      case "asset":
+        return enc(VAULT_USDG);
+      case "performanceFee":
+        return enc(l.performanceFee);
+      case "maxRate":
+        return enc(l.maxRate);
+      case "absoluteCap":
+        return enc(l.absoluteCap);
+      case "allocation":
+        return enc(l.allocation);
+      case "balanceOf":
+        return enc(l.vaultShares);
+      case "previewRedeem":
+        return enc(((a[0] as bigint) * l.vaultTotalAssets) / l.vaultTotalSupply);
+      case "canReceiveShares":
+        return enc(l.canReceiveShares);
+      case "canSendShares":
+        return enc(l.canSendShares);
+      case "deposit":
+      case "withdraw":
+      case "redeem":
+        state.simulated.push(call.data);
+        return "0x";
+    }
+  }
+  if (to === LEND_ADAPTER.toLowerCase()) {
+    const { functionName, a, enc } = pick(morphoMarketV1AdapterV2Abi);
+    switch (functionName) {
+      case "marketIdsLength":
+        return enc(BigInt(l.adapterMarketIds.length));
+      case "marketIds":
+        return enc(l.adapterMarketIds[Number(a[0])]!);
+      case "expectedSupplyAssets":
+        return enc(String(a[0]).toLowerCase() === LEND_MARKET_ID.toLowerCase() ? l.allocation : 0n);
+    }
+  }
+  if (to === LEND_ORACLE.toLowerCase() || to === LEND_ORACLE_2.toLowerCase()) {
+    const { functionName, enc } = pick(shareRiskOracleAbi);
+    if (l.oraclePrice === null) throw new Error("execution reverted: Unavailable()");
+    switch (functionName) {
+      case "price":
+        return enc(l.oraclePrice);
+      case "spot":
+        return enc([l.spot, l.spotLive]);
+      case "valuation":
+        return enc([l.nav, l.nav + l.liabilities, l.liabilities, l.spot, l.spotLive]);
+    }
+  }
+  if (to === LEND_IRM.toLowerCase()) {
+    const { functionName, enc } = pick(adaptiveCurveIrmAbi);
+    if (functionName === "borrowRateView") return enc(l.borrowRate);
+  }
+  throw new Error(`fake rpc: no lending fixture for ${call.data.slice(0, 10)} on ${call.to}`);
+}
+
 /** The `GET /api/stockyield/funds` row the public API would serve for the fixture fund (chain 46630 for the tests). */
 export function vaultApiFixture(state: ChainState) {
   const v = state.vault;
@@ -244,6 +467,7 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
   }
   if (method !== "eth_call") throw new Error(`fake rpc: unexpected ${method}`);
   const call = params[0] as { to: Address; data: Hex; from?: Address };
+  if (LENDING_ADDRESSES.has(call.to.toLowerCase())) return lendingRpc(state, call);
   if (VAULT_ADDRESSES.has(call.to.toLowerCase())) return vaultRpc(state, call);
   const { functionName, args } = decodeFunctionData({ abi, data: call.data });
   const enc = (result: unknown) => encodeFunctionResult({ abi, functionName, result } as Parameters<typeof encodeFunctionResult>[0]);
@@ -263,7 +487,7 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
     case "openedExpiries":
       return enc([EXPIRY]);
     case "strikesOf":
-      return enc(STRIKES);
+      return enc(strikesOf(state));
     case "positions":
       return enc(state.positions);
     case "protocolFeeBps":
@@ -275,22 +499,44 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
     case "uiMultiplier":
       return enc(ONE);
     case "expiryInfo":
-      return enc({ openedAt: 1792785600n, settled: false, settledByOwner: false, uiMultiplier: ONE, anchor: 215_000_000n, capLow: 150_500_000n, capHigh: 279_500_000n, settlementPrice: 0n, rawSettlementPrice: 0n, strikes: STRIKES });
+      return enc({ openedAt: 1792785600n, settled: false, settledByOwner: false, uiMultiplier: state.uiMultiplier, anchor: 215_000_000n, capLow: 150_500_000n, capHigh: 279_500_000n, settlementPrice: 0n, rawSettlementPrice: 0n, strikes: strikesOf(state) });
     case "sessions":
-      return enc([BigInt(Math.floor(Date.now() / 1000) + 86400), 3n, 0n]);
-    case "fillOrderAs":
+      return enc(state.session);
+    case "authorizeSession":
+    case "revokeSession":
       state.simulated.push(call.data);
       return "0x";
+    case "fillOrderAs": {
+      state.simulated.push(call.data);
+      const fromBalance = (args as unknown as unknown[])[4];
+      const signer = call.from?.toLowerCase();
+      // the market's rule: a session leg (signer != account) must settle from the balance
+      if (signer && signer !== String((args as unknown as unknown[])[0]).toLowerCase() && fromBalance !== true) throw new RevertWith("SessionWalletMode");
+      if (state.fillRevert) throw new RevertWith(state.fillRevert);
+      return "0x";
+    }
     default:
       throw new Error(`fake rpc: no fixture for ${functionName}(${(args as unknown as unknown[] | undefined)?.join(", ") ?? ""})`);
   }
 }
 
-/** The maker's `POST /v1/rfq` answer for a request body, signed for real so the SDK's verification passes. */
-export async function makerQuote(body: { instrument: string; side: "buy" | "sell"; quantity: string; taker: Address }, opts: { now?: number; dryRun?: boolean } = {}): Promise<QuoteResponse> {
+/** A JSON-RPC revert carrying a market custom error's data. */
+export class RevertWith extends Error {
+  readonly data: Hex;
+  constructor(errorName: string) {
+    super("execution reverted");
+    this.data = encodeErrorResult({ abi: marketV2Abi, errorName } as Parameters<typeof encodeErrorResult>[0]);
+  }
+}
+
+/**
+ * The maker's `POST /v1/rfq` answer for a request body, signed for real so the SDK's verification passes. The name
+ * carries the listed per-share strike; the order's id the per-token strike under `uiMultiplier`.
+ */
+export async function makerQuote(body: { instrument: string; side: "buy" | "sell"; quantity: string; taker: Address }, opts: { now?: number; dryRun?: boolean; uiMultiplier?: bigint } = {}): Promise<QuoteResponse> {
   const now = opts.now ?? Math.floor(Date.now() / 1000);
   const isPut = body.instrument.endsWith("-P");
-  const strike = BigInt(Math.round(Number(body.instrument.split("-")[2]) * 1e6));
+  const strike = tokenStrikeOf(BigInt(Math.round(Number(body.instrument.split("-")[2]) * 1e6)), opts.uiMultiplier ?? ONE);
   const instrumentId = encodeInstrumentId(EXPIRY, strike, isPut);
   const quantityRaw = BigInt(Math.round(Number(body.quantity) * 1e6)) * 10n ** 12n;
   const side = body.side === "buy" ? Side.Ask : Side.Bid;
@@ -365,6 +611,7 @@ export function fakeWorld(opts: { chain?: ChainState; quoteDryRun?: boolean; quo
         try {
           return { jsonrpc: "2.0", id: r.id, result: rpcResult(chain, r.method, r.params) };
         } catch (e) {
+          if (e instanceof RevertWith) return { jsonrpc: "2.0", id: r.id, error: { code: 3, message: e.message, data: e.data } };
           return { jsonrpc: "2.0", id: r.id, error: { code: -32000, message: e instanceof Error ? e.message : String(e) } };
         }
       };
@@ -378,7 +625,7 @@ export function fakeWorld(opts: { chain?: ChainState; quoteDryRun?: boolean; quo
     if (url.pathname === "/v1/rfq") {
       const f = failures.shift();
       if (f) return ok(f.body, f.status);
-      return ok(await makerQuote(body as Parameters<typeof makerQuote>[0], { dryRun: opts.quoteDryRun }));
+      return ok(await makerQuote(body as Parameters<typeof makerQuote>[0], { dryRun: opts.quoteDryRun, uiMultiplier: chain.uiMultiplier }));
     }
     if (opts.indexerDown) return ok({ error: "unavailable" }, 503);
     if (url.pathname === "/v1/pnl") return ok(pnlFixture(now));

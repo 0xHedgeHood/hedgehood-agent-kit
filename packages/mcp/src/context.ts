@@ -1,4 +1,4 @@
-import { getDeployment, getMarket, MarketClient, RfqClient, VaultClient, type MarketDeployment, type VaultDeployment, type VerifiedQuote } from "@hedgehood-io/sdk";
+import { getDeployment, getMarket, LendingClient, MarketClient, RfqClient, VaultClient, type LendingDeployment, type MarketDeployment, type VaultDeployment, type VerifiedQuote } from "@hedgehood-io/sdk";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount, type LocalAccount } from "viem/accounts";
 import type { KitConfig } from "./config.js";
@@ -12,6 +12,8 @@ export interface KitContext {
   marketDeployment?: MarketDeployment;
   /** The Stock Yield vault stack of the chain, when deployed. */
   vaults?: VaultDeployment;
+  /** Share lending (USDG lending vault + Blue market on fund shares) of the chain, when deployed. */
+  lendingDeployment?: LendingDeployment;
   /** The trading account every tool reads and trades for. */
   account: Address;
   session?: LocalAccount;
@@ -21,12 +23,14 @@ export interface KitContext {
   market: (signer?: "session" | "owner" | "none") => MarketClient;
   /** A vault client: reads, or writes signed with the owner key (a session key cannot act on a vault). */
   vault: (signer?: "owner" | "none") => VaultClient;
+  /** A lending client: reads, or writes signed with the owner key (it holds the USDG and the fund shares). */
+  lending: (signer?: "owner" | "none") => LendingClient;
   /** Quotes returned by get_quote, by digest, so fill_quote can take a digest instead of the whole order. */
   quotes: Map<Hex, { quote: VerifiedQuote; fetchedAt: number; side: "buy" | "sell"; requestedQuantityRaw: bigint }>;
   fetch?: typeof fetch;
 }
 
-export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; deployment?: MarketDeployment; vaults?: VaultDeployment } = {}): KitContext {
+export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; deployment?: MarketDeployment; vaults?: VaultDeployment; lending?: LendingDeployment } = {}): KitContext {
   const chainId = config.chainId;
   const dep = getDeployment(chainId);
   let marketDeployment = extra.deployment;
@@ -39,6 +43,7 @@ export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; 
     }
   }
   const vaults = extra.vaults ?? dep.vaults;
+  const lendingDeployment = extra.lending ?? dep.lending;
   const session = config.sessionKey ? privateKeyToAccount(config.sessionKey) : undefined;
   const owner = config.ownerKey ? privateKeyToAccount(config.ownerKey) : undefined;
   const account = config.account ?? owner?.address ?? session?.address;
@@ -60,6 +65,12 @@ export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; 
     if (extra.fetch) opts.fetch = extra.fetch;
     return new VaultClient(opts);
   };
+  const lending = (signer: "owner" | "none" = "none") => {
+    if (!lendingDeployment) throw new Error(`share lending is not deployed on chain ${chainId}`);
+    const opts: ConstructorParameters<typeof LendingClient>[0] = { chainId, rpcUrl: config.rpcUrl, deployment: lendingDeployment, account, signer: signer === "owner" ? owner : undefined };
+    if (extra.fetch) opts.fetch = extra.fetch;
+    return new LendingClient(opts);
+  };
   return {
     config,
     chainId,
@@ -68,12 +79,14 @@ export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; 
     },
     marketDeployment,
     vaults,
+    lendingDeployment,
     account,
     session,
     owner,
     rfq,
     market,
     vault,
+    lending,
     quotes: new Map(),
     fetch: extra.fetch,
   };

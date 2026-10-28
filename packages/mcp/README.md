@@ -20,8 +20,12 @@ Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`
 `positions` (active, with avg price / mark / unrealized P&L / time to expiry), `get_pnl`, `get_history` (past), `redeem`,
 `withdraw`*, `authorize_session`*, `leaderboard`, `my_record`, `get_agent_record`, `register_agent`*, `decode_instrument`;
 Stock Yield vaults: `list_vaults`, `vault_status`, `vault_deposit`*, `vault_redeem`*, `vault_claim`*, `vault_cancel`*
-(* owner key). Vault requests queue until the fund's next epoch freeze and are claimed afterwards; a redeem can take up
-to a week. The server also runs on mainnet 4663, where today only the vaults are deployed.
+share lending: `lend_status`, `lend_deposit`*, `lend_withdraw`*, `borrow_status`, `borrow_supply_collateral`*, `borrow_take`*,
+`borrow_repay`*, `borrow_withdraw_collateral`* (* owner key). `authorize_session` takes a required `maxSpend` (USDG of
+premium + fees the key may spend, `"0"` = cannot buy, `"unlimited"`) and `maxRequirement` (default `"0"` = no new
+requirement); fills from the session key always settle in balance mode. Vault requests queue until the fund's next epoch freeze and are claimed afterwards; a redeem can take up
+to a week; lending is instant (borrows are refused below health factor 1 and warned above 70% of LLTV). The server also
+runs on mainnet 4663, where today the vaults and share lending are deployed (no option market yet).
 
 Environment: `HEDGEHOOD_CHAIN_ID` (46630|4663), `HEDGEHOOD_SESSION_KEY_FILE` | `HEDGEHOOD_SESSION_KEY`,
 `HEDGEHOOD_ACCOUNT`, `HEDGEHOOD_OWNER_KEY_FILE` | `HEDGEHOOD_OWNER_KEY`, `HEDGEHOOD_RPC_URL`, `HEDGEHOOD_RFQ_URL`,

@@ -47,7 +47,7 @@ export function pnlByInstrument(pnl: PnlView | undefined): Map<string, PnlPositi
 
 /** On-chain position + the indexer's P&L row for it (when available) + time to expiry. */
 export function positionPnl(position: Position, underlying: string, pnl: PnlView | Map<string, PnlPosition> | undefined, now: number = Math.floor(Date.now() / 1000)): PositionPnlFields {
-  const instrument = instrumentName(underlying, position.expiry, position.strike, position.isPut);
+  const instrument = instrumentName(underlying, position.expiry, position.strike, position.isPut, position.uiMultiplier);
   const rows = pnl instanceof Map ? pnl : pnlByInstrument(pnl);
   const row = rows.get(instrument.toUpperCase());
   const avgPrice = row?.avgPriceRaw != null ? formatUsdg(BigInt(row.avgPriceRaw)) : undefined;
