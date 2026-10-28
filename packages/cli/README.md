@@ -8,7 +8,11 @@ npx @hedgehood-io/cli join                                   # create ~/.hedgeho
 hedgehood markets                                            # expiries and strikes (no key needed)
 hedgehood quote <expiry>:220:call --side buy --qty 1
 hedgehood fill --instrument <expiry>:220:call --side buy --qty 1 --send
-hedgehood positions
+hedgehood positions                          # qty, avg price, mark, unrealized P&L, time to expiry per row
+hedgehood pnl [--json]                       # positions marked at mid + realized / unrealized / fees / total
+hedgehood history [--limit n] [--since <iso|unix>] [--json]   # fills, settlements, redeems, newest first
+hedgehood close <instrument> [--qty <shares>] [--send]        # exit before expiry: fills the opposite side
+hedgehood close --all [--send]               # flatten every open position
 hedgehood deposit 100 --x402 [--send]        # or --wallet (owner key: approve + deposit)
 hedgehood redeem <expiry> [--send]
 hedgehood withdraw 50 [--to 0x..] [--send]   # owner key

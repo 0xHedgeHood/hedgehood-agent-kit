@@ -33,6 +33,8 @@ import {
  *    GET  /v1/leaderboard?by=account|agent&order=settledPnlRaw|fills|volumeRaw|premiumPaidRaw|premiumReceivedRaw&limit=
  *    GET  /v1/agents/{agentId}                     -> AgentView (ERC-8004 record + accounts trading under it)
  *    GET  /v1/quotes/{digest}                      -> QuoteStatus
+ *    GET  /v1/pnl?account=                         -> PnlView (open positions marked at the desk's mid + realized / fees / total)
+ *    GET  /v1/history?account=&limit=&since=       -> HistoryView (fills, settlements, redeems; newest first)
  *
  * Integers that may exceed 2^53 are decimal strings (`*Raw`); prices per share (`bid`, `ask`, `mid`, `price.start`) are
  * JSON numbers in USDG per share. The backend is in dry-run mode until the operator mounts the quote signer key: a quote
@@ -49,6 +51,8 @@ export const RfqPaths = {
   leaderboard: "/v1/leaderboard",
   agent: (agentId: string | number | bigint) => `/v1/agents/${agentId}`,
   quote: (digest: string) => `/v1/quotes/${digest}`,
+  pnl: "/v1/pnl",
+  history: "/v1/history",
   deposit: "/v1/deposit",
   instructions: "/v1/instructions",
 } as const;
@@ -273,6 +277,88 @@ export interface AgentView {
   registry: Address;
 }
 
+/** One open (or settled, not yet redeemed) position as `GET /v1/pnl` marks it. */
+export interface PnlPosition {
+  /** `NVDA-20261030-220-C` */
+  instrument: string;
+  market: Address;
+  expiry: number;
+  strike: string;
+  isPut: number | boolean;
+  /** Signed 1e18 shares (negative = short). */
+  quantityRaw: string;
+  /** Signed USDG raw paid (positive) or received (negative), taker fees included. */
+  costRaw: string;
+  /** Average entry price per share, USDG raw; null when unknown. */
+  avgPriceRaw: string | null;
+  /** Desk mark per share, USDG (floats); null when the desk has no row. */
+  markMid: number | null;
+  markBid?: number | null;
+  markAsk?: number | null;
+  markSource: string | null;
+  markAt: number | null;
+  /** Mark-to-mid P&L, signed USDG raw; null without a mark. */
+  unrealizedRaw: string | null;
+  settledAt: number | null;
+  /** Settlement payout, signed USDG raw, once the expiry settled. */
+  settlementRaw: string | null;
+}
+
+export interface PnlView {
+  account: Address;
+  asOf: number;
+  positions: PnlPosition[];
+  /** Settled P&L booked so far (signed USDG raw). */
+  realizedRaw: string;
+  /** Sum of the open positions' mark-to-mid P&L; null when any mark is missing. */
+  unrealizedRaw: string | null;
+  feesPaidRaw: string;
+  /** realized + unrealized - fees (signed USDG raw). */
+  totalRaw: string;
+  note?: string;
+}
+
+export interface FillEvent {
+  type: "fill";
+  at: number;
+  txHash: Hex;
+  instrument: string;
+  /** The account's side. */
+  side: "buy" | "sell";
+  quantityRaw: string;
+  /** Per share, USDG raw. */
+  priceRaw: string;
+  premiumRaw: string;
+  feeRaw: string;
+  counterparty: Address;
+}
+
+export interface SettlementEvent {
+  type: "settlement";
+  at: number;
+  instrument: string;
+  /** USDG per share. */
+  settlementPrice: number;
+  payoutRaw: string;
+}
+
+export interface RedeemEvent {
+  type: "redeem";
+  at: number;
+  txHash: Hex;
+  expiry: number;
+  amountRaw: string;
+}
+
+export type HistoryEvent = FillEvent | SettlementEvent | RedeemEvent;
+
+export interface HistoryView {
+  account: Address;
+  /** Newest first. */
+  events: HistoryEvent[];
+  note?: string;
+}
+
 export type LeaderboardOrder = "settledPnlRaw" | "fills" | "volumeRaw" | "premiumPaidRaw" | "premiumReceivedRaw";
 
 export class RfqError extends Error {
@@ -298,6 +384,8 @@ export interface RfqClientOptions {
   timeoutMs?: number;
   /** Clock override (unix seconds) for tests. */
   now?: () => number;
+  /** Wait before the single retry of a `503 not_executable:feed_not_healthy` quote (the feed cycles every 20 s); default 1500 ms. */
+  feedRetryMs?: number;
 }
 
 export class RfqClient {
@@ -307,6 +395,7 @@ export class RfqClient {
   private readonly apiKey?: string;
   private readonly timeoutMs: number;
   private readonly now: () => number;
+  private readonly feedRetryMs: number;
 
   constructor(opts: RfqClientOptions) {
     this.chainId = opts.chainId;
@@ -317,6 +406,7 @@ export class RfqClient {
     this.apiKey = opts.apiKey;
     this.timeoutMs = opts.timeoutMs ?? 15_000;
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+    this.feedRetryMs = opts.feedRetryMs ?? 1500;
   }
 
   private async request<T>(host: keyof BackendHosts, method: "GET" | "POST", path: string, body?: unknown, query?: Record<string, string | number | undefined>): Promise<T> {
@@ -367,11 +457,20 @@ export class RfqClient {
     return this.request<MarkView>("rfq", "GET", RfqPaths.mark, undefined, { instrument: name });
   }
 
-  /** The raw quote as the backend returns it (REST `POST /v1/rfq`). */
+  /**
+   * The raw quote as the backend returns it (REST `POST /v1/rfq`). A `503 not_executable:feed_not_healthy` refusal is
+   * retried once after `feedRetryMs` (the pricing feed cycles every 20 s); any other refusal surfaces at once.
+   */
   async requestQuote(req: QuoteRequest): Promise<QuoteResponse> {
     const body: Record<string, unknown> = { instrument: nameOf(req.instrumentId, req.underlying ?? "NVDA"), side: req.side, quantity: sharesDecimal(req.quantityRaw), taker: req.taker };
     if (req.sessionKey) body.sessionKey = req.sessionKey;
-    return this.request<QuoteResponse>("rfq", "POST", RfqPaths.rfq, body);
+    try {
+      return await this.request<QuoteResponse>("rfq", "POST", RfqPaths.rfq, body);
+    } catch (e) {
+      if (!isFeedNotHealthy(e)) throw e;
+      await new Promise((r) => setTimeout(r, this.feedRetryMs));
+      return this.request<QuoteResponse>("rfq", "POST", RfqPaths.rfq, body);
+    }
   }
 
   /** The same quote through the AirSwap-style JSON-RPC face (`getSignerSideOrder`). */
@@ -472,6 +571,25 @@ export class RfqClient {
   async quoteStatus(digest: Hex): Promise<Record<string, unknown>> {
     return this.request("indexer", "GET", RfqPaths.quote(digest));
   }
+
+  /** Open positions marked at the desk's mid, plus realized / unrealized / fees / total for the account. */
+  async getPnl(account: Address): Promise<PnlView> {
+    return this.request<PnlView>("indexer", "GET", RfqPaths.pnl, undefined, { account });
+  }
+
+  /** Past activity (fills, settlements, redeems), newest first. `since` is unix seconds. */
+  async getHistory(account: Address, opts: { limit?: number; since?: number } = {}): Promise<HistoryView> {
+    const r = await this.request<HistoryView>("indexer", "GET", RfqPaths.history, undefined, { account, limit: opts.limit, since: opts.since });
+    return { ...r, events: r.events ?? [] };
+  }
+}
+
+/** `503 not_executable` whose reason names the pricing feed (`not_executable:feed_not_healthy`). */
+export function isFeedNotHealthy(e: unknown): e is RfqError {
+  if (!(e instanceof RfqError) || e.status !== 503) return false;
+  const b = (e.body ?? {}) as { reason?: unknown };
+  const reason = typeof b.reason === "string" ? b.reason : "";
+  return e.code === "not_executable" && /feed_not_healthy/.test(reason);
 }
 
 const ZERO = "0x0000000000000000000000000000000000000000";

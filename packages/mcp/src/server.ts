@@ -8,6 +8,7 @@ import {
   encodeInstrumentId,
   encodeRegisterAgent,
   formatShares,
+  formatSignedUsdg,
   formatStrike,
   formatUsdg,
   identityRegistryFor,
@@ -18,8 +19,12 @@ import {
   orderToJson,
   parseShares,
   parseUsdg,
+  planClose,
+  pnlByInstrument,
+  positionPnl,
   SCOPE_CANCEL,
   SCOPE_TRADE,
+  type ClosePlan,
   type QuoteResponse,
   type TxRequest,
   type VerifiedQuote,
@@ -61,18 +66,19 @@ async function instrumentFrom(m: MarketClient, args: { instrument?: string; inst
   throw new Error("give instrument (NVDA-20261030-220-C), or instrumentId, or expiry + strike + kind");
 }
 
-async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRequest, confirm: boolean, dryRun: boolean | undefined) {
+/** `extra` is merged into every JSON answer (what a close or fill was priced at), never into an error. */
+async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRequest, confirm: boolean, dryRun: boolean | undefined, extra: Record<string, unknown> = {}) {
   const dry = dryRun ?? ctx.config.dryRunDefault;
   if (!confirm) {
-    return json({ ok: false, needsConfirm: true, wouldSend: tx.summary, to: tx.to, data: tx.data, dryRun: dry, hint: "call again with confirm: true" });
+    return json({ ...extra, ok: false, needsConfirm: true, wouldSend: tx.summary, to: tx.to, data: tx.data, dryRun: dry, hint: "call again with confirm: true" });
   }
   const signer = who === "owner" ? requireOwner(ctx) : requireSession(ctx);
   const m = ctx.market(who);
   try {
     const r = await m.send(tx, { dryRun: dry });
-    if (r.dryRun) return json({ ok: true, dryRun: true, simulated: true, from: signer.address, to: tx.to, data: tx.data, summary: tx.summary, hint: "simulation passed; call again with dryRun: false to broadcast" });
+    if (r.dryRun) return json({ ...extra, ok: true, dryRun: true, simulated: true, from: signer.address, to: tx.to, data: tx.data, summary: tx.summary, hint: "simulation passed; call again with dryRun: false to broadcast" });
     const receipt = await m.waitForReceipt(r.hash!);
-    return json({ ok: receipt.status === "success", dryRun: false, txHash: r.hash, blockNumber: receipt.blockNumber, status: receipt.status, from: signer.address, summary: tx.summary, explorer: `${m.chain.blockExplorers?.default.url}/tx/${r.hash}` });
+    return json({ ...extra, ok: receipt.status === "success", dryRun: false, txHash: r.hash, blockNumber: receipt.blockNumber, status: receipt.status, from: signer.address, summary: tx.summary, explorer: `${m.chain.blockExplorers?.default.url}/tx/${r.hash}` });
   } catch (e) {
     return fail(`${tx.summary} failed: ${errorText(e)}`);
   }
@@ -108,6 +114,19 @@ function quoteView(q: VerifiedQuote, underlying: string, side: "buy" | "sell", r
     markMidPerShare: q.markPrice,
     maker: q.order.maker,
     makerSigner: q.order.signer,
+  };
+}
+
+function closeView(plan: ClosePlan, underlying: string) {
+  return {
+    instrument: plan.instrument,
+    label: describeInstrument(plan.instrumentId, underlying),
+    instrumentId: plan.instrumentId.toString(),
+    position: formatShares(plan.position.quantityRaw),
+    closes: formatShares(plan.quantityRaw),
+    remainingAfter: formatShares(plan.remainingRaw),
+    side: plan.side,
+    quote: quoteView(plan.quote, underlying, plan.side, plan.quantityRaw),
   };
 }
 
@@ -234,7 +253,7 @@ export function createServer(ctx: KitContext): McpServer {
     "fill_quote",
     {
       title: "Fill a quote",
-      description: "Takes a quote from get_quote for your account via fillOrderAs from the session key, in balance mode (premium, fee and collateral settle from your deposited USDG; no approvals). dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash when sent.",
+      description: "Takes a quote from get_quote for your account via fillOrderAs from the session key, in balance mode (premium, fee and collateral settle from your deposited USDG; no approvals). Opens or adds to a position; to exit an existing position before expiry use close_position instead. dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash when sent.",
       inputSchema: {
         digest: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional().describe("Digest returned by get_quote"),
         order: z.record(z.unknown()).optional().describe("Alternatively the order JSON from get_quote"),
@@ -309,30 +328,102 @@ export function createServer(ctx: KitContext): McpServer {
   server.registerTool(
     "positions",
     {
-      title: "Positions and balances",
-      description: "Your market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument, and the session's authority. Read-only.",
+      title: "Positions and balances (active)",
+      description: "Your ACTIVE book: market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument with average entry price, the desk's mark, unrealized P&L and time to expiry (when the indexer answers), plus the session's authority. Past activity is get_history; totals are get_pnl; to exit a position before expiry call close_position. Read-only.",
       inputSchema: {},
     },
     async () => {
       const m = ctx.market("none");
-      const snap = await m.snapshot(ctx.account);
+      const [snap, pnl] = await Promise.all([m.snapshot(ctx.account), ctx.rfq.getPnl(ctx.account).catch(() => undefined)]);
       const settledPending: string[] = [];
       for (const e of snap.expiries) {
         const info = await m.expiryInfo(e);
         if (info.settled) settledPending.push(e.toString());
       }
       const session = ctx.session ? await m.session(ctx.session.address, ctx.account) : undefined;
+      const rows = pnlByInstrument(pnl);
+      const now = Math.floor(Date.now() / 1000);
       return json({
         account: ctx.account,
         collateral: formatUsdg(snap.collateralRaw),
         requirement: formatUsdg(snap.requirementRaw),
         freeCollateral: formatUsdg(snap.freeCollateralRaw),
         walletUsdg: formatUsdg(snap.walletUsdgRaw),
-        positions: snap.positions.map((p) => ({ instrumentId: p.instrumentId, label: describeInstrument(p.instrumentId, underlying), quantity: formatShares(p.quantityRaw), side: p.quantityRaw > 0n ? "long" : "short" })),
+        positions: snap.positions.map((p) => {
+          const f = positionPnl(p, underlying, rows, now);
+          return { instrumentId: p.instrumentId, instrument: f.instrument, label: describeInstrument(p.instrumentId, underlying), quantity: formatShares(p.quantityRaw), side: p.quantityRaw > 0n ? "long" : "short", avgPrice: f.avgPrice, mark: f.mark, markBid: f.markBid, markAsk: f.markAsk, unrealized: f.unrealized, expiry: p.expiry, expiresIn: f.expiresIn, secondsToExpiry: f.secondsToExpiry, closeWith: `close_position { instrument: "${f.instrument}" }` };
+        }),
+        pnl: pnl ? { asOf: pnl.asOf, realized: formatSignedUsdg(pnl.realizedRaw), unrealized: formatSignedUsdg(pnl.unrealizedRaw), feesPaid: formatUsdg(BigInt(pnl.feesPaidRaw)), total: formatSignedUsdg(pnl.totalRaw), note: pnl.note } : "indexer unavailable: no marks or P&L",
         expiries: snap.expiries,
         settledAwaitingRedeem: settledPending,
         session: session ? { key: session.key, active: session.active, canTrade: session.canTrade, canCancel: session.canCancel, expiresAt: session.expiresAt, maxRequirement: session.maxRequirement === 0n ? "unlimited" : formatUsdg(session.maxRequirement) } : "no session key configured",
       });
+    },
+  );
+
+  server.registerTool(
+    "close_position",
+    {
+      title: "Close a position (before expiry)",
+      description: "Exits an open position before expiry. Positions net out on chain and the maker quotes both sides, so this reads your signed position in the instrument, asks for a firm quote on the OPPOSITE side (a long is sold to the bid, a short is bought back at the ask) for min(|position|, quantity), verifies it and fills it via fillOrderAs from the session key in balance mode, exactly like fill_quote. Without confirm it only prices the close. dryRun (default true) simulates only; dryRun: false broadcasts and reports the tx hash. Requires confirm: true.",
+      inputSchema: {
+        ...instrumentFields,
+        quantity: decimalAmount.optional().describe("Shares to close; default and maximum: the whole position"),
+        fromBalance: z.boolean().default(true).describe("Settle inside the deposited balance (default); false pays/receives from the session key's wallet"),
+        confirm: confirmField,
+        dryRun: dryRunField,
+      },
+    },
+    async (args) => {
+      const m = ctx.market("session");
+      let plan: ClosePlan;
+      try {
+        const instrumentId = await instrumentFrom(m, args);
+        const sessionKey = ctx.session && ctx.session.address.toLowerCase() !== ctx.account.toLowerCase() ? ctx.session.address : undefined;
+        plan = await planClose({ market: m, rfq: ctx.rfq, instrumentId, quantityRaw: args.quantity ? parseShares(args.quantity) : undefined, fromBalance: args.fromBalance, sessionKey, protocolFeeBps: await m.protocolFeeBps() });
+      } catch (e) {
+        return fail(`close failed: ${errorText(e)}`);
+      }
+      ctx.quotes.set(plan.quote.digest, { quote: plan.quote, fetchedAt: Date.now(), side: plan.side, requestedQuantityRaw: plan.quantityRaw });
+      const view = closeView(plan, underlying);
+      if (!plan.quote.fillable) return json({ ...view, ok: false, fillable: false, note: "the desk runs without a signer key: this quote carries a placeholder signature and cannot be filled; nothing to send" });
+      if (plan.quote.canFill === false) view.quote.fundingPreview = { ...view.quote.fundingPreview, note: `maker predicts canFill=false${plan.quote.shortfallRaw > 0n ? ` (shortfall ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}` };
+      return sendOrExplain(ctx, "session", plan.request, args.confirm, args.dryRun, view);
+    },
+  );
+
+  server.registerTool(
+    "get_pnl",
+    {
+      title: "Profit and loss",
+      description: "Your P&L from the indexer: every open position with cost basis, average entry price, the desk's mark (bid / mid / ask per share) and unrealized P&L, then realized (settled) P&L, unrealized total, fees paid and total, all in USDG. Amounts ending in Raw are signed USDG with 6 decimals (quantityRaw: 1e18 shares). Read-only.",
+      inputSchema: {},
+    },
+    async () => {
+      const p = await ctx.rfq.getPnl(ctx.account);
+      return json({ ...p, summary: { realized: formatSignedUsdg(p.realizedRaw), unrealized: formatSignedUsdg(p.unrealizedRaw), feesPaid: formatUsdg(BigInt(p.feesPaidRaw)), total: formatSignedUsdg(p.totalRaw) } });
+    },
+  );
+
+  server.registerTool(
+    "get_history",
+    {
+      title: "Past activity",
+      description: "Your PAST activity from the indexer, newest first: fills (side, quantity, price per share, premium, fee, counterparty, tx), settlements (settlement price, payout) and redeems (expiry, amount). Open positions are `positions`; totals are get_pnl. Read-only.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(500).optional().describe("At most this many events"),
+        since: z.union([z.number().int().nonnegative(), z.string().min(1)]).optional().describe("Only events at or after this time: unix seconds or an ISO-8601 date/time"),
+      },
+    },
+    async ({ limit, since }) => {
+      let sinceUnix: number | undefined;
+      if (typeof since === "number") sinceUnix = since;
+      else if (typeof since === "string") {
+        const ms = /^\d+$/.test(since) ? Number(since) * (Number(since) > 1e11 ? 1 : 1000) : Date.parse(since);
+        if (Number.isNaN(ms)) return fail(`since must be unix seconds or an ISO date/time, got ${since}`);
+        sinceUnix = Math.floor(ms / 1000);
+      }
+      return json(await ctx.rfq.getHistory(ctx.account, { limit, since: sinceUnix }));
     },
   );
 
@@ -407,7 +498,7 @@ export function createServer(ctx: KitContext): McpServer {
 
   server.registerTool(
     "my_record",
-    { title: "My record", description: "Your account as the indexer sees it: positions reconciled from fills (with cost basis), your leaderboard row and ERC-8004 agent id, recent fills. Read-only.", inputSchema: { includeSettled: z.boolean().default(false) } },
+    { title: "My record", description: "Your account as the indexer sees it: positions reconciled from fills (with cost basis), your leaderboard row and ERC-8004 agent id, recent raw fills. For marked P&L use get_pnl; for a readable timeline use get_history. Read-only.", inputSchema: { includeSettled: z.boolean().default(false) } },
     async ({ includeSettled }) => {
       const [view, fills] = await Promise.all([ctx.rfq.positions(ctx.account, includeSettled), ctx.rfq.fills({ account: ctx.account, limit: 20 }).catch(() => [])]);
       return json({ ...view, recentFills: fills });

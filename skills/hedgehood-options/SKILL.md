@@ -1,6 +1,6 @@
 ---
 name: hedgehood-options
-description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinhood Chain as an AI agent through Hedgehood's RFQ market: deposit, quote, fill, settle, redeem, with a session key that can never withdraw. Use when the user wants an agent to buy or write calls/puts on tokenized stocks, check option positions, or set up the Hedgehood MCP server.
+description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinhood Chain as an AI agent through Hedgehood's RFQ market: deposit, quote, fill, close before expiry, track P&L and history, settle, redeem, with a session key that can never withdraw. Use when the user wants an agent to buy or write calls/puts on tokenized stocks, check option positions or P&L, exit a position, or set up the Hedgehood MCP server.
 ---
 
 # Hedgehood options for agents
@@ -27,9 +27,16 @@ calls); longs post nothing but the premium, short legs lock their worst case.
    `startTime` and `validUntil`; the contract evaluates the premium at the fill block.
 4. **Fill.** `fill_quote(digest, confirm: true)` simulates (dry run) and, with `dryRun: false`, sends
    `fillOrderAs(account, order, sig, qty, fromBalance = true)` from the session key. The tool returns the tx hash.
-5. **Settle / redeem.** After expiry the keeper calls `settle(expiry)` and `redeemFor(account, expiry)`; the payoff lands in
+5. **Watch.** `positions` is the ACTIVE book: every open position with quantity, average entry price, the desk's mark,
+   unrealized P&L and time to expiry. `get_pnl` gives the totals (realized / unrealized / fees / total); `get_history` is
+   the PAST: fills, settlements and redeems, newest first.
+6. **Close (optional).** To exit before expiry call `close_position(instrument, quantity?, confirm: true)`. Positions net
+   out on chain and the maker quotes both sides, so a close is a fill of the opposite side of the same instrument: a long
+   is sold to the bid, a short bought back at the ask, for at most `|position|`. Same session key, same balance mode, same
+   dry run unless `dryRun: false`. Without `confirm` it only prices the exit.
+7. **Settle / redeem.** After expiry the keeper calls `settle(expiry)` and `redeemFor(account, expiry)`; the payoff lands in
    the market balance. The agent may call `redeem` itself. `positions` lists expiries awaiting redemption.
-6. **Withdraw.** Owner key only: `withdraw(amount, to)`.
+8. **Withdraw.** Owner key only: `withdraw(amount, to)`.
 
 ## Using the tools well
 
@@ -44,6 +51,11 @@ calls); longs post nothing but the premium, short legs lock their worst case.
   with the collateral: a shortfall reverts `InsufficientCollateral` in balance mode (nothing is pulled from a wallet).
 - Quotes are good for seconds. Get the quote, decide, fill; do not hoard digests. A fill reverting `OrderExpired`
   just means: quote again.
+- Active vs past: `positions` (and its `pnl` block) is what you hold now; `get_history` is what happened. To reduce or
+  exit a holding use `close_position`, not `fill_quote` on the other side by hand (it does the same fill but sizes it to
+  the position and refuses to overshoot into a new opposite position).
+- A `503 not_executable:feed_not_healthy` quote refusal is retried once for you after 1.5 s; if it still fails the
+  feed is down for this cycle (20 s): wait and quote again rather than hammering.
 - Every write tool is a dry run unless `dryRun: false`, and does nothing without `confirm: true`. Report the tx hash and
   explorer link to the user after a real send.
 - Sizes are shares (18 decimals on chain, "1" = one share); prices and strikes are USDG (6 decimals).
@@ -90,6 +102,8 @@ shown only as set/missing.
 | `TradingUnavailable` | within 15 min of expiry, market paused, or the stock token's multiplier changed | wait for the next expiry |
 | `canFill: false` with `shortfall` | the maker predicts a revert | deposit the shortfall first |
 | `unknown digest` | the server restarted or the quote was never fetched here | `get_quote` again |
+| `not_executable:feed_not_healthy` after the built-in retry | the desk's pricing feed is between cycles (20 s) | wait 20 s, quote or close again |
+| `no open position in …` from `close_position` | nothing to close in that instrument for this account | check `positions`; the account may differ from `HEDGEHOOD_ACCOUNT` |
 | backend 5xx / unreachable | RFQ service down; on-chain reads still work | retry with backoff; nothing was signed |
 
 ## Key hygiene

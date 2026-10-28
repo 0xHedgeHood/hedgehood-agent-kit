@@ -6,6 +6,7 @@ import { encodeInstrumentId, orderToJson, Side, signOrder, type Order } from "@h
 import { createContext } from "../src/context.js";
 import { createServer } from "../src/server.js";
 import { loadConfig, normalizeKey } from "../src/config.js";
+import { CALL220, NAME210P, NAME220C, ONE, fakeWorld, withGlobalFetch } from "./fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
@@ -51,8 +52,8 @@ describe("mcp server", () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["authorize_session", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_mark", "get_quote", "leaderboard", "list_instruments", "list_markets", "my_record", "positions", "redeem", "register_agent", "withdraw"]);
-    for (const w of ["fill_quote", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent"]) {
+    expect(names).toEqual(["authorize_session", "close_position", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "list_instruments", "list_markets", "my_record", "positions", "redeem", "register_agent", "withdraw"]);
+    for (const w of ["fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent"]) {
       const t = tools.find((x) => x.name === w)!;
       const props = (t.inputSchema as { properties: Record<string, unknown> }).properties;
       expect(props.confirm, w).toBeDefined();
@@ -148,5 +149,92 @@ describe("mcp server", () => {
     expect(mine.leaderboard.fills).toBe(2);
     expect(mine.recentFills).toEqual([{ txHash: "0x01" }]);
     expect(JSON.parse(text(await client.callTool({ name: "get_agent_record", arguments: { agentId: "7" } }))).agentId).toBe("7");
+  });
+
+  it("get_pnl and get_history proxy the indexer's new endpoints and format the totals", async () => {
+    const world = fakeWorld();
+    const { client } = await connect(world.fetch);
+    const pnl = JSON.parse(text(await client.callTool({ name: "get_pnl", arguments: {} })));
+    expect(pnl.positions.map((p: { instrument: string }) => p.instrument)).toEqual([NAME220C, NAME210P]);
+    expect(pnl.summary).toEqual({ realized: "+1.2", unrealized: "-0.005", feesPaid: "0.0124", total: "+1.1826" });
+    expect(world.backend[0]!.url.toString()).toBe(`https://index.test/v1/pnl?account=${ACCOUNT}`);
+    const h = JSON.parse(text(await client.callTool({ name: "get_history", arguments: { limit: 2, since: "2026-01-01T00:00:00Z" } })));
+    expect(h.events.length).toBe(2);
+    expect(h.events[0].type).toBe("fill");
+    expect(world.backend[1]!.url.toString()).toBe(`https://index.test/v1/history?account=${ACCOUNT}&limit=2&since=1767225600`);
+    const bad = await client.callTool({ name: "get_history", arguments: { since: "yesterday-ish" } });
+    expect(bad.isError).toBe(true);
+  });
+
+  it("positions is enriched with average price, mark, unrealized P&L and time to expiry; degrades without the indexer", async () => {
+    const world = fakeWorld();
+    const { client } = await connect(world.fetch);
+    const body = await withGlobalFetch(world.fetch, async () => JSON.parse(text(await client.callTool({ name: "positions", arguments: {} }))));
+    expect(body.collateral).toBe("100");
+    expect(body.freeCollateral).toBe("90");
+    const rows = body.positions as Array<Record<string, unknown>>;
+    expect(rows.map((r) => [r.instrument, r.quantity, r.side])).toEqual([[NAME210P, "-0.5", "short"], [NAME220C, "1", "long"]]);
+    const long = rows.find((r) => r.instrument === NAME220C)!;
+    expect(long).toMatchObject({ avgPrice: "1.68", mark: 1.625, markBid: 1.57, markAsk: 1.68, unrealized: "-0.055", closeWith: `close_position { instrument: "${NAME220C}" }` });
+    expect(typeof long.expiresIn).toBe("string");
+    expect(body.pnl).toEqual({ asOf: expect.any(Number), realized: "+1.2", unrealized: "-0.005", feesPaid: "0.0124", total: "+1.1826", note: "marks at desk mid" });
+    const down = fakeWorld({ indexerDown: true });
+    const { client: c2 } = await connect(down.fetch);
+    const b2 = await withGlobalFetch(down.fetch, async () => JSON.parse(text(await c2.callTool({ name: "positions", arguments: {} }))));
+    expect(b2.pnl).toMatch(/indexer unavailable/);
+    expect(b2.positions[1]).toMatchObject({ instrument: NAME220C, quantity: "1" });
+    expect(b2.positions[1].avgPrice).toBeUndefined();
+    expect(b2.positions[1].expiresIn).toBeDefined();
+  });
+
+  it("close_position quotes the opposite side, prices without confirm, simulates with confirm (dry run), and refuses what it cannot fill", async () => {
+    const world = fakeWorld();
+    const { client } = await connect(world.fetch);
+    const run = (args: Record<string, unknown>) => withGlobalFetch(world.fetch, () => client.callTool({ name: "close_position", arguments: args }));
+    // long 1 call -> sell 1 to the bid; no confirm: priced, nothing simulated
+    const priced = JSON.parse(text(await run({ instrument: NAME220C })));
+    expect(priced).toMatchObject({ ok: false, needsConfirm: true, side: "sell", position: "1", closes: "1", remainingAfter: "0", instrument: NAME220C });
+    expect(priced.quote.pricePerShare).toBe("1.57");
+    expect(priced.quote.youReceive).toBe("1.56215"); // 1.57 minus the 50 bps taker fee (rounded up)
+    expect(priced.data.startsWith("0x18943a04")).toBe(true);
+    expect(world.backend.find((b) => b.url.pathname === "/v1/rfq")!.body).toMatchObject({ instrument: NAME220C, side: "sell", quantity: "1", taker: ACCOUNT });
+    expect(world.chain.simulated.length).toBe(0);
+    // short 0.5 put -> buy back 0.25 of it with confirm: simulated through the session key, dry run by default
+    const partial = JSON.parse(text(await run({ instrument: NAME210P, quantity: "0.25", confirm: true })));
+    expect(partial).toMatchObject({ ok: true, dryRun: true, simulated: true, side: "buy", position: "-0.5", closes: "0.25", remainingAfter: "-0.25", from: privateKeyToAccount(SESSION_KEY).address });
+    expect(partial.quote.youPay).toBe("0.4221"); // 0.25 * 1.68 + 50 bps fee
+    expect(world.chain.simulated.length).toBe(1);
+    expect(world.chain.simulated[0]).toBe(partial.data);
+    // more than the position: capped
+    const capped = JSON.parse(text(await run({ instrumentId: CALL220.toString(), quantity: "5" })));
+    expect(capped.closes).toBe("1");
+    // nothing to close
+    const none = await run({ expiry: EXPIRY.toString(), strike: "210", kind: "call" });
+    expect(none.isError).toBe(true);
+    expect(text(none)).toMatch(/no open position/);
+    // the desk in dry-run mode: priced but marked unfillable, never sent
+    const dry = fakeWorld({ quoteDryRun: true });
+    const { client: c2 } = await connect(dry.fetch);
+    const r = JSON.parse(text(await withGlobalFetch(dry.fetch, () => c2.callTool({ name: "close_position", arguments: { instrument: NAME220C, confirm: true } }))));
+    expect(r.ok).toBe(false);
+    expect(r.fillable).toBe(false);
+    expect(dry.chain.simulated.length).toBe(0);
+  });
+
+  it("close_position survives one feed_not_healthy 503 from the desk", async () => {
+    const world = fakeWorld({ quoteFails: [{ status: 503, body: { error: "not_executable", reason: "not_executable:feed_not_healthy" } }] });
+    const config = loadConfig({ HEDGEHOOD_CHAIN_ID: "46630", HEDGEHOOD_SESSION_KEY: SESSION_KEY, HEDGEHOOD_ACCOUNT: ACCOUNT, HEDGEHOOD_RFQ_URL: "https://rfq.test", HEDGEHOOD_INDEXER_URL: "https://index.test" });
+    const ctx = createContext(config, { fetch: world.fetch });
+    // shorten the retry for the test; the production default is 1.5 s
+    (ctx as unknown as { rfq: { feedRetryMs: number } }).rfq.feedRetryMs = 20;
+    const server = createServer(ctx);
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await server.connect(a);
+    const client = new Client({ name: "test", version: "0" });
+    await client.connect(b);
+    const r = JSON.parse(text(await withGlobalFetch(world.fetch, () => client.callTool({ name: "close_position", arguments: { instrument: NAME220C } }))));
+    expect(r.needsConfirm).toBe(true);
+    expect(world.backend.filter((x) => x.url.pathname === "/v1/rfq").length).toBe(2);
+    void ONE;
   });
 });

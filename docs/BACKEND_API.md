@@ -35,7 +35,9 @@ derives the name from an id with `instrumentName()` and resolves a name with `re
 | `POST /v1/rpc` | JSON-RPC 2.0 `getSignerSideOrder { instrument, side, amount, takerWallet }` (AirSwap maker protocol shape), `getPricing { instruments[] }`, `getMarkets`, `getInstruments`, `getProtocols` | `{ result }` or `{ error: { code: -32000, message, data: { reason, code } } }` |
 
 Refusals: `invalid` 400, `unknown_instrument` 404, `halted` 503, `not_executable` 503 (feed stale, listed session
-closed, divergence), `risk` 409, `refused` 409. `RfqError.code` carries the code.
+closed, divergence), `risk` 409, `refused` 409. `RfqError.code` carries the code. A `503` whose `reason` is
+`not_executable:feed_not_healthy` is retried once by `requestQuote` after 1.5 s (`feedRetryMs`), because the pricing feed
+cycles every 20 s; every other refusal surfaces at once.
 
 `QuoteResponse`: `{ quote: Order (17 fields, numbers as strings, side "0"/"1"), signature, digest, validUntil, startTime,
 ttl, instrument, instrumentId, market, book, marketId, version, taker, takerSide, makerSide, quantityRaw, markPrice,
@@ -64,6 +66,16 @@ adds the on-chain `orderDigest` / `remaining` / `isValidOrderSignature` / `curre
 | `GET /v1/leaderboard?by=account\|agent&order=settledPnlRaw\|fills\|volumeRaw\|premiumPaidRaw\|premiumReceivedRaw&limit=` | `{ by, order, rows: [{ account, agentId, fills, premiumPaidRaw, premiumReceivedRaw, feesPaidRaw, settledPnlRaw, volumeRaw, updatedAt }] }` (by agent: `{ agentId, accounts[], ... }`) |
 | `GET /v1/agents/{agentId}` | `{ agentId, record: { agentId, owner, agentURI, agentWallet, registry } \| null, accounts: rows[], registry }` |
 | `GET /v1/quotes/{digest}` | the RFQ quote's status (open / expired / filled) |
+| `GET /v1/pnl?account=` | `{ account, asOf, positions: [{ instrument, market, expiry, strike, isPut, quantityRaw, costRaw, avgPriceRaw\|null, markMid\|null, markBid, markAsk, markSource\|null, markAt\|null, unrealizedRaw\|null, settledAt\|null, settlementRaw\|null }], realizedRaw, unrealizedRaw\|null, feesPaidRaw, totalRaw, note }` |
+| `GET /v1/history?account=&limit=&since=` | `{ account, events: [ { type: "fill", at, txHash, instrument, side: "buy"\|"sell", quantityRaw, priceRaw, premiumRaw, feeRaw, counterparty } \| { type: "settlement", at, instrument, settlementPrice, payoutRaw } \| { type: "redeem", at, txHash, expiry, amountRaw } ] }`, newest first; `since` unix seconds |
+
+`/v1/pnl` and `/v1/history` (added alongside this kit's `close` / `pnl` / `history` features; shapes agreed with the
+backend, mocked in the kit's tests): every `*Raw` is a decimal string of signed USDG raw (6 decimals) except
+`quantityRaw` (signed 1e18 shares, negative = short); `markMid` / `markBid` / `markAsk` / `settlementPrice` are floats in
+USDG per share; `avgPriceRaw` and `priceRaw` are per share. `unrealizedRaw` is mark-to-mid and `null` without a mark;
+`totalRaw = realizedRaw + unrealizedRaw - feesPaidRaw`. The SDK reads them with `RfqClient.getPnl(account)` and
+`getHistory(account, { limit, since })`; `positionPnl()` joins an on-chain position with its `/v1/pnl` row by instrument
+name for the `positions` views.
 
 The indexer keys agents by ERC-8004 id, not by address; the kit's `my_record` is `GET /v1/positions?account=` (which
 includes the account's leaderboard row and `agentId`) plus recent fills, and `get_agent_record(agentId)` is
