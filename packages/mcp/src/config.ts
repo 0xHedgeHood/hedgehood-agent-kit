@@ -9,7 +9,9 @@ import type { Address, Hex } from "viem";
  *
  *   HEDGEHOOD_CHAIN_ID          46630 (default) or 4663
  *   HEDGEHOOD_RPC_URL           override the chain's public RPC
- *   HEDGEHOOD_API_URL           override the agent-market backend
+ *   HEDGEHOOD_RFQ_URL           override the quote service host (default https://agent-api.hedgehood.io)
+ *   HEDGEHOOD_INDEXER_URL       override the indexer host (default https://agent-index.hedgehood.io)
+ *   HEDGEHOOD_GATEWAY_URL       override the x402 deposit gateway host (default https://agent-pay.hedgehood.io)
  *   HEDGEHOOD_UNDERLYING        NVDA (default: first market on the chain)
  *   HEDGEHOOD_ACCOUNT           the trading account (owner address) the session key acts for; defaults to the
  *                               owner key's address, else the session key's own address (self-custody mode)
@@ -23,7 +25,9 @@ import type { Address, Hex } from "viem";
 export interface KitConfig {
   chainId: number;
   rpcUrl?: string;
-  apiUrl?: string;
+  rfqUrl?: string;
+  indexerUrl?: string;
+  gatewayUrl?: string;
   underlying?: string;
   account?: Address;
   sessionKey?: Hex;
@@ -83,7 +87,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): KitConfig {
   return {
     chainId,
     rpcUrl: envValue(env, "HEDGEHOOD_RPC_URL"),
-    apiUrl: envValue(env, "HEDGEHOOD_API_URL"),
+    rfqUrl: envValue(env, "HEDGEHOOD_RFQ_URL"),
+    indexerUrl: envValue(env, "HEDGEHOOD_INDEXER_URL"),
+    gatewayUrl: envValue(env, "HEDGEHOOD_GATEWAY_URL"),
     underlying: envValue(env, "HEDGEHOOD_UNDERLYING"),
     account: account as Address | undefined,
     sessionKey: keyFrom(env, "HEDGEHOOD_SESSION_KEY_FILE", "HEDGEHOOD_SESSION_KEY"),
@@ -98,7 +104,9 @@ export function describeConfig(cfg: KitConfig): Record<string, unknown> {
   return {
     chainId: cfg.chainId,
     rpcUrl: cfg.rpcUrl ?? "(chain default)",
-    apiUrl: cfg.apiUrl ?? "(registry default)",
+    rfqUrl: cfg.rfqUrl ?? "(registry default)",
+    indexerUrl: cfg.indexerUrl ?? "(registry default)",
+    gatewayUrl: cfg.gatewayUrl ?? "(registry default)",
     underlying: cfg.underlying ?? "(first market)",
     account: cfg.account ?? "(derived from keys)",
     sessionKey: cfg.sessionKey ? "set" : "missing",

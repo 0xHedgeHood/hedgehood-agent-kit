@@ -10,7 +10,7 @@ const session = privateKeyToAccount(key);
 const account = (process.env.HEDGEHOOD_ACCOUNT ?? session.address) as Address;
 
 const market = new MarketClient({ chainId: 46630, underlying: "NVDA", account, signer: session });
-const rfq = new RfqClient({ chainId: 46630, apiUrl: process.env.HEDGEHOOD_API_URL });
+const rfq = new RfqClient({ chainId: 46630 }); // public hosts: agent-api / agent-index / agent-pay.hedgehood.io
 
 // nearest expiry that is still trading
 const infos = await Promise.all((await market.openedExpiries()).map((e) => market.expiryInfo(e)));
@@ -21,10 +21,11 @@ const instrumentId = encodeInstrumentId(open.expiry, strike, false);
 const quantityRaw = parseShares("1");
 
 const quote = await rfq.getQuote(
-  { chainId: 46630, market: market.market, instrumentId, side: "buy", quantityRaw, taker: account },
+  { chainId: 46630, market: market.market, instrumentId, side: "buy", quantityRaw, taker: account, sessionKey: session.address, underlying: "NVDA" },
   { orderBook: market.orderBook, protocolFeeBps: await market.protocolFeeBps() },
 );
-console.log(`call ${formatUsdg(strike)} exp ${open.expiry}: pay ${formatUsdg(quote.netNowRaw)} USDG (fee ${formatUsdg(quote.feeNowRaw)}), ${quote.secondsLeft}s left, canFill=${quote.canFill}`);
+console.log(`${quote.instrument}: pay ${formatUsdg(quote.netNowRaw)} USDG (fee ${formatUsdg(quote.feeNowRaw)}), ${quote.secondsLeft}s left, canFill=${quote.canFill}`);
+if (!quote.fillable) throw new Error("the desk is in dry-run mode (placeholder signature): nothing to fill");
 if (quote.netNowRaw > parseUsdg("10")) throw new Error("too expensive, skipping");
 
 const tx = market.fillOrderAs(quote.order, quote.signature, quantityRaw, true);

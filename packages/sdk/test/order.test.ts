@@ -100,6 +100,40 @@ describe("EIP-712 order", () => {
   });
 });
 
+describe("backend golden fixture (hedgehood-options tests/test_abi_v2.py `order()`, feat/rfq-backend @ 0cd8d23)", () => {
+  // Their test recomputes _hashTypedDataV4 by hand (eth_abi) for this order; the same formula run with `cast` gives
+  // the hashes below, so the kit, the backend and the contract agree on the digest.
+  const backendOrder: Order = {
+    maker: "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A", // Account.from_key(0x11..11)
+    signer: "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+    taker: "0x0000000000000000000000000000000000000301",
+    chainId: 4663n,
+    settlement: "0x0000000000000000000000000000000000000202",
+    market: "0x0000000000000000000000000000000000000201",
+    instrumentId: encodeInstrumentId(1_792_180_800n, 210_000_000n, false),
+    side: Side.Ask,
+    quantityRaw: 5n * 10n ** 17n,
+    minFillRaw: 5n * 10n ** 17n,
+    premiumStartRaw: 2_500_000n,
+    premiumEndRaw: 2_520_000n,
+    startTime: 1_792_000_000n,
+    validUntil: 1_792_000_015n,
+    stockMultiplier: 10n ** 18n,
+    nonce: 7n,
+    fromBalance: true,
+  };
+  it("matches the digest the backend's abi_v2.order_digest produces", async () => {
+    expect(backendOrder.instrumentId).toBe(141991191677344271959867671748752748800n);
+    expect(orderDigest(backendOrder)).toBe("0xd7c8942636b7d0ffe6026f7dc027a471ba7131f8786ebf15b1d89515508f1f12");
+    const signer = privateKeyToAccount("0x1111111111111111111111111111111111111111111111111111111111111111");
+    expect(signer.address).toBe(backendOrder.maker);
+    const sig = await signOrder(signer, backendOrder);
+    expect(await recoverOrderSigner(backendOrder, sig)).toBe(signer.address);
+    // decay as the backend computes it (abi_v2.current_premium_raw): 7 s into a 15 s rise of 20000 on an ask -> ceil
+    expect(currentPremiumRaw(backendOrder, 1_792_000_007n)).toBe(2_500_000n + 9_334n);
+  });
+});
+
 describe("premium decay (currentPremiumRaw)", () => {
   it("is the start premium before startTime, the end at/after validUntil, flat when equal", () => {
     expect(currentPremiumRaw(fixtureOrder, 1761599999n)).toBe(5_000_000n);

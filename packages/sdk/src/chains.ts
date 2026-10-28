@@ -57,10 +57,30 @@ export interface ChainDeployment {
   usdgEip712: { name: string; version: string };
   /** ERC-8004 Identity Registry, when deployed on this chain. */
   identityRegistry?: Address;
-  /** Default Hedgehood agent-market backend (RFQ, deposit gateway, hosted MCP). */
-  apiUrl?: string;
+  /** Hedgehood agent-market backend hosts (the same hosts serve both chains; the chain id selects the deployment). */
+  api: BackendHosts;
   markets: MarketDeployment[];
 }
+
+/** The backend services (hedgehood-options `feat/rfq-backend`): RFQ quote service, indexer, x402 deposit gateway, hosted read-only MCP. */
+export interface BackendHosts {
+  /** Quote service: GET /v1/markets, /v1/instruments, /v1/mark, POST /v1/rfq, POST /v1/rpc (AirSwap-style JSON-RPC). */
+  rfq: string;
+  /** Fill watcher: GET /v1/positions, /v1/fills, /v1/leaderboard, /v1/agents/{id}, /v1/quotes/{digest}. */
+  indexer: string;
+  /** x402 deposit gateway: POST /v1/deposit, GET /v1/instructions, /v1/deposits. */
+  gateway: string;
+  /** Hosted read-only MCP (streamable HTTP). */
+  mcp: string;
+}
+
+/** Planned public hostnames (not reachable yet as of 2026-10-28; the stack runs on the host in testnet dry-run mode). */
+export const HEDGEHOOD_API: BackendHosts = {
+  rfq: "https://agent-api.hedgehood.io",
+  indexer: "https://agent-index.hedgehood.io",
+  gateway: "https://agent-pay.hedgehood.io",
+  mcp: "https://mcp.hedgehood.io/mcp",
+};
 
 /**
  * Deployment registry. Testnet 46630 is the CashOptionMarketV2 for tNVDA2 recorded in hedgehood-options
@@ -77,7 +97,8 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
     // tUSDG is a test token; assumed to expose the same EIP-3009 surface and domain name as mainnet USDG. If the
     // gateway's 402 names another domain in `extra`, the payer signs on that one (see x402.ts).
     usdgEip712: { name: "Global Dollar", version: "1" },
-    apiUrl: "https://agents-testnet.hedgehood.app",
+    identityRegistry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432", // in the backend's testnet registry; not verified to exist on 46630
+    api: HEDGEHOOD_API,
     markets: [
       {
         underlying: "NVDA",
@@ -99,7 +120,7 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
     usdgDecimals: 6,
     usdgEip712: { name: "Global Dollar", version: "1" },
     identityRegistry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
-    apiUrl: "https://agents.hedgehood.app",
+    api: HEDGEHOOD_API,
     markets: [], // V2 not deployed on mainnet yet (pending audit)
   },
 };

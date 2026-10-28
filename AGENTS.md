@@ -19,8 +19,9 @@ server that signs with the agent's key), `packages/cli` (`hedgehood`), the Claud
   `CHANGELOG.md`. Never edit the generated ABI files by hand.
 - The EIP-712 struct string in `packages/sdk/src/order.ts` must match the contract's `ORDER_TYPEHASH`; the test pins
   the hash, so a contract change shows up as a failing test, not a silent mismatch.
-- The backend API is assumed (`docs/BACKEND_API.md`); when the real contract lands, change `RfqPaths`/types in
-  `packages/sdk/src/rfq.ts`, the 402 handling in `x402.ts`, and the fixtures, in one PR.
+- The backend API is documented in `docs/BACKEND_API.md` (hedgehood-options `feat/rfq-backend`); a route or shape change
+  there means changing `RfqPaths`/types in `packages/sdk/src/rfq.ts`, the 402 handling in `x402.ts`, and the fixtures, in
+  one PR. Re-run the live read path (`hedgehood markets|instruments|quote`) before merging such a change.
 - Every send stays dry run by default (SDK `send()`, CLI `--send`, MCP `dryRun`/`confirm`). Do not add a tool that
   broadcasts without `confirm: true`. Do not log or return private keys, even partially.
 - Do not publish to npm or any registry from a PR or CI; releases are manual (`RELEASING.md`, `REGISTRIES.md`).

@@ -12,6 +12,7 @@ if (args.includes("--help") || args.includes("-h")) {
   hedgehood-mcp                 stdio transport (for Claude Code, Codex, Claude Desktop)
   hedgehood-mcp --http [port]   streamable HTTP on 127.0.0.1 (default port 7402, path /mcp)
   hedgehood-mcp --check         print the resolved configuration (keys shown as set/missing) and exit
+  --testnet | --mainnet         select the 46630 / 4663 deployment (same public backend hosts); default testnet
 
 Environment: HEDGEHOOD_CHAIN_ID, HEDGEHOOD_RPC_URL, HEDGEHOOD_API_URL, HEDGEHOOD_UNDERLYING, HEDGEHOOD_ACCOUNT,
 HEDGEHOOD_SESSION_KEY_FILE (or HEDGEHOOD_SESSION_KEY), HEDGEHOOD_OWNER_KEY_FILE (optional), HEDGEHOOD_DRY_RUN,
@@ -21,6 +22,8 @@ HEDGEHOOD_MAX_DEPOSIT. See https://github.com/0xHedgeHood/hedgehood-agent-kit.
 }
 
 async function main() {
+  if (args.includes("--testnet")) process.env.HEDGEHOOD_CHAIN_ID = "46630";
+  if (args.includes("--mainnet")) process.env.HEDGEHOOD_CHAIN_ID = "4663";
   const config = loadConfig();
   const ctx = createContext(config);
   if (args.includes("--check")) {

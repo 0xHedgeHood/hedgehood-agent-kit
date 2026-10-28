@@ -16,7 +16,7 @@ const EXPIRY = 1793390400n;
 const INSTRUMENT = encodeInstrumentId(EXPIRY, 220_000_000n, false);
 
 async function connect(fetchImpl?: typeof fetch) {
-  const config = loadConfig({ HEDGEHOOD_CHAIN_ID: "46630", HEDGEHOOD_SESSION_KEY: SESSION_KEY, HEDGEHOOD_ACCOUNT: ACCOUNT, HEDGEHOOD_API_URL: "https://api.test" });
+  const config = loadConfig({ HEDGEHOOD_CHAIN_ID: "46630", HEDGEHOOD_SESSION_KEY: SESSION_KEY, HEDGEHOOD_ACCOUNT: ACCOUNT, HEDGEHOOD_RFQ_URL: "https://rfq.test", HEDGEHOOD_INDEXER_URL: "https://index.test", HEDGEHOOD_GATEWAY_URL: "https://pay.test" });
   const ctx = createContext(config, { fetch: fetchImpl });
   const server = createServer(ctx);
   const [a, b] = InMemoryTransport.createLinkedPair();
@@ -51,7 +51,7 @@ describe("mcp server", () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["authorize_session", "decode_instrument", "deposit_x402", "fill_quote", "get_mark", "get_quote", "leaderboard", "list_instruments", "list_markets", "my_record", "positions", "redeem", "register_agent", "withdraw"]);
+    expect(names).toEqual(["authorize_session", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_mark", "get_quote", "leaderboard", "list_instruments", "list_markets", "my_record", "positions", "redeem", "register_agent", "withdraw"]);
     for (const w of ["fill_quote", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent"]) {
       const t = tools.find((x) => x.name === w)!;
       const props = (t.inputSchema as { properties: Record<string, unknown> }).properties;
@@ -101,11 +101,14 @@ describe("mcp server", () => {
     expect(text(r2)).toMatch(/owner key/);
   });
 
-  it("deposit_x402 dry run stops at the 402 and never signs", async () => {
+  it("deposit_x402 dry run reads the instructions, stops at the 402 and never signs", async () => {
     let calls = 0;
-    const fetchImpl: typeof fetch = (async () => {
+    const fetchImpl: typeof fetch = (async (url: string | URL | Request) => {
       calls++;
-      const pr = { x402Version: 2, resource: { url: "https://api.test/v1/deposit", description: "d", mimeType: "application/json" }, accepts: [{ scheme: "exact", network: "eip155:46630", asset: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d", amount: "25000000", payTo: "0x9999999999999999999999999999999999999999", maxTimeoutSeconds: 600, extra: { name: "Global Dollar", version: "1" } }] };
+      if (String(url).endsWith("/v1/instructions")) {
+        return new Response(JSON.stringify({ endpoint: "https://pay.test/v1/deposit", method: "POST", asset: { symbol: "USDG", address: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d", decimals: 6, network: "eip155:46630", chainId: 46630 }, payTo: "0x9999999999999999999999999999999999999999", fee: { raw: "0" }, limits: { minRaw: "1000000", maxRaw: "1000000000", dayCapRaw: "5000000000", ratePerS: 0.2, burst: 5, feeRaw: "0" }, markets: [] }), { status: 200 });
+      }
+      const pr = { x402Version: 2, resource: { url: "https://pay.test/v1/deposit", description: "d", mimeType: "application/json" }, accepts: [{ scheme: "exact", network: "eip155:46630", asset: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d", amount: "25000000", payTo: "0x9999999999999999999999999999999999999999", maxTimeoutSeconds: 600, extra: { name: "Global Dollar", version: "1" } }] };
       return new Response("{}", { status: 402, headers: { "PAYMENT-REQUIRED": Buffer.from(JSON.stringify(pr)).toString("base64") } });
     }) as typeof fetch;
     const { client } = await connect(fetchImpl);
@@ -117,19 +120,33 @@ describe("mcp server", () => {
     expect(body.ok).toBe(true);
     expect(body.dryRun).toBe(true);
     expect(body.requirement.amount).toBe("25000000");
-    expect(calls).toBe(1);
+    expect(body.gateway.payTo).toBe("0x9999999999999999999999999999999999999999");
+    expect(calls).toBe(2);
     const big = await client.callTool({ name: "deposit_x402", arguments: { amount: "5000", confirm: true } });
     expect(big.isError).toBe(true);
     expect(text(big)).toMatch(/HEDGEHOOD_MAX_DEPOSIT/);
   });
 
-  it("leaderboard and my_record proxy the backend", async () => {
+  it("leaderboard, my_record and get_agent_record proxy the indexer", async () => {
+    const seen: string[] = [];
     const fetchImpl: typeof fetch = (async (url: string | URL) => {
       const u = new URL(String(url));
-      return new Response(JSON.stringify(u.pathname.includes("/agents/") ? { account: ACCOUNT, fills: 2 } : { entries: [{ rank: 1, account: ACCOUNT }] }), { status: 200 });
+      seen.push(u.toString());
+      const body = u.pathname.includes("/agents/")
+        ? { agentId: "7", record: { agentId: "7", owner: ACCOUNT }, accounts: [] }
+        : u.pathname.endsWith("/positions")
+          ? { account: ACCOUNT, positions: [], leaderboard: { account: ACCOUNT, fills: 2 }, agentId: null }
+          : u.pathname.endsWith("/fills")
+            ? { fills: [{ txHash: "0x01" }] }
+            : { by: "account", order: "settledPnlRaw", rows: [{ account: ACCOUNT, fills: 2 }] };
+      return new Response(JSON.stringify(body), { status: 200 });
     }) as typeof fetch;
     const { client } = await connect(fetchImpl);
-    expect(JSON.parse(text(await client.callTool({ name: "leaderboard", arguments: {} })))).toEqual([{ rank: 1, account: ACCOUNT }]);
-    expect(JSON.parse(text(await client.callTool({ name: "my_record", arguments: {} }))).fills).toBe(2);
+    expect(JSON.parse(text(await client.callTool({ name: "leaderboard", arguments: { by: "account", order: "fills", limit: 5 } }))).rows[0].fills).toBe(2);
+    expect(seen[0]).toBe("https://index.test/v1/leaderboard?by=account&order=fills&limit=5");
+    const mine = JSON.parse(text(await client.callTool({ name: "my_record", arguments: {} })));
+    expect(mine.leaderboard.fills).toBe(2);
+    expect(mine.recentFills).toEqual([{ txHash: "0x01" }]);
+    expect(JSON.parse(text(await client.callTool({ name: "get_agent_record", arguments: { agentId: "7" } }))).agentId).toBe("7");
   });
 });

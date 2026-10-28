@@ -22,12 +22,13 @@ export interface KitContext {
 export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; deployment?: MarketDeployment } = {}): KitContext {
   const chainId = config.chainId;
   const dep = getDeployment(chainId);
+  void dep.api;
   const deployment = extra.deployment ?? getMarket(chainId, config.underlying ?? dep.markets[0]?.underlying ?? "NVDA");
   const session = config.sessionKey ? privateKeyToAccount(config.sessionKey) : undefined;
   const owner = config.ownerKey ? privateKeyToAccount(config.ownerKey) : undefined;
   const account = config.account ?? owner?.address ?? session?.address;
   if (!account) throw new Error("no account: set HEDGEHOOD_ACCOUNT, or a session/owner key");
-  const rfqOpts: ConstructorParameters<typeof RfqClient>[0] = { chainId, apiUrl: config.apiUrl ?? dep.apiUrl };
+  const rfqOpts: ConstructorParameters<typeof RfqClient>[0] = { chainId, hosts: { ...(config.rfqUrl ? { rfq: config.rfqUrl } : {}), ...(config.indexerUrl ? { indexer: config.indexerUrl } : {}), ...(config.gatewayUrl ? { gateway: config.gatewayUrl } : {}) } };
   if (extra.fetch) rfqOpts.fetch = extra.fetch;
   const rfq = new RfqClient(rfqOpts);
   const market = (signer: "session" | "owner" | "none" = "session") => {

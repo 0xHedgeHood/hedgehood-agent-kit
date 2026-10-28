@@ -38,9 +38,9 @@ cast send 0xC289617d613C9865a6595B365DaD88277282e0Ac 'deposit(address,uint256)' 
 # 3. trade from the agent machine
 export HEDGEHOOD_ACCOUNT=<owner address>
 hedgehood markets                                   # open expiries, strikes
-hedgehood quote <expiry>:220:call --side buy --qty 1
-hedgehood fill --instrument <expiry>:220:call --side buy --qty 1          # dry run: simulates, prints calldata
-hedgehood fill --instrument <expiry>:220:call --side buy --qty 1 --send   # broadcasts, prints the tx hash
+hedgehood quote NVDA-20261030-220-C --side buy --qty 1                    # firm RFQ quote, verified locally
+hedgehood fill --instrument NVDA-20261030-220-C --side buy --qty 1        # dry run: simulates, prints calldata
+hedgehood fill --instrument NVDA-20261030-220-C --side buy --qty 1 --send # broadcasts, prints the tx hash
 hedgehood positions
 ```
 
@@ -69,13 +69,15 @@ costs under 6 USDG"*. The agent calls `get_quote`, shows you the price, then `fi
   (bundles the skill and the server), or `claude mcp add hedgehood -e HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key -e HEDGEHOOD_ACCOUNT=0x... -- npx -y @hedgehood-io/mcp`.
 - **Codex CLI**: `codex mcp add hedgehood --env HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key --env HEDGEHOOD_ACCOUNT=0x... -- npx -y @hedgehood-io/mcp`
   (or the same block under `[mcp_servers.hedgehood]` in `~/.codex/config.toml`).
+- **Hosted, read-only, no keys** (any MCP host that takes a URL): `https://mcp.hedgehood.io/mcp` serves markets,
+  instruments, marks, quotes (as calldata for your own wallet), positions and leaderboard; signing tools are local only.
 - **Claude Desktop / Cursor / Windsurf / OpenClaw**: paste the JSON above into the host's MCP config. Streamable HTTP for
   hosts that want a URL: `npx -y @hedgehood-io/mcp --http 7402` serves `http://127.0.0.1:7402/mcp` (localhost only; it signs).
 - `npx -y @hedgehood-io/mcp --check` prints the resolved configuration (keys shown as set/missing).
 
 Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `deposit_x402`, `positions`, `redeem`,
-`withdraw` (owner key), `authorize_session` (owner key), `leaderboard`, `my_record`, `register_agent` (ERC-8004, owner
-key), `decode_instrument`. Write tools do nothing without `confirm: true`; with it they simulate and return the unsigned
+`withdraw` (owner key), `authorize_session` (owner key), `leaderboard`, `my_record`, `get_agent_record`, `register_agent`
+(ERC-8004, owner key), `decode_instrument`. Write tools do nothing without `confirm: true`; with it they simulate and return the unsigned
 transaction unless `dryRun: false`, and then report the tx hash.
 
 ## Security model
@@ -106,8 +108,12 @@ transaction unless `dryRun: false`, and then report the tx hash.
 - Testnet 46630 (RPC `https://rpc.testnet.chain.robinhood.com`): market `0xC289617d613C9865a6595B365DaD88277282e0Ac`,
   book `0x7288a3D12e15379C3b64988b54Ab4Da759638cf5`, tNVDA2 `0x267ddeE02B44FDF4D073E124869DaA5BDbF1759D`, tUSDG
   `0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d`. Fixture feeds; not mainnet configuration. Mainnet 4663: no market yet.
-- Backend (RFQ, x402 deposit gateway, indexer): the API is **assumed**, see [docs/BACKEND_API.md](docs/BACKEND_API.md);
-  `RfqPaths` in the SDK is the one place to adjust when the real contract lands.
+- Backend (hedgehood-options `feat/rfq-backend`, PR #38): RFQ `https://agent-api.hedgehood.io`, indexer
+  `https://agent-index.hedgehood.io`, x402 deposit gateway `https://agent-pay.hedgehood.io`, hosted read-only MCP
+  `https://mcp.hedgehood.io/mcp`; routes and shapes in [docs/BACKEND_API.md](docs/BACKEND_API.md). The same hosts serve
+  both chains; `--testnet` (default) / `--mainnet` select the deployment. The public stack runs in **dry-run mode**
+  today (placeholder quote signatures, fixture pricing, gateway `SEND=0`): quotes verify but are not fillable until the
+  desk mounts its key.
 - Agent identity: ERC-8004 Identity Registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` on 4663 (optional).
 
 ## Development

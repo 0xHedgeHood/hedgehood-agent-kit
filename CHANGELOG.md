@@ -20,4 +20,8 @@ First scaffold of the public agent kit for Hedgehood's AI-agent options market (
   dry run unless `--send`.
 - Claude Code plugin + marketplace (`.claude-plugin/`), skill `skills/hedgehood-options/SKILL.md`, `AGENTS.md`,
   Smithery/Glama manifests, examples, CI (typecheck + tests + build + binary smoke).
-- Backend API shape is assumed (`docs/BACKEND_API.md`); nothing is published to npm or any registry yet.
+- Backend client reconciled with hedgehood-options `feat/rfq-backend` (PR #38 @ 0cd8d23) and verified against the live
+  public testnet stack (agent-api / agent-index / agent-pay.hedgehood.io, mcp.hedgehood.io/mcp): instrument names,
+  REST + JSON-RPC quotes, digest/calldata cross-checks, dry-run quotes marked unfillable, indexer positions/leaderboard/
+  agents, gateway instructions + 402 flow. Known backend mismatch documented (gateway names eip155:4663 on testnet).
+- Nothing is published to npm or any registry yet.

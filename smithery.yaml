@@ -16,9 +16,9 @@ startCommand:
       account:
         type: string
         description: "Owner (trading) account the session key acts for; defaults to the session key address"
-      apiUrl:
+      rfqUrl:
         type: string
-        description: "Backend override (RFQ / deposit gateway / indexer)"
+        description: "Quote service override (default https://agent-api.hedgehood.io)"
       rpcUrl:
         type: string
         description: "RPC override"
@@ -30,7 +30,7 @@ startCommand:
         HEDGEHOOD_CHAIN_ID: config.chainId || "46630",
         HEDGEHOOD_SESSION_KEY_FILE: config.sessionKeyFile,
         ...(config.account ? { HEDGEHOOD_ACCOUNT: config.account } : {}),
-        ...(config.apiUrl ? { HEDGEHOOD_API_URL: config.apiUrl } : {}),
+        ...(config.rfqUrl ? { HEDGEHOOD_RFQ_URL: config.rfqUrl } : {}),
         ...(config.rpcUrl ? { HEDGEHOOD_RPC_URL: config.rpcUrl } : {})
       }
     })

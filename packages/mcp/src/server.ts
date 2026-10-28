@@ -11,7 +11,9 @@ import {
   formatStrike,
   formatUsdg,
   identityRegistryFor,
+  instrumentName,
   orderDigest,
+  resolveInstrumentName,
   orderFromJson,
   orderToJson,
   parseShares,
@@ -23,6 +25,7 @@ import {
   type VerifiedQuote,
 } from "@hedgehood-io/sdk";
 import type { Address, Hex } from "viem";
+import type { MarketClient } from "@hedgehood-io/sdk";
 import { z } from "zod";
 import { requireOwner, requireSession, type KitContext } from "./context.js";
 import { describeConfig } from "./config.js";
@@ -42,10 +45,20 @@ function fail(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true as const };
 }
 
-function instrumentFrom(args: { instrumentId?: string; expiry?: string; strike?: string; kind?: "call" | "put" }): bigint {
+const instrumentFields = {
+  instrument: z.string().regex(/^[A-Za-z]{1,8}-\d{8}-\d+(\.\d+)?-[CPcp]$/).optional().describe("Backend name, e.g. NVDA-20261030-220-C"),
+  instrumentId: uintString.optional().describe("Packed id from list_instruments"),
+  expiry: uintString.optional().describe("Unix seconds of the expiry"),
+  strike: decimalAmount.optional().describe("USDG per share, e.g. \"220\""),
+  kind: z.enum(["call", "put"]).optional(),
+};
+
+/** An instrument from a backend name, a packed id, or expiry + strike + kind. */
+async function instrumentFrom(m: MarketClient, args: { instrument?: string; instrumentId?: string; expiry?: string; strike?: string; kind?: "call" | "put" }): Promise<bigint> {
   if (args.instrumentId) return BigInt(args.instrumentId);
+  if (args.instrument) return resolveInstrumentName(args.instrument, await m.openedExpiries());
   if (args.expiry && args.strike && args.kind) return encodeInstrumentId(BigInt(args.expiry), parseUsdg(args.strike), args.kind === "put");
-  throw new Error("give instrumentId, or expiry + strike + kind");
+  throw new Error("give instrument (NVDA-20261030-220-C), or instrumentId, or expiry + strike + kind");
 }
 
 async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRequest, confirm: boolean, dryRun: boolean | undefined) {
@@ -73,9 +86,12 @@ function errorText(e: unknown): string {
 
 function quoteView(q: VerifiedQuote, underlying: string, side: "buy" | "sell", requestedQuantityRaw: bigint) {
   return {
-    digest: orderDigest(q.order),
-    instrument: describeInstrument(q.order.instrumentId, underlying),
+    digest: q.digest,
+    instrument: q.instrument,
+    label: describeInstrument(q.order.instrumentId, underlying),
     instrumentId: q.order.instrumentId.toString(),
+    fillable: q.fillable,
+    backendDryRun: q.dryRun ? "the desk runs without a signer key: this quote carries a placeholder signature and cannot be filled" : undefined,
     side,
     quantity: formatShares(requestedQuantityRaw),
     pricePerShare: formatUsdg(q.pricePerShareRaw),
@@ -88,8 +104,10 @@ function quoteView(q: VerifiedQuote, underlying: string, side: "buy" | "sell", r
     secondsLeft: q.secondsLeft,
     canFill: q.canFill,
     shortfall: q.shortfallRaw > 0n ? formatUsdg(q.shortfallRaw) : undefined,
+    fundingPreview: q.funding,
+    markMidPerShare: q.markPrice,
     maker: q.order.maker,
-    quoteId: q.quoteId,
+    makerSigner: q.order.signer,
   };
 }
 
@@ -110,9 +128,9 @@ export function createServer(ctx: KitContext): McpServer {
       const infos = await Promise.all(expiries.map((e) => m.expiryInfo(e)));
       let backend: unknown = undefined;
       try {
-        backend = await ctx.rfq.markets();
+        backend = (await ctx.rfq.markets()).filter((x) => x.market.toLowerCase() === m.market.toLowerCase() || x.underlying === underlying);
       } catch (e) {
-        backend = { unavailable: errorText(e) };
+        backend = { unavailable: errorText(e), hosts: ctx.rfq.hosts };
       }
       return json({
         chainId: ctx.chainId,
@@ -121,6 +139,7 @@ export function createServer(ctx: KitContext): McpServer {
         market: m.market,
         orderBook: m.orderBook,
         settlementToken: m.usdg,
+        backendHosts: ctx.rfq.hosts,
         takerFeeBps: fee,
         uiMultiplier: mult,
         expiries: infos.map((i) => ({ expiry: i.expiry, date: new Date(Number(i.expiry) * 1000).toISOString(), tradingOpen: i.tradingOpen, settled: i.settled, anchor: formatUsdg(i.anchor), capLow: formatUsdg(i.capLow), capHigh: formatUsdg(i.capHigh), strikes: i.strikes.map(formatStrike) })),
@@ -143,10 +162,10 @@ export function createServer(ctx: KitContext): McpServer {
       const out = [];
       for (const e of expiries) {
         const info = await m.expiryInfo(e);
-        let marks: Record<string, string> = {};
+        let listed: Record<string, { occ: string; settled: boolean }> = {};
         try {
-          const list = await ctx.rfq.instruments(m.market, e);
-          marks = Object.fromEntries(list.filter((x) => x.markRaw).map((x) => [x.instrumentId, formatUsdg(BigInt(x.markRaw!))]));
+          const list = await ctx.rfq.instruments(underlying, e);
+          listed = Object.fromEntries(list.map((x) => [x.instrumentId, { occ: x.occ, settled: x.settled }]));
         } catch {
           /* backend optional */
         }
@@ -158,7 +177,7 @@ export function createServer(ctx: KitContext): McpServer {
           settlementPrice: info.settled ? formatUsdg(info.settlementPrice) : undefined,
           instruments: info.strikes.flatMap((s) => (["call", "put"] as const).map((k) => {
             const id = encodeInstrumentId(e, s, k === "put");
-            return { instrumentId: id.toString(), label: describeInstrument(id, underlying), strike: formatStrike(s), kind: k, mark: marks[id.toString()] };
+            return { instrument: instrumentName(underlying, e, s, k === "put"), instrumentId: id.toString(), label: describeInstrument(id, underlying), strike: formatStrike(s), kind: k, listedOcc: listed[id.toString()]?.occ, quotedByBackend: id.toString() in listed };
           })),
         });
       }
@@ -170,13 +189,13 @@ export function createServer(ctx: KitContext): McpServer {
     "get_mark",
     {
       title: "Get mark",
-      description: "Indicative mark (and bid/ask when streamed) of one instrument from the backend; not executable. Use get_quote for a firm price.",
-      inputSchema: { instrumentId: uintString.optional(), expiry: uintString.optional(), strike: decimalAmount.optional(), kind: z.enum(["call", "put"]).optional() },
+      description: "The desk's indicative bid / ask / mid per share (USDG), delta, iv and whether it is executable right now; not a firm price. Use get_quote for one.",
+      inputSchema: instrumentFields,
     },
     async (args) => {
-      const id = instrumentFrom(args);
-      const mark = await ctx.rfq.mark(ctx.deployment.market, id);
-      return json({ instrument: describeInstrument(id, underlying), instrumentId: id, mark: formatUsdg(BigInt(mark.markRaw)), bid: mark.bidRaw ? formatUsdg(BigInt(mark.bidRaw)) : undefined, ask: mark.askRaw ? formatUsdg(BigInt(mark.askRaw)) : undefined, spot: mark.spotRaw ? formatUsdg(BigInt(mark.spotRaw)) : undefined, iv: mark.iv, observedAt: mark.observedAt });
+      const id = await instrumentFrom(ctx.market("none"), args);
+      const mark = await ctx.rfq.mark({ instrumentId: id, underlying });
+      return json({ ...mark, label: describeInstrument(id, underlying), note: mark.executable ? undefined : `not executable now (${mark.reason ?? "no row"}): no quote will be given; try during the listed session` });
     },
   );
 
@@ -186,22 +205,19 @@ export function createServer(ctx: KitContext): McpServer {
       title: "Get firm quote (RFQ)",
       description: "Asks the maker for a firm, signed quote addressed to your account, verifies the signature, taker and expiry locally, and returns price, fee, time left and a digest to pass to fill_quote. Quotes decay and expire in seconds. Read-only (nothing is sent).",
       inputSchema: {
-        instrumentId: uintString.optional().describe("From list_instruments"),
-        expiry: uintString.optional(),
-        strike: decimalAmount.optional().describe("USDG per share, e.g. \"220\""),
-        kind: z.enum(["call", "put"]).optional(),
+        ...instrumentFields,
         side: z.enum(["buy", "sell"]).describe("buy = you buy the option (pay premium); sell = you write it (receive premium, post collateral)"),
         quantity: decimalAmount.describe("Shares, e.g. \"1\" or \"0.5\""),
-        ttlSeconds: z.number().int().min(5).max(300).optional(),
       },
     },
     async (args) => {
-      const id = instrumentFrom(args);
-      const quantityRaw = parseShares(args.quantity);
       const m = ctx.market("none");
+      const id = await instrumentFrom(m, args);
+      const quantityRaw = parseShares(args.quantity);
       const fee = await m.protocolFeeBps();
-      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: args.side, quantityRaw, taker: ctx.account, ttlSeconds: args.ttlSeconds }, { orderBook: m.orderBook, protocolFeeBps: fee });
-      const digest = orderDigest(q.order);
+      const sessionKey = ctx.session && ctx.session.address.toLowerCase() !== ctx.account.toLowerCase() ? ctx.session.address : undefined;
+      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: args.side, quantityRaw, taker: ctx.account, sessionKey, underlying }, { orderBook: m.orderBook, protocolFeeBps: fee });
+      const digest = q.digest;
       ctx.quotes.set(digest, { quote: q, fetchedAt: Date.now(), side: args.side, requestedQuantityRaw: quantityRaw });
       const view = quoteView(q, underlying, args.side, quantityRaw);
       let requirementAfter: string | undefined;
@@ -210,7 +226,7 @@ export function createServer(ctx: KitContext): McpServer {
       } catch {
         /* optional */
       }
-      return json({ ...view, requirementAfter, order: orderToJson(q.order), signature: q.signature, next: "fill_quote with this digest and confirm: true (dryRun first)" });
+      return json({ ...view, requirementAfter, order: orderToJson(q.order), signature: q.signature, next: q.fillable ? "fill_quote with this digest and confirm: true (dryRun first)" : "not fillable (backend dry run); nothing to send" });
     },
   );
 
@@ -235,6 +251,7 @@ export function createServer(ctx: KitContext): McpServer {
       if (args.digest) {
         const cached = ctx.quotes.get(args.digest as Hex);
         if (!cached) return fail("unknown digest; call get_quote again (quotes expire in seconds)");
+        if (!cached.quote.fillable) return fail("this quote is a backend dry-run placeholder (no signer key on the desk); it cannot be filled");
         order = cached.quote.order;
         signature = cached.quote.signature;
         quantityRaw = args.quantity ? parseShares(args.quantity) : cached.requestedQuantityRaw;
@@ -270,8 +287,19 @@ export function createServer(ctx: KitContext): McpServer {
       const dry = dryRun ?? ctx.config.dryRunDefault;
       if (!confirm) return json({ ok: false, needsConfirm: true, wouldDo: `pay ${amount} USDG from ${payer.address} to the gateway, credited to ${ctx.account}`, dryRun: dry });
       try {
-        const r = await depositViaGateway({ account: ctx.account, market: ctx.deployment.market, amountRaw }, { signer: payer, chainId: ctx.chainId, apiUrl: ctx.config.apiUrl, fetch: ctx.fetch, dryRun: dry, maxAmountRaw: cap });
-        return json({ ok: true, dryRun: r.dryRun, payer: payer.address, account: ctx.account, requirement: r.requirement, settlement: r.settlement, depositTxHash: r.depositTxHash, body: r.body, hint: r.dryRun ? "402 looks right; call again with dryRun: false to pay" : undefined });
+        const r = await depositViaGateway({ account: ctx.account, market: ctx.deployment.market, amountRaw }, { signer: payer, chainId: ctx.chainId, gatewayUrl: ctx.config.gatewayUrl, fetch: ctx.fetch, dryRun: dry, maxAmountRaw: cap });
+        return json({
+          ok: true,
+          dryRun: r.dryRun,
+          payer: payer.address,
+          account: ctx.account,
+          gateway: { payTo: r.instructions?.payTo, feeRaw: r.instructions?.fee?.raw, limits: r.instructions?.limits },
+          requirement: r.requirement,
+          settlement: r.settlement,
+          deposit: r.deposit,
+          depositTxHash: r.depositTxHash,
+          hint: r.dryRun ? "402 looks right; call again with dryRun: false to pay" : r.deposit?.status === "prepared" ? "payment collected; the gateway runs with SEND=0 and only prepared the deposit transaction (operator sends it)" : undefined,
+        });
       } catch (e) {
         return fail(`deposit failed: ${errorText(e)}`);
       }
@@ -365,14 +393,31 @@ export function createServer(ctx: KitContext): McpServer {
 
   server.registerTool(
     "leaderboard",
-    { title: "Leaderboard", description: "Agent leaderboard from the indexer (PnL, volume, fills). Read-only.", inputSchema: { period: z.enum(["7d", "30d", "all"]).default("30d"), limit: z.number().int().min(1).max(100).default(25) } },
-    async ({ period, limit }) => json(await ctx.rfq.leaderboard(period, limit)),
+    {
+      title: "Leaderboard",
+      description: "Indexer leaderboard per account or per ERC-8004 agent id: fills, premium paid/received, fees, settled PnL, volume (USDG raw). Read-only.",
+      inputSchema: {
+        by: z.enum(["account", "agent"]).default("account"),
+        order: z.enum(["settledPnlRaw", "fills", "volumeRaw", "premiumPaidRaw", "premiumReceivedRaw"]).default("settledPnlRaw"),
+        limit: z.number().int().min(1).max(100).default(25),
+      },
+    },
+    async ({ by, order, limit }) => json(await ctx.rfq.leaderboard({ by, order, limit })),
   );
 
   server.registerTool(
     "my_record",
-    { title: "My record", description: "Your account's indexed record: PnL, volume, fills, rank, recent trades. Read-only.", inputSchema: {} },
-    async () => json(await ctx.rfq.agent(ctx.account)),
+    { title: "My record", description: "Your account as the indexer sees it: positions reconciled from fills (with cost basis), your leaderboard row and ERC-8004 agent id, recent fills. Read-only.", inputSchema: { includeSettled: z.boolean().default(false) } },
+    async ({ includeSettled }) => {
+      const [view, fills] = await Promise.all([ctx.rfq.positions(ctx.account, includeSettled), ctx.rfq.fills({ account: ctx.account, limit: 20 }).catch(() => [])]);
+      return json({ ...view, recentFills: fills });
+    },
+  );
+
+  server.registerTool(
+    "get_agent_record",
+    { title: "Agent record (ERC-8004)", description: "The ERC-8004 record (owner, agentURI) of an agent id and the accounts seen trading under it. Read-only.", inputSchema: { agentId: uintString } },
+    async ({ agentId }) => json(await ctx.rfq.agent(agentId)),
   );
 
   server.registerTool(

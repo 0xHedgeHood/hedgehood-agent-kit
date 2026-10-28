@@ -5,11 +5,20 @@
  * (MIT, https://github.com/Leonardiae/priors/tree/main/packages/x402: networks.mjs, merchant.mjs `registerUsdg`,
  * payer.mjs `CappedExactEvmScheme` / `pickV2Requirement`). Thanks to the Priors contributors.
  *
- * Flow: POST the deposit intent -> 402 with PAYMENT-REQUIRED -> pick the one USDG requirement on our chain -> sign
- * an EIP-3009 TransferWithAuthorization with the agent's key -> resend with PAYMENT-SIGNATURE -> the gateway
- * settles the transfer and calls `market.deposit(account, amount)`; its response carries PAYMENT-RESPONSE and the
- * deposit tx hash. The payer signs a transfer of USDG from its own wallet to the gateway: the key that pays must
- * hold USDG. In the recommended setup that is the owner wallet funding `account`; a session key holds no funds.
+ * Gateway (hedgehood-options `gateway/app.py` + `gateway/x402.py`, branch feat/rfq-backend @ 0cd8d23):
+ *   GET  /v1/instructions                      -> { endpoint, asset {symbol, address, decimals, network, chainId}, payTo, fee {raw}, limits {minRaw, maxRaw, dayCapRaw, ...}, markets[] }
+ *   POST /v1/deposit { account, amountRaw | amount, underlying | market }
+ *        no payment       -> 402, header PAYMENT-REQUIRED (= body): accepts[0] = { scheme exact, network, asset USDG, amount = amountRaw + fee.raw,
+ *                            payTo = the gateway float, maxTimeoutSeconds 600, extra { name "Global Dollar", version "1" }, description }
+ *        PAYMENT-SIGNATURE -> facilitator verify + settle, then market.deposit(account, amountRaw) from the float:
+ *                            200 { id, status: prepared|sent|confirmed|queued|failed, account, market, underlying, amountRaw, feeRaw, tx, txHash, error,
+ *                                  payment {payer, transaction, network}, send, note } + header PAYMENT-RESPONSE (the settle response)
+ *        409 replay (EIP-3009 nonce reused), 429 rate_limited / day_cap, 400 invalid
+ *   `status: prepared` means the operator runs the gateway with SEND=0: the payment was collected, the deposit tx is only prepared.
+ *
+ * The payer signs a transfer of USDG from its own wallet to the float: the key that pays must hold USDG. In the
+ * recommended setup that is the owner wallet funding `account`; a session key holds no funds. Before anything is
+ * signed the kit reads /v1/instructions and checks the 402 against it (payTo, asset, amount = requested + fee).
  */
 import { x402Client, x402HTTPClient } from "@x402/core/client";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
@@ -145,13 +154,45 @@ export interface DepositViaGatewayRequest {
   /** The market account to credit (`market.deposit(account, amount)`), normally the agent's owner account. */
   account: Address;
   market: Address;
-  /** USDG raw to deposit; the gateway's 402 must ask exactly this (or less). */
+  /** USDG raw to deposit; the gateway's 402 asks exactly this plus its published fee. */
   amountRaw: bigint;
+}
+
+/** `GET /v1/instructions` of the gateway. */
+export interface GatewayInstructions {
+  summary: string;
+  endpoint: string;
+  method: "POST";
+  asset: { symbol: string; address: Address; decimals: number; network: string; chainId: number };
+  payTo: Address;
+  fee: { raw: string };
+  limits: { minRaw: string; maxRaw: string; dayCapRaw: string; ratePerS: number; burst: number; feeRaw: string };
+  markets: Array<{ underlying: string; market: Address; book: Address; version: number }>;
+  flow?: string[];
+  after?: string[];
+  notice?: string;
+}
+
+export interface GatewayDepositResponse {
+  id: number;
+  status: "prepared" | "sent" | "confirmed" | "queued" | "failed";
+  account: Address;
+  market: Address;
+  underlying: string;
+  amountRaw: string;
+  feeRaw: string;
+  tx?: unknown;
+  txHash?: Hex | null;
+  error?: string | null;
+  payment?: { payer?: Address; transaction?: Hex; network?: string };
+  send?: boolean;
+  note?: string | null;
 }
 
 export interface DepositViaGatewayResult {
   /** True when nothing was signed or sent (dry run): `requirement` shows what the gateway asked. */
   dryRun: boolean;
+  instructions?: GatewayInstructions;
   requirement?: PaymentRequirements;
   /** The signed payment (resend these headers on a retry; never sign twice for one deposit). */
   paymentHeaders?: Record<string, string>;
@@ -160,40 +201,64 @@ export interface DepositViaGatewayResult {
   body?: unknown;
   /** Settlement reported in PAYMENT-RESPONSE, if any (the EIP-3009 transfer's tx hash). */
   settlement?: { success: boolean; transaction?: string; network?: string; payer?: string; errorReason?: string };
-  /** The deposit tx hash the gateway reports in its body (`depositTxHash`), when it does. */
+  /** The gateway's deposit record: `status` prepared (SEND=0) | sent | confirmed | queued | failed, `txHash` when sent. */
+  deposit?: GatewayDepositResponse;
   depositTxHash?: Hex;
 }
 
 export interface DepositViaGatewayOptions extends UsdgPayerOptions {
-  apiUrl?: string;
+  /** Gateway base URL; default the registry's `api.gateway`. */
+  gatewayUrl?: string;
   fetch?: typeof fetch;
   /** Default true: stop after the 402 and report the requirement without signing. */
   dryRun?: boolean;
+  /** Underlying ticker to name the market by (the gateway accepts `underlying` or `market`); default: `market`. */
+  underlying?: string;
   timeoutMs?: number;
 }
 
+/** `GET /v1/instructions`: what the gateway will ask for, before any 402. */
+export async function gatewayInstructions(opts: { chainId: number; gatewayUrl?: string; fetch?: typeof fetch }): Promise<GatewayInstructions> {
+  const base = (opts.gatewayUrl ?? getDeployment(opts.chainId).api.gateway).replace(/\/+$/, "");
+  const r = await (opts.fetch ?? globalThis.fetch)(`${base}${RfqPaths.instructions}`, { headers: { accept: "application/json" } });
+  if (!r.ok) throw new Error(`gateway instructions: HTTP ${r.status}`);
+  return (await r.json()) as GatewayInstructions;
+}
+
 /**
- * Deposits USDG into `account`'s market balance through the x402 gateway. Checks before signing: the 402 names our
- * chain's USDG by full address, asks no more than `amountRaw` and no more than the payer's cap. The request body is
- * `{ chainId, market, account, amountRaw }`; the gateway shape is assumed (see rfq.ts header).
+ * Deposits USDG into `account`'s market balance through the x402 gateway. Before signing: the gateway's published
+ * instructions name our chain's USDG and a `payTo`; the 402 offers exactly one `exact` requirement for that USDG on our
+ * network, to that `payTo`, for `amountRaw + fee` and under the payer's cap. The request body is
+ * `{ account, amountRaw, market }` (or `underlying`).
  */
 export async function depositViaGateway(req: DepositViaGatewayRequest, opts: DepositViaGatewayOptions): Promise<DepositViaGatewayResult> {
   const dep = getDeployment(opts.chainId);
-  const apiUrl = (opts.apiUrl ?? dep.apiUrl)?.replace(/\/+$/, "");
-  if (!apiUrl) throw new Error(`no API url for chain ${opts.chainId}`);
+  const base = (opts.gatewayUrl ?? dep.api.gateway).replace(/\/+$/, "");
   const fetchImpl = opts.fetch ?? globalThis.fetch;
-  const url = `${apiUrl}${RfqPaths.deposit}`;
-  const body = JSON.stringify({ chainId: opts.chainId, market: req.market, account: req.account, amountRaw: req.amountRaw.toString() });
-  const headers = { "content-type": "application/json", accept: "application/json" };
   const { http, network, asset, cap } = createUsdgClient(opts);
 
-  const first = await fetchImpl(url, { method: "POST", headers, body });
-  if (first.status !== 402) {
-    const text = await first.text();
-    throw new Error(`deposit gateway answered ${first.status} instead of 402: ${text.slice(0, 300)}`);
+  const instructions = await gatewayInstructions({ chainId: opts.chainId, gatewayUrl: base, fetch: fetchImpl });
+  if (!sameAddr(instructions.asset?.address, asset)) {
+    throw new Error(`the gateway pays in ${instructions.asset?.address} on ${instructions.asset?.network}, not this chain's USDG ${asset} (${network}); nothing was signed`);
   }
-  let parsedBody: unknown;
+  if (instructions.asset?.network && instructions.asset.network !== network) {
+    throw new Error(`the gateway's network ${instructions.asset.network} is not ${network}; nothing was signed`);
+  }
+  const fee = BigInt(instructions.fee?.raw ?? "0");
+  const expectedTotal = req.amountRaw + fee;
+  if (instructions.limits) {
+    const min = BigInt(instructions.limits.minRaw);
+    const max = BigInt(instructions.limits.maxRaw);
+    if (req.amountRaw < min || req.amountRaw > max) throw new Error(`the gateway accepts deposits between ${min} and ${max} USDG raw; nothing was signed`);
+  }
+
+  const url = `${base}${RfqPaths.deposit}`;
+  const body = JSON.stringify({ account: req.account, amountRaw: req.amountRaw.toString(), ...(opts.underlying ? { underlying: opts.underlying } : { market: req.market }) });
+  const headers = { "content-type": "application/json", accept: "application/json" };
+  const first = await fetchImpl(url, { method: "POST", headers, body });
   const text = await first.text();
+  if (first.status !== 402) throw new Error(`deposit gateway answered ${first.status} instead of 402: ${text.slice(0, 300)}`);
+  let parsedBody: unknown;
   try {
     parsedBody = text ? JSON.parse(text) : undefined;
   } catch {
@@ -202,10 +267,11 @@ export async function depositViaGateway(req: DepositViaGatewayRequest, opts: Dep
   const paymentRequired: PaymentRequired = http.getPaymentRequiredResponse((n) => first.headers.get(n), parsedBody);
   const requirement = pickUsdgRequirement(paymentRequired.accepts ?? [], network, asset);
   if (!requirement) throw new Error(`the gateway's 402 offers no USDG "exact" requirement on ${network} for ${asset}; nothing was signed`);
+  if (!sameAddr(requirement.payTo, instructions.payTo)) throw new Error(`the 402 names payTo ${requirement.payTo}, not the gateway's published ${instructions.payTo}; nothing was signed`);
   const price = BigInt(requirement.amount);
-  if (price > req.amountRaw) throw new Error(`the gateway asks ${price} USDG raw, more than the requested deposit ${req.amountRaw}; nothing was signed`);
+  if (price !== expectedTotal) throw new Error(`the gateway asks ${price} USDG raw, expected ${req.amountRaw} + fee ${fee} = ${expectedTotal}; nothing was signed`);
   if (price > cap) throw new Error(`the gateway asks ${price} USDG raw, above this payer's cap ${cap}; nothing was signed`);
-  if (opts.dryRun ?? true) return { dryRun: true, requirement };
+  if (opts.dryRun ?? true) return { dryRun: true, instructions, requirement };
 
   const payload = await http.createPaymentPayload({ ...paymentRequired, accepts: [requirement] });
   const paymentHeaders = http.encodePaymentSignatureHeader(payload);
@@ -223,11 +289,11 @@ export async function depositViaGateway(req: DepositViaGatewayRequest, opts: Dep
   } catch {
     settlement = undefined;
   }
-  const depositTxHash = (body2 as { depositTxHash?: Hex } | undefined)?.depositTxHash;
   if (!second.ok) {
     const err = new Error(`deposit gateway refused the payment: ${second.status} ${text2.slice(0, 300)}`);
     Object.assign(err, { paymentHeaders, payload, status: second.status, body: body2, settlement });
     throw err;
   }
-  return { dryRun: false, requirement, paymentHeaders, payload, status: second.status, body: body2, settlement, depositTxHash };
+  const deposit = body2 as GatewayDepositResponse;
+  return { dryRun: false, instructions, requirement, paymentHeaders, payload, status: second.status, body: body2, settlement, deposit, depositTxHash: deposit?.txHash ?? undefined };
 }

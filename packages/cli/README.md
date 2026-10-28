@@ -16,7 +16,9 @@ hedgehood session authorize|revoke|status
 hedgehood register --name "my-agent"         # ERC-8004, mainnet, owner key
 ```
 
-Global options: `--chain 46630|4663`, `--rpc`, `--api`, `--account <owner>`, `--underlying NVDA`, `--session-key-file`,
-`--owner-key-file`, `--json`. Environment variables of `@hedgehood-io/mcp` are honoured too.
+Instruments: a backend name (`NVDA-20261030-220-C`), a packed id, or `expiry:strike:call|put`.
+Global options: `--testnet` (default) | `--mainnet` | `--chain <id>`, `--rpc`, `--rfq-url`, `--indexer-url`, `--gateway-url`,
+`--account <owner>`, `--underlying NVDA`, `--session-key-file`, `--owner-key-file`, `--json`. Environment variables of
+`@hedgehood-io/mcp` are honoured too.
 
 https://github.com/0xHedgeHood/hedgehood-agent-kit. MIT.

@@ -11,8 +11,8 @@ See [RELEASING.md](RELEASING.md). Before the first `@hedgehood-io/mcp` publish, 
 ## 2. Official MCP Registry (registry.modelcontextprotocol.io)
 
 Manifest: `packages/mcp/server.json` (name `io.github.0xHedgeHood/hedgehood-options`; the `io.github.0xHedgeHood/*`
-namespace is proven by GitHub login to an account with access to the `0xHedgeHood` org). Remove or fill the `remotes`
-entry (hosted read-only server, placeholder `https://mcp.hedgehood.io/mcp`) before publishing.
+namespace is proven by GitHub login to an account with access to the `0xHedgeHood` org). The `remotes` entry points at
+the hosted read-only server `https://mcp.hedgehood.io/mcp` (live, testnet dry-run as of 2026-10-28).
 
 ```sh
 brew install mcp-publisher            # or: curl -L https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr A-Z a-z)_$(uname -m).tar.gz | tar xz

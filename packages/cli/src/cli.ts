@@ -11,6 +11,8 @@ import {
   depositViaGateway,
   describeInstrument,
   encodeInstrumentId,
+  instrumentName,
+  resolveInstrumentName,
   encodeRegisterAgent,
   formatShares,
   formatStrike,
@@ -33,8 +35,12 @@ function expand(p: string): string {
 
 interface GlobalOpts {
   chain: string;
+  testnet?: boolean;
+  mainnet?: boolean;
   rpc?: string;
-  api?: string;
+  rfqUrl?: string;
+  indexerUrl?: string;
+  gatewayUrl?: string;
   account?: string;
   underlying?: string;
   sessionKeyFile?: string;
@@ -45,8 +51,12 @@ interface GlobalOpts {
 function envFrom(o: GlobalOpts): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (o.chain) env.HEDGEHOOD_CHAIN_ID = o.chain;
+  if (o.testnet) env.HEDGEHOOD_CHAIN_ID = "46630";
+  if (o.mainnet) env.HEDGEHOOD_CHAIN_ID = "4663";
   if (o.rpc) env.HEDGEHOOD_RPC_URL = o.rpc;
-  if (o.api) env.HEDGEHOOD_API_URL = o.api;
+  if (o.rfqUrl) env.HEDGEHOOD_RFQ_URL = o.rfqUrl;
+  if (o.indexerUrl) env.HEDGEHOOD_INDEXER_URL = o.indexerUrl;
+  if (o.gatewayUrl) env.HEDGEHOOD_GATEWAY_URL = o.gatewayUrl;
   if (o.account) env.HEDGEHOOD_ACCOUNT = o.account;
   if (o.underlying) env.HEDGEHOOD_UNDERLYING = o.underlying;
   if (o.sessionKeyFile) env.HEDGEHOOD_SESSION_KEY_FILE = o.sessionKeyFile;
@@ -64,6 +74,8 @@ function ctxFrom(cmd: Command, readOnly = false): KitContext {
   if (readOnly && !env.HEDGEHOOD_ACCOUNT && !env.HEDGEHOOD_SESSION_KEY_FILE && !env.HEDGEHOOD_SESSION_KEY && !env.HEDGEHOOD_OWNER_KEY_FILE && !env.HEDGEHOOD_OWNER_KEY) env.HEDGEHOOD_ACCOUNT = ZERO;
   return createContext(loadConfig(env));
 }
+
+const sessionKeyOf = (ctx: KitContext) => (ctx.session && ctx.session.address.toLowerCase() !== ctx.account.toLowerCase() ? ctx.session.address : undefined);
 
 const out = (cmd: Command, v: unknown, human?: string) => {
   const o = cmd.optsWithGlobals() as GlobalOpts;
@@ -86,21 +98,21 @@ async function send(cmd: Command, ctx: KitContext, who: "session" | "owner", tx:
   if (receipt.status !== "success") process.exitCode = 1;
 }
 
-function instrumentArg(v: string): bigint {
-  // "<instrumentId>" or "<expiry>:<strike>:<call|put>"
+/** "<instrumentId>", "NVDA-20261030-220-C" (backend name) or "<expiry>:<strike>:<call|put>". */
+async function instrumentArg(ctx: KitContext, v: string): Promise<bigint> {
   if (/^\d+$/.test(v)) return BigInt(v);
   const m = /^(\d+):(\d+(?:\.\d+)?):(call|put|c|p)$/i.exec(v);
-  if (!m) throw new Error(`instrument must be an id or expiry:strike:call|put, got ${v}`);
-  return encodeInstrumentId(BigInt(m[1]!), parseUsdg(m[2]!), /^p/i.test(m[3]!));
+  if (m) return encodeInstrumentId(BigInt(m[1]!), parseUsdg(m[2]!), /^p/i.test(m[3]!));
+  return resolveInstrumentName(v, await ctx.market("none").openedExpiries());
 }
 
 function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint): string {
   const pays = q.netNowRaw > 0n;
   return [
-    `${describeInstrument(q.order.instrumentId, underlying)}  qty ${formatShares(qty)}`,
+    `${q.instrument}  (${describeInstrument(q.order.instrumentId, underlying)})  qty ${formatShares(qty)}${q.dryRun ? "  [BACKEND DRY RUN: placeholder signature, not fillable]" : ""}`,
     `  price/share ${formatUsdg(q.pricePerShareRaw)}  premium ${formatUsdg(q.premiumNowRaw)}  fee ${formatUsdg(q.feeNowRaw)}  ${pays ? "you pay" : "you receive"} ${formatUsdg(pays ? q.netNowRaw : -q.netNowRaw)}`,
-    `  valid ${q.secondsLeft}s (until ${q.order.validUntil})  canFill ${q.canFill}${q.shortfallRaw > 0n ? `  shortfall ${formatUsdg(q.shortfallRaw)}` : ""}`,
-    `  digest ${orderDigest(q.order)}  maker ${q.order.maker}`,
+    `  valid ${q.secondsLeft}s (until ${q.order.validUntil})  canFill ${q.canFill ?? "unknown"}${q.shortfallRaw > 0n ? `  shortfall ${formatUsdg(q.shortfallRaw)}` : ""}${q.funding.note ? `  (${q.funding.note})` : ""}`,
+    `  digest ${q.digest}  maker ${q.order.maker}  mark mid ${q.markPrice}`,
   ].join("\n");
 }
 
@@ -109,8 +121,12 @@ export function buildProgram(): Command {
     .description("Hedgehood AI-agent options market on Robinhood Chain. Sends are DRY RUN unless --send is given.")
     .version("0.1.0")
     .option("--chain <id>", "46630 (testnet, default) or 4663", process.env.HEDGEHOOD_CHAIN_ID ?? "46630")
+    .option("--testnet", "use the Robinhood testnet (46630) deployment (default)")
+    .option("--mainnet", "use Robinhood Chain mainnet (4663); no V2 market yet")
     .option("--rpc <url>", "RPC URL override")
-    .option("--api <url>", "backend URL override")
+    .option("--rfq-url <url>", "quote service override (default https://agent-api.hedgehood.io)")
+    .option("--indexer-url <url>", "indexer override (default https://agent-index.hedgehood.io)")
+    .option("--gateway-url <url>", "x402 deposit gateway override (default https://agent-pay.hedgehood.io)")
     .option("--account <address>", "trading account (owner) the session key acts for")
     .option("--underlying <ticker>", "NVDA")
     .option("--session-key-file <path>", `session key file (default ${DEFAULT_SESSION_KEY_FILE} when present)`)
@@ -181,13 +197,13 @@ export function buildProgram(): Command {
     .action(async (expiry: string, _o: unknown, cmd: Command) => {
       const ctx = ctxFrom(cmd, true);
       const info = await ctx.market("none").expiryInfo(BigInt(expiry));
-      const rows = info.strikes.flatMap((s) => [false, true].map((p) => ({ instrumentId: encodeInstrumentId(info.expiry, s, p), label: describeInstrument(encodeInstrumentId(info.expiry, s, p), ctx.deployment.underlying) })));
-      out(cmd, { expiry: info.expiry, tradingOpen: info.tradingOpen, instruments: rows }, rows.map((r) => `${r.instrumentId}  ${r.label}`).join("\n"));
+      const rows = info.strikes.flatMap((s) => [false, true].map((p) => ({ instrument: instrumentName(ctx.deployment.underlying, info.expiry, s, p), instrumentId: encodeInstrumentId(info.expiry, s, p), label: describeInstrument(encodeInstrumentId(info.expiry, s, p), ctx.deployment.underlying) })));
+      out(cmd, { expiry: info.expiry, tradingOpen: info.tradingOpen, instruments: rows }, rows.map((r) => `${r.instrument}  ${r.instrumentId}`).join("\n"));
     });
 
   program
     .command("quote")
-    .description("Firm RFQ quote for an instrument (id, or expiry:strike:call|put)")
+    .description("Firm RFQ quote for an instrument (NVDA-20261030-220-C, an id, or expiry:strike:call|put)")
     .argument("<instrument>")
     .requiredOption("--side <buy|sell>")
     .option("--qty <shares>", "quantity in shares", "1")
@@ -195,12 +211,12 @@ export function buildProgram(): Command {
     .action(async (instrument: string, opts: { side: "buy" | "sell"; qty: string; out?: string }, cmd: Command) => {
       const ctx = ctxFrom(cmd);
       const m = ctx.market("none");
-      const id = instrumentArg(instrument);
+      const id = await instrumentArg(ctx, instrument);
       const qty = parseShares(opts.qty);
-      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
-      const file = { order: orderToJson(q.order), signature: q.signature, side: opts.side, quantityRaw: qty.toString(), chainId: ctx.chainId };
+      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+      const file = { order: orderToJson(q.order), signature: q.signature, side: opts.side, quantityRaw: qty.toString(), chainId: ctx.chainId, dryRun: q.dryRun };
       if (opts.out) writeFileSync(opts.out, JSON.stringify(file, null, 2));
-      out(cmd, { ...file, digest: orderDigest(q.order), premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, secondsLeft: q.secondsLeft }, quoteHuman(q, ctx.deployment.underlying, qty) + (opts.out ? `\n  saved to ${opts.out}` : ""));
+      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable }, quoteHuman(q, ctx.deployment.underlying, qty) + (opts.out ? `\n  saved to ${opts.out}` : ""));
     });
 
   program
@@ -216,16 +232,18 @@ export function buildProgram(): Command {
       const m = ctx.market("session");
       let order, signature: Hex, qty: bigint;
       if (quoteFile) {
-        const f = JSON.parse(readFileSync(quoteFile, "utf8")) as { order: Record<string, unknown>; signature: Hex; quantityRaw?: string };
+        const f = JSON.parse(readFileSync(quoteFile, "utf8")) as { order: Record<string, unknown>; signature: Hex; quantityRaw?: string; dryRun?: boolean };
+        if (f.dryRun) throw new Error("this quote is a backend dry-run placeholder (no signer key on the desk); it cannot be filled");
         order = orderFromJson(f.order);
         signature = f.signature;
         qty = opts.qty ? parseShares(opts.qty) : BigInt(f.quantityRaw ?? order.quantityRaw.toString());
       } else {
         if (!opts.instrument || !opts.side) throw new Error("give a quote file, or --instrument and --side");
         qty = parseShares(opts.qty ?? "1");
-        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: instrumentArg(opts.instrument), side: opts.side, quantityRaw: qty, taker: ctx.account }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: await instrumentArg(ctx, opts.instrument), side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
         process.stdout.write(quoteHuman(q, ctx.deployment.underlying, qty) + "\n");
-        if (!q.canFill) process.stdout.write(`  maker says canFill=false${q.shortfallRaw > 0n ? ` (short ${formatUsdg(q.shortfallRaw)} USDG)` : ""}; the fill will likely revert\n`);
+        if (!q.fillable) throw new Error("backend dry-run quote (placeholder signature): nothing to fill");
+        if (q.canFill === false) process.stdout.write(`  maker says canFill=false${q.shortfallRaw > 0n ? ` (short ${formatUsdg(q.shortfallRaw)} USDG)` : ""}; the fill will likely revert\n`);
         order = q.order;
         signature = q.signature;
       }
@@ -241,13 +259,15 @@ export function buildProgram(): Command {
       const m = ctx.market("none");
       const s = await m.snapshot(ctx.account);
       const sess = ctx.session ? await m.session(ctx.session.address, ctx.account) : undefined;
+      const indexed = await ctx.rfq.positions(ctx.account).catch(() => undefined);
       const lines = [
         `account ${s.account}`,
         `collateral ${formatUsdg(s.collateralRaw)}  locked ${formatUsdg(s.requirementRaw)}  free ${formatUsdg(s.freeCollateralRaw)}  wallet USDG ${formatUsdg(s.walletUsdgRaw)}`,
         ...(s.positions.length ? s.positions.map((p) => `  ${p.quantityRaw > 0n ? "+" : ""}${formatShares(p.quantityRaw)}  ${describeInstrument(p.instrumentId, ctx.deployment.underlying)}  id ${p.instrumentId}`) : ["  no positions"]),
         sess ? `session ${sess.key} ${sess.active ? "ACTIVE" : "inactive"} trade=${sess.canTrade} cancel=${sess.canCancel} until ${sess.expiresAt} maxRequirement ${sess.maxRequirement === 0n ? "unlimited" : formatUsdg(sess.maxRequirement)}` : "session: none configured",
+        indexed ? `indexer: ${indexed.positions.length} position(s), fills ${indexed.leaderboard?.fills ?? 0}, settled PnL ${formatUsdg(BigInt(indexed.leaderboard?.settledPnlRaw ?? "0"))}, agentId ${indexed.agentId ?? "none"}` : "indexer: unavailable",
       ];
-      out(cmd, { ...s, session: sess }, lines.join("\n"));
+      out(cmd, { ...s, session: sess, indexed }, lines.join("\n"));
     });
 
   program
@@ -269,8 +289,8 @@ export function buildProgram(): Command {
         return;
       }
       const payer = ctx.owner ?? requireSession(ctx);
-      const r = await depositViaGateway({ account: ctx.account, market: ctx.deployment.market, amountRaw }, { signer: payer, chainId: ctx.chainId, apiUrl: ctx.config.apiUrl, dryRun: !opts.send, maxAmountRaw: parseUsdg(ctx.config.maxDepositUsdg) });
-      out(cmd, r, r.dryRun ? `DRY RUN: gateway asks ${formatUsdg(BigInt(r.requirement!.amount))} USDG from ${payer.address} to ${r.requirement!.payTo}; add --send to pay` : `paid; deposit tx ${r.depositTxHash ?? "(see body)"}  settlement ${JSON.stringify(r.settlement)}`);
+      const r = await depositViaGateway({ account: ctx.account, market: ctx.deployment.market, amountRaw }, { signer: payer, chainId: ctx.chainId, gatewayUrl: ctx.config.gatewayUrl, dryRun: !opts.send, maxAmountRaw: parseUsdg(ctx.config.maxDepositUsdg) });
+      out(cmd, r, r.dryRun ? `DRY RUN: gateway asks ${formatUsdg(BigInt(r.requirement!.amount))} USDG from ${payer.address} to ${r.requirement!.payTo} (fee ${formatUsdg(BigInt(r.instructions!.fee.raw))}); add --send to pay` : `paid; gateway deposit status ${r.deposit?.status}${r.depositTxHash ? ` tx ${r.depositTxHash}` : ""}  settlement ${JSON.stringify(r.settlement)}`);
     });
 
   program

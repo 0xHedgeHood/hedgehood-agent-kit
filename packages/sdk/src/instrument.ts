@@ -84,3 +84,44 @@ export function gridFor(
   }
   return { capLow, capHigh, strikes };
 }
+
+// ---------------------------------------------------------------- backend instrument names
+// The RFQ service names instruments `UNDERLYING-YYYYMMDD-STRIKE-C|P` (rfq/registry.py `instrument_key`): the New York
+// calendar date of the expiry and the strike in USD as Python's `f"{usd:g}"` prints it ("200", "202.5").
+
+const NY_DATE = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" });
+
+/** `YYYYMMDD` of a unix expiry in New York time (the OCC date). */
+export function expiryDateNY(expiry: bigint | number): string {
+  return NY_DATE.format(new Date(Number(expiry) * 1000)).replace(/-/g, "");
+}
+
+/** Strike label as the backend prints it: 220000000n -> "220", 222500000n -> "222.5". */
+export function strikeLabel(strikeRaw: bigint): string {
+  const whole = strikeRaw / 1_000_000n;
+  const frac = (strikeRaw % 1_000_000n).toString().padStart(6, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : whole.toString();
+}
+
+export function instrumentName(underlying: string, expiry: bigint | number, strikeRaw: bigint, isPut: boolean): string {
+  return `${underlying.toUpperCase()}-${expiryDateNY(expiry)}-${strikeLabel(strikeRaw)}-${isPut ? "P" : "C"}`;
+}
+
+export const INSTRUMENT_NAME_RE = /^([A-Z]{1,8})-(\d{8})-(\d+(?:\.\d+)?)-([CP])$/;
+
+/** Parses `NVDA-20261030-220-C`; the expiry is a date, so the unix expiry needs the market's opened expiries to resolve. */
+export function parseInstrumentName(text: string): { underlying: string; date: string; strikeRaw: bigint; isPut: boolean } {
+  const m = INSTRUMENT_NAME_RE.exec(text.trim().toUpperCase());
+  if (!m) throw new RangeError(`instrument must look like NVDA-20261030-220-C, got ${text}`);
+  const [whole, frac = ""] = m[3]!.split(".");
+  if (frac.length > 6) throw new RangeError("strike has more than 6 decimals");
+  const strikeRaw = BigInt(whole!) * 1_000_000n + BigInt(frac.padEnd(6, "0") || "0");
+  return { underlying: m[1]!, date: m[2]!, strikeRaw, isPut: m[4] === "P" };
+}
+
+/** Resolves a backend instrument name to an id given the market's opened expiries (unix seconds). */
+export function resolveInstrumentName(text: string, expiries: Iterable<bigint>): bigint {
+  const p = parseInstrumentName(text);
+  for (const e of expiries) if (expiryDateNY(e) === p.date) return encodeInstrumentId(e, p.strikeRaw, p.isPut);
+  throw new RangeError(`no opened expiry on ${p.date}`);
+}

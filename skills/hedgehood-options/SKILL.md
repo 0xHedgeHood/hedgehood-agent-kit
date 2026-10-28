@@ -35,8 +35,11 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 
 - Start with `list_markets` (addresses, open expiries, strikes, fee) and `positions` (balance, free collateral, session
   status). If `session.active` is false, stop: the owner must `authorize_session` first.
-- Instrument ids pack `(expiry << 96) | (strike << 1) | isPut`; `list_instruments` gives ids and labels, `decode_instrument`
-  reverses one.
+- Instruments are named `NVDA-20261030-220-C` (New York date, USD strike, C/P); ids pack `(expiry << 96) | (strike << 1) |
+  isPut`. `list_instruments` gives both; `decode_instrument` reverses an id. `get_mark` says whether the desk is quoting
+  (`executable`); outside the listed US session it is not.
+- A quote with `backendDryRun` / `fillable: false` comes from a desk running without its signer key (testnet today): read
+  it, do not try to fill it.
 - Before a buy, check `freeCollateral >= youPay`. Before a sell (writing), compare `requirementAfter` from `get_quote`
   with the collateral: a shortfall reverts `InsufficientCollateral` in balance mode (nothing is pulled from a wallet).
 - Quotes are good for seconds. Get the quote, decide, fill; do not hoard digests. A fill reverting `OrderExpired`
@@ -69,7 +72,9 @@ Manual (Claude Code, Claude Desktop, Codex, OpenClaw and any MCP host):
 
 Codex CLI: `codex mcp add hedgehood --env HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key --env HEDGEHOOD_ACCOUNT=0x... -- npx -y @hedgehood-io/mcp`.
 OpenClaw: add the same `mcpServers` block to the agent's MCP config. Create the session key with `npx @hedgehood-io/cli join`.
-Add `HEDGEHOOD_OWNER_KEY_FILE` only on a machine you trust with funds (it unlocks `withdraw`, `deposit_x402` from the owner
+Chain: `--testnet` (46630, default) or `--mainnet` (4663) on the `npx` command, or `HEDGEHOOD_CHAIN_ID`. The backend hosts
+default to `agent-api` / `agent-index` / `agent-pay.hedgehood.io`; a hosted read-only MCP (no keys, no fills) is at
+`https://mcp.hedgehood.io/mcp`. Add `HEDGEHOOD_OWNER_KEY_FILE` only on a machine you trust with funds (it unlocks `withdraw`, `deposit_x402` from the owner
 wallet, `authorize_session`, `register_agent`). `npx @hedgehood-io/mcp --check` prints the resolved configuration with keys
 shown only as set/missing.
 
