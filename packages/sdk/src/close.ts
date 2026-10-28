@@ -3,6 +3,7 @@ import type { TxRequest } from "./calldata.js";
 import { expiryOf, instrumentNameOf } from "./instrument.js";
 import type { MarketClient, Position, SendResult } from "./market.js";
 import type { RfqClient, VerifiedQuote } from "./rfq.js";
+import type { SessionCharge } from "./session.js";
 
 /**
  * Closing a position before expiry. Positions are signed and net out on chain, and the maker quotes both sides of
@@ -10,6 +11,11 @@ import type { RfqClient, VerifiedQuote } from "./rfq.js";
  * maker's bid, a short by buying its ask. `planClose` reads the account's on-chain position, picks the side, asks the
  * desk for a quote of min(|position|, quantity) and builds the same `fillOrderAs(account, ..., fromBalance)` the fill
  * path uses; `closePosition` sends it through `MarketClient.send` (dry run unless told otherwise).
+ *
+ * Filled by a session key, a close is normally free of both session budgets: selling a long held does not draw the
+ * short-risk budget, and buying back a short draws the spend budget only for what it pays above the short's worst
+ * case. The plan carries that charge (`sessionCharge`, with `withinBudget`) so a caller knows before sending whether
+ * the fill would hit `SessionLimit`.
  */
 export interface CloseRequest {
   /** Carries the chain, the deployment, the account and the signing key (the session key, as for a fill). */
@@ -23,7 +29,7 @@ export interface CloseRequest {
    * must keep it true (the market reverts `SessionWalletMode`); false is only for a signer that is the account itself.
    */
   fromBalance?: boolean;
-  /** The session key that will send the fill, for the desk's SessionLimit preview. */
+  /** The session key that will send the fill: the desk's SessionLimit preview, and the plan's `sessionCharge`. */
   sessionKey?: Address;
   /** The book's taker fee, if already read; otherwise read on chain. */
   protocolFeeBps?: bigint | number;
@@ -44,6 +50,8 @@ export interface ClosePlan {
   remainingRaw: bigint;
   quote: VerifiedQuote;
   request: TxRequest;
+  /** With a session key: what the fill draws from the session's budgets and whether it fits (else `SessionLimit`). */
+  sessionCharge?: SessionCharge;
 }
 
 export interface CloseResult extends ClosePlan {
@@ -77,7 +85,11 @@ export async function planClose(req: CloseRequest): Promise<ClosePlan> {
   );
   const request = market.fillOrderAs(quote.order, quote.signature, quantityRaw, req.fromBalance ?? true, account);
   const remainingRaw = side === "sell" ? position.quantityRaw - quantityRaw : position.quantityRaw + quantityRaw;
-  return { account, instrumentId: req.instrumentId, instrument: quote.instrument, position, side, quantityRaw, remainingRaw, quote, request };
+  // best effort: a failed read leaves the charge out rather than blocking the exit (the simulation still checks it)
+  const sessionCharge = req.sessionKey
+    ? await market.sessionCharge({ instrumentId: req.instrumentId, side, quantityRaw, order: quote.order, protocolFeeBps, key: req.sessionKey, account, positionBeforeRaw: position.quantityRaw }).catch(() => undefined)
+    : undefined;
+  return { account, instrumentId: req.instrumentId, instrument: quote.instrument, position, side, quantityRaw, remainingRaw, quote, request, sessionCharge };
 }
 
 /**
@@ -87,6 +99,6 @@ export async function planClose(req: CloseRequest): Promise<ClosePlan> {
 export async function closePosition(req: CloseRequest & { dryRun?: boolean }): Promise<CloseResult> {
   const plan = await planClose(req);
   if (!plan.quote.fillable) throw new Error("backend dry-run quote (placeholder signature): nothing to fill");
-  const result = await req.market.send(plan.request, { dryRun: req.dryRun ?? true });
+  const result = await req.market.send(plan.request, { dryRun: req.dryRun ?? true, sessionCharge: plan.sessionCharge });
   return { ...plan, result };
 }

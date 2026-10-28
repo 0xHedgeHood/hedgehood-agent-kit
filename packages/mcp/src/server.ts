@@ -5,6 +5,7 @@ import {
   decodeInstrumentId,
   depositViaGateway,
   describeInstrument,
+  describeSessionCharge,
   encodeInstrumentId,
   encodeRegisterAgent,
   expiryOf,
@@ -24,6 +25,7 @@ import {
   pnlByInstrument,
   positionPnl,
   shareStrikeOf,
+  Side,
   tokenStrikeOf,
   UNIT_MULTIPLIER,
   UNLIMITED,
@@ -35,7 +37,9 @@ import {
   type OracleStatus,
   type PlanStep,
   type PlanStepResult,
+  type PlannedSessionLeg,
   type QuoteResponse,
+  type SessionCharge,
   type TxRequest,
   type VaultAccountInfo,
   type VaultInfo,
@@ -89,8 +93,11 @@ async function instrumentFrom(m: MarketClient, args: { instrument?: string; inst
   throw new Error("give instrument (NVDA-20261030-220-C), or instrumentId, or expiry + strike + kind");
 }
 
-/** `extra` is merged into every JSON answer (what a close or fill was priced at), never into an error. */
-async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRequest, confirm: boolean, dryRun: boolean | undefined, extra: Record<string, unknown> = {}) {
+/**
+ * `extra` is merged into every JSON answer (what a close or fill was priced at), never into an error. With the leg's
+ * `sessionCharge`, a SessionLimit revert names the budget it draws and what was left.
+ */
+async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRequest, confirm: boolean, dryRun: boolean | undefined, extra: Record<string, unknown> = {}, sessionCharge?: SessionCharge) {
   const dry = dryRun ?? ctx.config.dryRunDefault;
   if (!confirm) {
     return json({ ...extra, ok: false, needsConfirm: true, wouldSend: tx.summary, to: tx.to, data: tx.data, dryRun: dry, hint: "call again with confirm: true" });
@@ -98,7 +105,7 @@ async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRe
   const signer = who === "owner" ? requireOwner(ctx) : requireSession(ctx);
   const m = ctx.market(who);
   try {
-    const r = await m.send(tx, { dryRun: dry });
+    const r = await m.send(tx, { dryRun: dry, sessionCharge });
     if (r.dryRun) return json({ ...extra, ok: true, dryRun: true, simulated: true, from: signer.address, to: tx.to, data: tx.data, summary: tx.summary, hint: "simulation passed; call again with dryRun: false to broadcast" });
     const receipt = await m.waitForReceipt(r.hash!);
     return json({ ...extra, ok: receipt.status === "success", dryRun: false, txHash: r.hash, blockNumber: receipt.blockNumber, status: receipt.status, from: signer.address, summary: tx.summary, explorer: `${m.chain.blockExplorers?.default.url}/tx/${r.hash}` });
@@ -154,7 +161,34 @@ function closeView(plan: ClosePlan, underlying: string) {
 }
 
 const SESSION_LIMITS =
-  "A session key's fills always settle from the account's deposited balance (the market reverts SessionWalletMode on a session leg in wallet mode), the premium + fee it makes the account pay comes out of the session's spend budget (spendLeft; SessionLimit when exhausted, 0 = it cannot buy) and it cannot push the account's requirement above maxRequirement (SessionLimit).";
+  "A session key's fills always settle from the account's deposited balance (the market reverts SessionWalletMode on a session leg in wallet mode). Two cumulative budgets bound it (SessionLimit when a fill needs more than is left): every sell leg draws the short-risk budget (riskLeft) by the worst case of the short it opens, ceil(opened short x maxPayout / 1e18) with maxPayout = capHigh - strike (call) or strike - capLow (put) per token, and selling a long held is free (0 = it cannot sell to open); every buy leg draws the spend budget (spendLeft) by its premium + fee less the worst case of the shorts it buys back (0 = buy to close only).";
+
+/** The session charge of a leg the configured session key is about to fill; undefined without a session key or when the reads fail. */
+async function sessionChargeFor(ctx: KitContext, m: MarketClient, leg: Omit<PlannedSessionLeg, "key" | "account">): Promise<SessionCharge | undefined> {
+  const key = ctx.session && ctx.session.address.toLowerCase() !== ctx.account.toLowerCase() ? ctx.session.address : undefined;
+  if (!key) return undefined;
+  try {
+    return await m.sessionCharge({ ...leg, key, account: ctx.account });
+  } catch {
+    return undefined;
+  }
+}
+
+function sessionChargeView(c: SessionCharge | undefined) {
+  if (!c) return undefined;
+  return {
+    budget: c.budget === "shortRisk" ? "shortRisk (riskLeft)" : "spend (spendLeft)",
+    charge: formatUsdg(c.chargeRaw),
+    left: c.leftRaw === undefined ? undefined : formatSessionCap(c.leftRaw),
+    withinBudget: c.withinBudget,
+    openedShort: c.side === "sell" ? formatShares(c.openedShortRaw) : undefined,
+    closedShort: c.side === "buy" ? formatShares(c.closedShortRaw) : undefined,
+    maxPayoutPerToken: formatUsdg(c.maxPayoutRaw),
+    chargeRaw: c.chargeRaw,
+    leftRaw: c.leftRaw,
+    note: describeSessionCharge(c),
+  };
+}
 
 function sessionView(s: Awaited<ReturnType<MarketClient["session"]>>) {
   return {
@@ -165,10 +199,10 @@ function sessionView(s: Awaited<ReturnType<MarketClient["session"]>>) {
     expiresAt: s.expiresAt,
     authorizedAt: s.authorizedAt,
     authorizedAtIso: s.authorizedAt === 0n ? undefined : new Date(Number(s.authorizedAt) * 1000).toISOString(),
+    riskLeft: formatSessionCap(s.riskLeft),
     spendLeft: formatSessionCap(s.spendLeft),
-    maxRequirement: formatSessionCap(s.maxRequirement),
+    riskLeftRaw: s.riskLeft,
     spendLeftRaw: s.spendLeft,
-    maxRequirementRaw: s.maxRequirement,
   };
 }
 
@@ -291,7 +325,9 @@ export function createServer(ctx: KitContext): McpServer {
       } catch {
         /* optional */
       }
-      return json({ ...view, requirementAfter, order: orderToJson(q.order), signature: q.signature, next: q.fillable ? "fill_quote with this digest and confirm: true (dryRun first)" : "not fillable (backend dry run); nothing to send" });
+      const charge = await sessionChargeFor(ctx, m, { instrumentId: id, side: args.side, quantityRaw, order: q.order, protocolFeeBps: fee });
+      const next = !q.fillable ? "not fillable (backend dry run); nothing to send" : charge?.withinBudget === false ? `the session key cannot fill this: ${charge.budget === "shortRisk" ? "riskLeft" : "spendLeft"} is short (SessionLimit); smaller size, or the owner re-authorizes with a larger ${charge.budget === "shortRisk" ? "maxShortRisk" : "maxSpend"}` : "fill_quote with this digest and confirm: true (dryRun first)";
+      return json({ ...view, requirementAfter, sessionCharge: sessionChargeView(charge), order: orderToJson(q.order), signature: q.signature, next });
     },
   );
 
@@ -299,7 +335,7 @@ export function createServer(ctx: KitContext): McpServer {
     "fill_quote",
     {
       title: "Fill a quote",
-      description: "Takes a quote from get_quote for your account via fillOrderAs from the session key, always in balance mode (premium, fee and collateral settle from your deposited USDG; no approvals). A buy is charged to the session's spend budget (spendLeft in `positions`); SessionLimit means the budget or the session's maxRequirement would be exceeded, SessionWalletMode that a session leg was not in balance mode. Opens or adds to a position; to exit an existing position before expiry use close_position instead. dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash when sent.",
+      description: "Takes a quote from get_quote for your account via fillOrderAs from the session key, always in balance mode (premium, fee and collateral settle from your deposited USDG; no approvals). A sell that opens a short draws the session's short-risk budget (riskLeft) by its worst case, a buy the spend budget (spendLeft) beyond the shorts it closes; the answer carries `sessionCharge`. SessionLimit means the leg needs more than its budget has left, SessionWalletMode that a session leg was not in balance mode. Opens or adds to a position; to exit an existing position before expiry use close_position instead. dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash when sent.",
       inputSchema: {
         digest: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional().describe("Digest returned by get_quote"),
         order: z.record(z.unknown()).optional().describe("Alternatively the order JSON from get_quote"),
@@ -332,7 +368,8 @@ export function createServer(ctx: KitContext): McpServer {
       if (order.taker.toLowerCase() !== ctx.account.toLowerCase()) return fail(`quote is addressed to ${order.taker}, not your account ${ctx.account}`);
       const m = ctx.market("session");
       const tx = m.fillOrderAs(order, signature, quantityRaw, true);
-      return sendOrExplain(ctx, "session", tx, args.confirm, args.dryRun);
+      const charge = await sessionChargeFor(ctx, m, { instrumentId: order.instrumentId, side: order.side === Side.Ask ? "buy" : "sell", quantityRaw, order });
+      return sendOrExplain(ctx, "session", tx, args.confirm, args.dryRun, charge ? { sessionCharge: sessionChargeView(charge) } : {}, charge);
     },
   );
 
@@ -375,7 +412,7 @@ export function createServer(ctx: KitContext): McpServer {
     "positions",
     {
       title: "Positions and balances (active)",
-      description: "Your ACTIVE book: market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument with average entry price, the desk's mark, unrealized P&L and time to expiry (when the indexer answers), plus the session's authority (expiry, authorizedAt, spendLeft = premium + fees it may still pay, maxRequirement). Past activity is get_history; totals are get_pnl; to exit a position before expiry call close_position. Read-only.",
+      description: "Your ACTIVE book: market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument with average entry price, the desk's mark, unrealized P&L and time to expiry (when the indexer answers), plus the session's authority (expiry, authorizedAt, riskLeft = worst case of the shorts it may still open, spendLeft = premium + fees it may still pay beyond buying back shorts). Past activity is get_history; totals are get_pnl; to exit a position before expiry call close_position. Read-only.",
       inputSchema: {},
     },
     async () => {
@@ -411,7 +448,7 @@ export function createServer(ctx: KitContext): McpServer {
     "close_position",
     {
       title: "Close a position (before expiry)",
-      description: "Exits an open position before expiry. Positions net out on chain and the maker quotes both sides, so this reads your signed position in the instrument, asks for a firm quote on the OPPOSITE side (a long is sold to the bid, a short is bought back at the ask) for min(|position|, quantity), verifies it and fills it via fillOrderAs from the session key in balance mode, exactly like fill_quote. Without confirm it only prices the close. dryRun (default true) simulates only; dryRun: false broadcasts and reports the tx hash. Requires confirm: true.",
+      description: "Exits an open position before expiry. Positions net out on chain and the maker quotes both sides, so this reads your signed position in the instrument, asks for a firm quote on the OPPOSITE side (a long is sold to the bid, a short is bought back at the ask) for min(|position|, quantity), verifies it and fills it via fillOrderAs from the session key in balance mode, exactly like fill_quote. A close is normally free of the session budgets (selling a long held opens no short; buying back a short is charged only above its worst case); `sessionCharge` says what it draws and whether it fits. Without confirm it only prices the close. dryRun (default true) simulates only; dryRun: false broadcasts and reports the tx hash. Requires confirm: true.",
       inputSchema: {
         ...instrumentFields,
         quantity: decimalAmount.optional().describe("Shares to close; default and maximum: the whole position"),
@@ -434,11 +471,11 @@ export function createServer(ctx: KitContext): McpServer {
         return fail(`close failed: ${errorText(e)}`);
       }
       ctx.quotes.set(plan.quote.digest, { quote: plan.quote, fetchedAt: Date.now(), side: plan.side, requestedQuantityRaw: plan.quantityRaw });
-      const view: ReturnType<typeof closeView> & { fromBalance: boolean; note?: string } = { ...closeView(plan, underlying), fromBalance };
+      const view: ReturnType<typeof closeView> & { fromBalance: boolean; note?: string; sessionCharge?: ReturnType<typeof sessionChargeView> } = { ...closeView(plan, underlying), fromBalance, sessionCharge: sessionChargeView(plan.sessionCharge) };
       if (forced) view.note = "fromBalance: false ignored: a session key always settles in balance mode (the market reverts SessionWalletMode on a session leg in wallet mode)";
       if (!plan.quote.fillable) return json({ ...view, ok: false, fillable: false, note: "the desk runs without a signer key: this quote carries a placeholder signature and cannot be filled; nothing to send" });
       if (plan.quote.canFill === false) view.quote.fundingPreview = { ...view.quote.fundingPreview, note: `maker predicts canFill=false${plan.quote.shortfallRaw > 0n ? ` (shortfall ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}` };
-      return sendOrExplain(ctx, "session", plan.request, args.confirm, args.dryRun, view);
+      return sendOrExplain(ctx, "session", plan.request, args.confirm, args.dryRun, view, plan.sessionCharge);
     },
   );
 
@@ -508,28 +545,30 @@ export function createServer(ctx: KitContext): McpServer {
     "authorize_session",
     {
       title: "Authorize session key (owner key only)",
-      description: "authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend) from the owner: lets the session key trade for the account (never withdraw). maxSpend (required) is the total premium + fees the key may make the account pay over the session (\"0\" = it cannot buy; \"unlimited\" = no cap; a budget such as \"100\" is recommended). maxRequirement caps the collateral requirement a session trade may push the account to (default \"0\" = no new requirement, i.e. it cannot write options; \"unlimited\" = no cap). " + SESSION_LIMITS + " Re-authorizing (rotate or extend) replaces the terms, resets the budget and voids every order the key signed before. dryRun default true. Requires confirm: true.",
+      description: "authorizeSession(key, expiresAt, scope, maxShortRisk, maxSpend) from the owner: lets the session key trade for the account (never withdraw). maxSpend (required) is the cumulative premium + fees the key may make the account pay over the session beyond the worst case of the shorts it buys back (\"0\" = buy to close only; \"unlimited\" = no cap; a budget such as \"100\" is recommended). maxShortRisk is the cumulative worst-case payout of the shorts it may open (default \"0\" = it cannot sell to open; e.g. \"60\" covers one share of a 220 call with capHigh 279.5; \"unlimited\" = no cap). " + SESSION_LIMITS + " Re-authorizing (rotate or extend) replaces the terms, resets both budgets and voids every order the key signed before. dryRun default true. Requires confirm: true.",
       inputSchema: {
         key: address.optional().describe("Session key address; default: the configured session key"),
         days: z.number().int().min(1).max(365).default(30),
-        maxSpend: sessionCap.optional().describe("Required unless revoke: USDG of premium + fees the key may spend for the account over the session, e.g. \"100\"; \"0\" = cannot buy; \"unlimited\" = no cap"),
-        maxRequirement: sessionCap.default("0").describe("USDG cap on the account's total requirement after a session trade; \"0\" (default) = no new requirement (cannot write options); \"unlimited\" = no cap"),
+        maxSpend: sessionCap.optional().describe("Required unless revoke: cumulative USDG of premium + fees the key may spend for the account over the session beyond buying back shorts, e.g. \"100\"; \"0\" = buy to close only; \"unlimited\" = no cap"),
+        maxShortRisk: sessionCap.default("0").describe("Cumulative USDG worst case of the shorts the key may open (each sell leg: ceil(opened short x maxPayout / 1e18)); \"0\" (default) = cannot sell to open; \"unlimited\" = no cap"),
+        maxRequirement: z.string().optional().describe("Removed (hedgehood-options #58): use maxShortRisk"),
         cancel: z.boolean().default(true).describe("Also grant SCOPE_CANCEL"),
         revoke: z.boolean().default(false).describe("true: revokeSession(key) instead"),
         confirm: confirmField,
         dryRun: dryRunField,
       },
     },
-    async ({ key, days, maxSpend, maxRequirement, cancel, revoke, confirm, dryRun }) => {
+    async ({ key, days, maxSpend, maxShortRisk, maxRequirement, cancel, revoke, confirm, dryRun }) => {
+      if (maxRequirement !== undefined) return fail("maxRequirement was removed (hedgehood-options #58): sessions carry a cumulative short-risk budget instead of a cap on the account's requirement. Pass maxShortRisk (USDG; \"0\" = the key cannot sell to open; each short it opens costs its worst-case payout, e.g. one share of a 220 call with capHigh 279.5 costs 59.5).");
       requireOwner(ctx);
       const k = key ?? ctx.session?.address;
       if (!k) return fail("no session key to authorize: pass key or set HEDGEHOOD_SESSION_KEY_FILE");
       const m = ctx.market("owner");
       if (revoke) return sendOrExplain(ctx, "owner", m.revokeSession(k), confirm, dryRun);
-      if (maxSpend === undefined) return fail("maxSpend is required: the USDG of premium + fees this key may spend for the account over the session (e.g. \"100\"; \"0\" = it cannot buy; \"unlimited\" = no cap)");
+      if (maxSpend === undefined) return fail("maxSpend is required: the USDG of premium + fees this key may spend for the account over the session (e.g. \"100\"; \"0\" = buy to close only; \"unlimited\" = no cap)");
       const expiresAt = Math.floor(Date.now() / 1000) + days * 86400;
-      const terms = { maxSpend: formatSessionCap(parseCap(maxSpend)), maxRequirement: formatSessionCap(parseCap(maxRequirement)), expiresAt, note: "re-authorizing resets the spend budget and voids orders this key signed before" };
-      return sendOrExplain(ctx, "owner", m.authorizeSession(k, expiresAt, { trade: true, cancel, maxRequirement: parseCap(maxRequirement), maxSpend: parseCap(maxSpend) }), confirm, dryRun, { terms });
+      const terms = { maxShortRisk: formatSessionCap(parseCap(maxShortRisk)), maxSpend: formatSessionCap(parseCap(maxSpend)), expiresAt, note: "both budgets are cumulative over the session; re-authorizing resets them and voids orders this key signed before" };
+      return sendOrExplain(ctx, "owner", m.authorizeSession(k, expiresAt, { trade: true, cancel, maxShortRisk: parseCap(maxShortRisk), maxSpend: parseCap(maxSpend) }), confirm, dryRun, { terms });
     },
   );
 

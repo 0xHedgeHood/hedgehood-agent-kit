@@ -24,7 +24,7 @@ is: it reads a private key from the user's disk and signs locally, which a hoste
    - *Delegated session on the user's device*: a companion (the local MCP or the CLI) holds the session key and polls
      an inbox the hosted server writes approved quotes into; the hosted tool only queues. More moving parts.
    - *Account abstraction*: the owner authorizes a session key held in a TEE/KMS the operator runs, with a tight
-     `maxRequirement`. Custody-adjacent; needs legal review and the non-US gating enforced at sign-in.
+     `maxShortRisk` and `maxSpend`. Custody-adjacent; needs legal review and the non-US gating enforced at sign-in.
 4. **Widget**: a quote card (instrument, price per share, fee, seconds left, canFill) and a positions table; both are
    plain JSON from the SDK's `quoteView` / `snapshot` shapes.
 5. **Compliance**: non-US gating at OAuth sign-in (the market is non-US only), risk disclosure in the first tool result

@@ -29,7 +29,7 @@ export interface ChainState {
   simulated: Hex[];
   /** The expiry's snapshotted uiMultiplier; the listed per-share strikes stay 210 / 220, stored per token under it. */
   uiMultiplier: bigint;
-  /** sessions(account, key): [expiresAt, authorizedAt, scope, maxRequirement, spendLeft]. */
+  /** sessions(account, key): [expiresAt, authorizedAt, scope, riskLeft, spendLeft]. */
   session: [bigint, bigint, bigint, bigint, bigint];
   /** A custom error the next simulated fill reverts with (e.g. "SessionLimit"). */
   fillRevert?: string;
@@ -490,6 +490,13 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
       return enc(strikesOf(state));
     case "positions":
       return enc(state.positions);
+    case "position": {
+      // the same fixture as positions(): [call@210, put@210, call@220, put@220] of EXPIRY
+      const id = (args as unknown as unknown[])[1] as bigint;
+      const ids = strikesOf(state).flatMap((k) => [encodeInstrumentId(EXPIRY, k, false), encodeInstrumentId(EXPIRY, k, true)]);
+      const i = ids.indexOf(id);
+      return enc(i < 0 ? 0n : (state.positions[i] ?? 0n));
+    }
     case "protocolFeeBps":
       return enc(50n);
     case "tradingOpen":

@@ -31,8 +31,8 @@ npx @hedgehood-io/cli join
 
 # 2. owner wallet (anywhere): authorize the session with a spend budget (here 100 USDG of premium + fees) and deposit tUSDG
 cast send <market> 'authorizeSession(address,uint64,uint256,uint256,uint256)' <session> <expiresAt> 3 0 100000000 --rpc-url https://rpc.testnet.chain.robinhood.com
-#    (scope 3 = trade + cancel; maxRequirement 0 = the key cannot write options; maxSpend 100 USDG raw; or, with the
-#    owner key on this machine: `hedgehood session authorize --max-spend 100 --send`)
+#    (scope 3 = trade + cancel; maxShortRisk 0 = the key cannot sell to open; maxSpend 100 USDG raw; or, with the
+#    owner key on this machine: `hedgehood session authorize --max-spend 100 [--max-short-risk 60] --send`)
 cast send 0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d 'approve(address,uint256)' 0xC289617d613C9865a6595B365DaD88277282e0Ac 100000000 --rpc-url ...
 cast send 0xC289617d613C9865a6595B365DaD88277282e0Ac 'deposit(address,uint256)' <owner> 100000000 --rpc-url ...
 #    (or, once the gateway is up: `hedgehood deposit 100 --x402 --send` from the owner key)
@@ -158,13 +158,18 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
   the account in the `EpochFund`; only the account (or a position manager it approved on chain) can redeem, cancel or
   claim, so every vault write is sent from the owner key, never from a session key.
 - **Session keys.** The agent's key is authorized by the owner with `authorizeSession(key, expiresAt, scope,
-  maxRequirement, maxSpend)`: it can sign and take orders and cancel, for one account, until `expiresAt`. `maxSpend` is
-  the total premium + fees it may make the account pay over the session (0 = it cannot buy; `type(uint256).max` =
-  unlimited; the kit requires an explicit value, `--max-spend <usdg|unlimited>`); `maxRequirement` caps the account's
-  total collateral requirement after a session trade (0, the kit's default = no new requirement, it cannot write
-  options; max = unlimited). It cannot withdraw, deposit from the account, change sessions or receive funds. Re-authorizing
-  resets the budget and voids every order the key signed before; `revokeSession` is immediate and voids every unfilled
-  order the key signed.
+  maxShortRisk, maxSpend)`: it can sign and take orders and cancel, for one account, until `expiresAt`, within two
+  cumulative budgets (USDG raw; `SessionLimit` beyond either). `maxShortRisk` (`riskLeft`) bounds the worst case of the
+  shorts it opens: each sell leg costs `ceil(openedShort x maxPayout / 1e18)`, `openedShort` being the shares beyond the
+  long held (selling a long is free) and `maxPayout` `capHigh - strike` (call) or `strike - capLow` (put) per token; 0,
+  the kit's default, = it cannot sell to open. `maxSpend` (`spendLeft`) bounds the premium + fees it pays as buyer, less
+  the worst case of the shorts a buy closes (0 = buy to close only; the kit requires an explicit `--max-spend
+  <usdg|unlimited>`). `type(uint256).max` is unlimited for either. The SDK prices each leg's charge in advance
+  (`MarketClient.sessionCharge`, `ClosePlan.sessionCharge`), and the CLI and MCP show it with every quote, fill and
+  close. A key can lose at most `maxShortRisk + maxSpend` plus the longs it can sell and the shorts it can buy back up to
+  their worst case. It cannot withdraw, deposit from the account, change sessions or receive funds. Re-authorizing resets
+  both budgets and voids every order the key signed before; `revokeSession` is immediate and voids every unfilled order
+  the key signed.
 - **Balance mode.** Fills settle premium, fee and collateral inside the deposited balance (`fillOrderAs(..., fromBalance =
   true)`): no ERC-20 approvals, nothing is ever pulled from a wallet; a shortfall reverts. A session key can only fill
   this way (the market reverts `SessionWalletMode` on a session leg in wallet mode), and the kit refuses or forces
@@ -187,10 +192,11 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
 
 ## What it talks to
 
-- Contracts: `CashOptionMarketV2` + `CashOptionOrderBookV2` (hedgehood-options PR #54, branch `contracts/audit-fixes-v2`,
-  commit `aa47f7f`: session spend budget, listed per-share grid, multiplier tolerance). ABIs are vendored in
+- Contracts: `CashOptionMarketV2` + `CashOptionOrderBookV2` + `ChainlinkExpirySource` (hedgehood-options PR #58, branch
+  `contracts/redteam-fixes`, commit `ccbab74`: session short-risk budget, unreadable stock controls, phase-boundary round
+  hints; on top of PR #54's spend budget, listed per-share grid and multiplier tolerance). ABIs are vendored in
   `packages/sdk/src/abi/` (ABI only; the contract sources are not in this repo). The testnet market below was deployed
-  from the earlier `131c1ae` build: until it is redeployed from `aa47f7f`, session reads and `authorizeSession` from this
+  from the earlier `131c1ae` build: until it is redeployed from `ccbab74`, session reads and `authorizeSession` from this
   kit do not match it.
   Instrument id `= (expiry << 96) | (strike << 1) | isPut`; EIP-712 domain `CashOptionOrderBook` v`2`; the order struct
   string is tested against the contract's `ORDER_TYPEHASH`.

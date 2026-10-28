@@ -11,8 +11,11 @@ import {
   orderDigest,
   orderToJson,
   planClose,
+  maxPaidUntilExpiry,
+  sessionChargeOf,
   signOrder,
   type MarketClient,
+  type PlannedSessionLeg,
   type Order,
   type Position,
   type QuoteResponse,
@@ -53,8 +56,11 @@ async function quoteFor(o: Order, dryRun = false): Promise<QuoteResponse> {
   };
 }
 
-/** A MarketClient double: on-chain reads answered from fixtures, sends recorded. */
-function fakeMarket(positions: Position[]) {
+/** Caps of the fixture expiry: 150.5 / 279.5 USDG per token. */
+const CAPS = { capLow: 150_500_000n, capHigh: 279_500_000n };
+
+/** A MarketClient double: on-chain reads answered from fixtures, sends recorded; the session has `budgets` left. */
+function fakeMarket(positions: Position[], budgets = { riskLeft: 0n, spendLeft: 0n }) {
   const sends: Array<{ request: TxRequest; dryRun?: boolean }> = [];
   const m = {
     chainId: 46630,
@@ -65,6 +71,12 @@ function fakeMarket(positions: Position[]) {
     snapshot: async () => ({ account: AGENT, collateralRaw: 0n, requirementRaw: 0n, freeCollateralRaw: 0n, walletUsdgRaw: 0n, expiries: [EXPIRY], positions }),
     protocolFeeBps: async () => 50n,
     expiryMultiplier: async () => positions[0]?.uiMultiplier ?? ONE,
+    sessionCharge: async (leg: PlannedSessionLeg) => {
+      const p = positions.find((x) => x.instrumentId === leg.instrumentId)!;
+      const maxPayoutRaw = p.isPut ? p.strike - CAPS.capLow : CAPS.capHigh - p.strike;
+      const paidRaw = leg.side === "buy" ? maxPaidUntilExpiry(leg.order!, leg.quantityRaw, leg.protocolFeeBps!, NOW + 5) : undefined;
+      return sessionChargeOf({ side: leg.side, quantityRaw: leg.quantityRaw, positionBeforeRaw: leg.positionBeforeRaw ?? p.quantityRaw, maxPayoutRaw, paidRaw }, leg.key ? budgets : undefined);
+    },
     fillOrderAs: (o: Order, sig: Hex, qty: bigint, fromBalance = true, account: Address = AGENT) => encodeFillOrderAs(BOOK, account, o, sig, qty, fromBalance),
     send: async (request: TxRequest, opts: { dryRun?: boolean } = {}): Promise<SendResult> => {
       sends.push({ request, dryRun: opts.dryRun });
@@ -106,6 +118,21 @@ describe("planClose", () => {
     expect(plan.request.data.startsWith("0x18943a04")).toBe(true);
     expect(plan.request.data).toBe(encodeFillOrderAs(BOOK, AGENT, plan.quote.order, plan.quote.signature, ONE, true).data);
     expect(plan.quote.netNowRaw).toBeLessThan(0n); // the taker receives premium net of fee
+    // selling the long held opens no short: free of the short-risk budget even at 0
+    expect(plan.sessionCharge).toMatchObject({ budget: "shortRisk", openedShortRaw: 0n, chargeRaw: 0n, leftRaw: 0n, withinBudget: true });
+  });
+
+  it("with a session key, prices the close against the session's budgets (a buy-to-close is free up to the short's worst case)", async () => {
+    const { market } = fakeMarket([long, short], { riskLeft: 0n, spendLeft: 0n });
+    const { rfq } = fakeRfq();
+    const key = "0x4444444444444444444444444444444444444444" as Address;
+    const buyBack = await planClose({ market, rfq, instrumentId: PUT, sessionKey: key });
+    expect(buyBack.sessionCharge).toMatchObject({ side: "buy", budget: "spend", closedShortRaw: ONE / 2n, chargeRaw: 0n, withinBudget: true });
+    expect(buyBack.sessionCharge!.paidRaw).toBeGreaterThan(0n);
+    const partial = await planClose({ market, rfq, instrumentId: CALL, quantityRaw: ONE / 4n, sessionKey: key });
+    expect(partial.sessionCharge).toMatchObject({ chargeRaw: 0n, withinBudget: true });
+    // without a session key no budgets are read
+    expect((await planClose({ market, rfq, instrumentId: CALL })).sessionCharge).toBeUndefined();
   });
 
   it("closes a short by buying back, caps the quantity at |position| and reports the remainder of a partial close", async () => {

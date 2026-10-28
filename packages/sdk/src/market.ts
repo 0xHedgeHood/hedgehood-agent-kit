@@ -29,6 +29,7 @@ import { decodeMarketError, MarketRevertError } from "./errors.js";
 import { decodeInstrumentId, encodeInstrumentId, expiryDateNY, expiryOf, instrumentNameOf, parseInstrumentName, resolveInstrumentName, shareStrikeOf, UNIT_MULTIPLIER } from "./instrument.js";
 import { orderToTuple, SCOPE_CANCEL, SCOPE_TRADE, type Order } from "./order.js";
 import { sendTxRequest, type SendResult } from "./send.js";
+import { maxPaidUntilExpiry, maxPayoutPerToken, sessionChargeOf, sessionLimitDetail, type SessionCharge } from "./session.js";
 
 export interface MarketClientOptions {
   chainId: number;
@@ -86,7 +87,7 @@ export interface AccountSnapshot {
   positions: Position[];
 }
 
-/** `type(uint256).max`: the "unlimited" value of a session's maxRequirement / maxSpend. */
+/** `type(uint256).max`: the "unlimited" value of a session's maxShortRisk / maxSpend. */
 export const UNLIMITED = (1n << 256n) - 1n;
 
 export interface SessionInfo {
@@ -95,32 +96,54 @@ export interface SessionInfo {
   /** When the session was (re-)authorized: orders the key signed with an earlier startTime are void. */
   authorizedAt: bigint;
   scope: bigint;
-  /** Cap on the account's total requirement a session trade may push it to: 0 = no new requirement, UNLIMITED = no cap. */
-  maxRequirement: bigint;
-  /** Premium + fee (USDG raw) the key may still make the account pay as buyer: 0 = cannot buy, UNLIMITED = no cap. */
+  /**
+   * Short-risk budget left (USDG raw): the worst-case payout of the shorts the key may still open, each sell leg
+   * charged ceil(openedShort x maxPayout / 1e18) (see `session.ts`). 0 = it cannot open shorts; UNLIMITED = no cap.
+   */
+  riskLeft: bigint;
+  /**
+   * Spend budget left (USDG raw): premium + fee the key may still make the account pay as buyer beyond the worst case
+   * of the shorts a purchase closes. 0 = it may only buy to close; UNLIMITED = no cap.
+   */
   spendLeft: bigint;
   canTrade: boolean;
   canCancel: boolean;
   active: boolean;
 }
 
-/** A session cap for display: "unlimited", "none (0)" or the USDG amount. */
-export function formatSessionCap(raw: bigint): string {
-  if (raw === UNLIMITED) return "unlimited";
-  if (raw === 0n) return "none (0)";
-  const whole = raw / 1_000_000n;
-  const frac = (raw % 1_000_000n).toString().padStart(6, "0").replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : whole.toString();
-}
-
-/** Options of `authorizeSession`; both caps are explicit because 0 means "none", not "unlimited". */
+/** Options of `authorizeSession`; both budgets are explicit because 0 means "none", not "unlimited". */
 export interface AuthorizeSessionOptions {
   trade?: boolean;
   cancel?: boolean;
-  /** USDG raw cap on the account's total requirement after a session trade: 0 = no new requirement (default), UNLIMITED = no cap. */
-  maxRequirement?: bigint;
-  /** USDG raw premium + fee the key may make the account pay over the session: 0 = it cannot buy, UNLIMITED = no cap. Required. */
+  /**
+   * Cumulative short-risk budget (USDG raw): the summed worst case of the shorts the key may open over the session
+   * (each sell leg charged ceil(openedShort x maxPayout / 1e18); selling a long held is free). 0 (default) = the key
+   * cannot sell to open; UNLIMITED = no cap.
+   */
+  maxShortRisk?: bigint;
+  /**
+   * Cumulative spend budget (USDG raw): premium + fee the key may make the account pay as buyer over the session,
+   * less the worst case of the shorts a purchase closes. 0 = it may only buy to close; UNLIMITED = no cap. Required.
+   */
   maxSpend: bigint;
+}
+
+/** A leg the session key is about to fill, for `MarketClient.sessionCharge`. */
+export interface PlannedSessionLeg {
+  instrumentId: bigint;
+  /** The account's side. */
+  side: "buy" | "sell";
+  quantityRaw: bigint;
+  /** Buys: premium + fee the account pays (USDG raw); or pass `quote` + `protocolFeeBps` to bound it from the order. */
+  paidRaw?: bigint;
+  /** The order the leg takes: a buy is priced at the most it can cost until `validUntil` (`maxPaidUntilExpiry`). */
+  order?: Order;
+  protocolFeeBps?: bigint | number;
+  /** The session key; default: the signer when it is not the account. Without one, budgets are not read. */
+  key?: Address;
+  account?: Address;
+  /** The position before the fill, if already read. */
+  positionBeforeRaw?: bigint;
 }
 
 export type { SendResult } from "./send.js";
@@ -270,19 +293,53 @@ export class MarketClient {
   }
 
   async session(key: Address, account = this.requireAccount()): Promise<SessionInfo> {
-    const [expiresAt, authorizedAt, scope, maxRequirement, spendLeft] = await this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "sessions", args: [account, key] });
+    const [expiresAt, authorizedAt, scope, riskLeft, spendLeft] = await this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "sessions", args: [account, key] });
     const now = BigInt(Math.floor(Date.now() / 1000));
     return {
       key,
       expiresAt: BigInt(expiresAt),
       authorizedAt: BigInt(authorizedAt),
       scope,
-      maxRequirement,
+      riskLeft,
       spendLeft,
       canTrade: (scope & SCOPE_TRADE) !== 0n,
       canCancel: (scope & SCOPE_CANCEL) !== 0n,
       active: BigInt(expiresAt) > now && scope !== 0n,
     };
+  }
+
+  /** The account's signed position in one instrument (`position(account, id)`; 1e18 shares, negative = short). */
+  async position(instrumentId: bigint, account = this.requireAccount()): Promise<bigint> {
+    return this.publicClient.readContract({ address: this.market, abi: marketV2Abi, functionName: "position", args: [account, instrumentId] });
+  }
+
+  /** Worst-case payout per token of one short in the instrument, from its expiry's caps (`maxPayoutPerToken`). */
+  async maxPayoutPerToken(instrumentId: bigint): Promise<bigint> {
+    const { expiry, strike, isPut } = decodeInstrumentId(instrumentId);
+    const info = await this.expiryInfo(expiry);
+    if (info.openedAt === 0n) throw new RangeError(`expiry ${expiry} is not open`);
+    return maxPayoutPerToken(strike, isPut, info);
+  }
+
+  /**
+   * What a session leg will draw from the session's budgets, read from the chain: the position before the fill, the
+   * expiry's caps and (with a session key) `riskLeft` / `spendLeft`. `withinBudget: false` means the fill will revert
+   * `SessionLimit`. A buy needs `paidRaw` or the `order` it takes (priced at its most expensive point until it expires).
+   */
+  async sessionCharge(leg: PlannedSessionLeg): Promise<SessionCharge> {
+    const account = leg.account ?? this.requireAccount();
+    const key = leg.key ?? (this.signsAsSession ? this.signer!.address : undefined);
+    let paidRaw = leg.paidRaw;
+    if (leg.side === "buy" && paidRaw === undefined) {
+      if (!leg.order) throw new Error("sessionCharge: a buy needs paidRaw or the order it takes");
+      paidRaw = maxPaidUntilExpiry(leg.order, leg.quantityRaw, leg.protocolFeeBps ?? (await this.protocolFeeBps()), Math.floor(Date.now() / 1000));
+    }
+    const [positionBeforeRaw, maxPayoutRaw, session] = await Promise.all([
+      leg.positionBeforeRaw ?? this.position(leg.instrumentId, account),
+      this.maxPayoutPerToken(leg.instrumentId),
+      key ? this.session(key, account) : undefined,
+    ]);
+    return sessionChargeOf({ side: leg.side, quantityRaw: leg.quantityRaw, positionBeforeRaw, maxPayoutRaw, paidRaw }, session);
   }
 
   async isAuthorized(account: Address, signer: Address, scope = SCOPE_TRADE): Promise<boolean> {
@@ -316,13 +373,15 @@ export class MarketClient {
 
   /**
    * Simulates then (unless dryRun) signs and sends `request` from the configured signer. Simulation runs first in
-   * both cases so a dry run still reports the revert reason a send would hit.
+   * both cases so a dry run still reports the revert reason a send would hit. With the leg's `sessionCharge`
+   * (`sessionCharge()`), a `SessionLimit` revert names the budget the leg draws and what was left.
    */
-  async send(request: TxRequest, opts: { dryRun?: boolean; simulate?: boolean } = {}): Promise<SendResult> {
+  async send(request: TxRequest, opts: { dryRun?: boolean; simulate?: boolean; sessionCharge?: SessionCharge } = {}): Promise<SendResult> {
     try {
       return await sendTxRequest(this, request, opts);
     } catch (e) {
-      const decoded = decodeMarketError(e);
+      let decoded = decodeMarketError(e);
+      if (decoded?.errorName === "SessionLimit" && opts.sessionCharge) decoded = { ...decoded, hint: `${sessionLimitDetail(opts.sessionCharge)}. ${decoded.hint ?? ""}`.trim() };
       if (decoded) throw new MarketRevertError(request.summary, decoded, e);
       throw e;
     }
@@ -367,15 +426,19 @@ export class MarketClient {
   }
 
   /**
-   * `authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend)` from the owner. `maxSpend` is required: the
-   * total premium + fee the key may make the account pay (0 = it cannot buy, `UNLIMITED` = no cap). `maxRequirement`
-   * defaults to 0 (the key cannot raise the account's requirement, i.e. cannot write options). Re-authorizing resets
-   * the budget and voids every order the key signed before.
+   * `authorizeSession(key, expiresAt, scope, maxShortRisk, maxSpend)` from the owner. `maxSpend` is required: the
+   * cumulative premium + fee the key may make the account pay beyond the worst case of the shorts it buys back (0 =
+   * it may only buy to close, `UNLIMITED` = no cap). `maxShortRisk` is the cumulative worst case of the shorts the
+   * key may open; it defaults to 0 (the key cannot sell to open). Re-authorizing resets both budgets and voids every
+   * order the key signed before.
    */
   authorizeSession(key: Address, expiresAt: bigint | number, opts: AuthorizeSessionOptions): TxRequest {
-    if (opts?.maxSpend === undefined) throw new Error("authorizeSession: maxSpend is required (USDG raw the key may spend on premium + fees; 0 = cannot buy, UNLIMITED = no cap)");
+    if (opts?.maxSpend === undefined) throw new Error("authorizeSession: maxSpend is required (USDG raw the key may spend on premium + fees beyond buying back shorts; 0 = buy to close only, UNLIMITED = no cap)");
+    if ((opts as { maxRequirement?: unknown }).maxRequirement !== undefined) {
+      throw new Error("authorizeSession: maxRequirement was replaced by maxShortRisk (hedgehood-options #58): a cumulative budget of the worst-case payout of the shorts the key opens, not a cap on the account's requirement");
+    }
     const scope = ((opts.trade ?? true) ? SCOPE_TRADE : 0n) | (opts.cancel ? SCOPE_CANCEL : 0n);
-    return encodeAuthorizeSession(this.market, key, expiresAt, scope, opts.maxRequirement ?? 0n, opts.maxSpend);
+    return encodeAuthorizeSession(this.market, key, expiresAt, scope, opts.maxShortRisk ?? 0n, opts.maxSpend);
   }
 
   revokeSession(key: Address): TxRequest {

@@ -53,7 +53,11 @@ encodedInOrder }, signing { maker, signer, kind: owner|session, domain }, fundin
 canFill: bool|null, preview { canFill, shortfallRaw, collateralRaw, requirementRaw, requirementAfterRaw, cashDeltaRaw,
 mode, sessionLimitRaw, reason, note } }, fill { to, chainId, quantityRaw, default, fillOrderAs, fillOrderAsWallet,
 fillOrder, note }, dryRun, pricing }`. `canFill` is `null` when the service has no RPC for the preview (the case on the
-public testnet stack today). `dryRun: true` = no signer key mounted: placeholder signature, the kit marks the quote
+public testnet stack today). `funding.preview.sessionLimitRaw` / a `SessionLimit:requirement` reason come from the
+backend's pre-#58 model (a cap on the account's requirement); with hedgehood-options PR #58 the market charges a
+session's short-risk and spend budgets instead, and the kit prices that charge itself (`MarketClient.sessionCharge`,
+from `position`, the expiry's caps and `sessions()`), so it treats the backend field as informational until the
+backend follows. `dryRun: true` = no signer key mounted: placeholder signature, the kit marks the quote
 `fillable: false` and `fill_quote` / `hedgehood fill` refuse it.
 
 What `RfqClient.getQuote` verifies locally before returning a quote: order well formed; `chainId`, `settlement` (= the

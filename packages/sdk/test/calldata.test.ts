@@ -25,21 +25,21 @@ describe("calldata", () => {
 
   it("deposit / authorizeSession / withdraw selectors", () => {
     expect(encodeDeposit(MARKET, ME, 1n).data.slice(0, 10)).toBe("0x47e7ef24");
-    // authorizeSession(address,uint64,uint256,uint256,uint256): `cast sig` / forge methodIdentifiers @ aa47f7f
+    // authorizeSession(address,uint64,uint256,uint256,uint256): `cast sig` / forge methodIdentifiers @ aa47f7f and ccbab74 (unchanged)
     expect(encodeAuthorizeSession(MARKET, ME, 1, SCOPE_TRADE | SCOPE_CANCEL, 0n, 0n).data.slice(0, 10)).toBe("0x30f1b27a");
     expect(encodeWithdraw(MARKET, 1n, ME).to).toBe(MARKET);
   });
 
-  it("authorizeSession encodes maxRequirement and maxSpend, unlimited as type(uint256).max", () => {
+  it("authorizeSession encodes maxShortRisk and maxSpend, unlimited as type(uint256).max", () => {
     const tx = encodeAuthorizeSession(MARKET, ME, 1_800_000_000, SCOPE_TRADE, 0n, 250_000_000n);
     const d = decodeFunctionData({ abi: marketV2Abi, data: tx.data });
     expect(d.functionName).toBe("authorizeSession");
     expect(d.args).toEqual([ME, 1_800_000_000n, 1n, 0n, 250_000_000n]);
-    expect(tx.summary).toBe(`authorizeSession(${ME}, until 1800000000, scope 1, maxRequirement 0, maxSpend 250000000)`);
+    expect(tx.summary).toBe(`authorizeSession(${ME}, until 1800000000, scope 1, maxShortRisk 0, maxSpend 250000000)`);
     const open = encodeAuthorizeSession(MARKET, ME, 1_800_000_000, SCOPE_TRADE | SCOPE_CANCEL, UNLIMITED, UNLIMITED);
     expect(UNLIMITED).toBe(2n ** 256n - 1n);
     expect(decodeFunctionData({ abi: marketV2Abi, data: open.data }).args).toEqual([ME, 1_800_000_000n, 3n, UNLIMITED, UNLIMITED]);
-    expect(open.summary).toMatch(/maxRequirement unlimited, maxSpend unlimited/);
+    expect(open.summary).toMatch(/maxShortRisk unlimited, maxSpend unlimited/);
   });
 
   it("nonceMask builds one slot mask and refuses spans", () => {

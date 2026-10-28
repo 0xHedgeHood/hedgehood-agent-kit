@@ -35,8 +35,12 @@ math, `signOrder`, `verifyOrderSignature`), `calldata` (every write as an unsign
 (`positionPnl`, `formatTimeToExpiry`), `x402` (`depositViaGateway`,
 USDG preset adapted from `@priors/x402`), `identity` (ERC-8004), `vault` (`VaultClient` for the Stock Yield vaults:
 `listVaults`, `status`, owner-wallet plans `requestDeposit` / `requestRedeem` / `cancelDeposit` / `cancelRedeem` /
-`claim`, dry run by default), `send` (`sendTxRequest`), `errors` (`decodeMarketError`, `MarketRevertError`: market /
-book custom errors such as `SessionLimit` and `SessionWalletMode` with what to do), `units`. ABIs: `marketV2Abi`, `orderBookV2Abi`, `erc20Abi`,
+`claim`, dry run by default), `send` (`sendTxRequest`), `session` (session budget charges: `shortRiskCharge`,
+`spendCharge`, `sessionChargeOf`, `maxPaidUntilExpiry`, `formatSessionCap`; `MarketClient.sessionCharge` reads the
+position, caps and `riskLeft` / `spendLeft` and says whether a leg fits before it is sent; `planClose` carries it),
+`errors` (`decodeMarketError`, `MarketRevertError`: market / book / settlement source custom errors such as
+`SessionLimit`, `SessionWalletMode`, `StockControlsPaused` and `InvalidRoundHint` with what to do), `units`. ABIs:
+`marketV2Abi`, `orderBookV2Abi`, `chainlinkExpirySourceAbi`, `erc20Abi`,
 `identityRegistryAbi`, `epochFundAbi`, `vaultRegistryAbi`, `openDepositGateAbi`, `stakeThresholdGateAbi`.
 
 ```ts
