@@ -131,7 +131,7 @@ function closeView(plan: ClosePlan, underlying: string) {
 }
 
 export function createServer(ctx: KitContext): McpServer {
-  const server = new McpServer({ name: "hedgehood-options", version: "0.1.0" });
+  const server = new McpServer({ name: "hedgehood-options", version: "0.2.0" });
   const underlying = ctx.deployment.underlying;
 
   server.registerTool(
