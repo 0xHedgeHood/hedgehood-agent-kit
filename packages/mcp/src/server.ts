@@ -24,7 +24,14 @@ import {
   positionPnl,
   SCOPE_CANCEL,
   SCOPE_TRADE,
+  LTV_WARN_FRACTION,
+  type BorrowStatus,
   type ClosePlan,
+  type LendStatus,
+  type LendingPlan,
+  type OracleStatus,
+  type PlanStep,
+  type PlanStepResult,
   type QuoteResponse,
   type TxRequest,
   type VaultAccountInfo,
@@ -33,7 +40,7 @@ import {
   type VerifiedQuote,
 } from "@hedgehood-io/sdk";
 import { formatUnits } from "viem";
-import type { Address, Hex } from "viem";
+import type { Address, Chain, Hex } from "viem";
 import type { MarketClient } from "@hedgehood-io/sdk";
 import { z } from "zod";
 import { requireOwner, requireSession, type KitContext } from "./context.js";
@@ -551,6 +558,7 @@ export function createServer(ctx: KitContext): McpServer {
   );
 
   registerVaultTools(server, ctx);
+  registerLendingTools(server, ctx);
   return server;
 }
 
@@ -625,22 +633,25 @@ function planView(plan: VaultPlan) {
   return { vault: plan.vault, symbol: plan.symbol, account: plan.account, summary: plan.summary, steps: plan.steps.map((s) => ({ kind: s.kind, to: s.to, data: s.data, summary: s.summary })) };
 }
 
-/** Same gating as sendOrExplain, for a plan of one or more owner-key transactions. */
-async function sendPlanOrExplain(ctx: KitContext, plan: VaultPlan, confirm: boolean, dryRun: boolean | undefined) {
+/** Same gating as sendOrExplain, for a plan of one or more owner-key transactions (vault or lending). */
+async function runPlanOrExplain(ctx: KitContext, plan: { steps: PlanStep[]; summary: string }, client: { sendPlan: (p: never, o: { dryRun: boolean }) => Promise<PlanStepResult[]>; chain: Chain }, view: Record<string, unknown>, confirm: boolean, dryRun: boolean | undefined, extra: Record<string, unknown>) {
   const dry = dryRun ?? ctx.config.dryRunDefault;
-  if (!confirm) return json({ ...planView(plan), ok: false, needsConfirm: true, wouldSend: plan.summary, dryRun: dry, hint: "call again with confirm: true", cycle: VAULT_CYCLE });
+  if (!confirm) return json({ ...view, ok: false, needsConfirm: true, wouldSend: plan.summary, dryRun: dry, hint: "call again with confirm: true", ...extra });
   const owner = requireOwner(ctx);
-  const v = ctx.vault("owner");
   try {
-    const results = await v.sendPlan(plan, { dryRun: dry });
+    const results = await client.sendPlan(plan as never, { dryRun: dry });
     if (dry) {
-      return json({ ...planView(plan), ok: true, dryRun: true, from: owner.address, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated })), hint: `simulation passed${results.some((r) => !r.simulated) ? " (a step after an approval is not simulated until the approval is mined)" : ""}; call again with dryRun: false to broadcast`, cycle: VAULT_CYCLE });
+      return json({ ...view, ok: true, dryRun: true, from: owner.address, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated })), hint: `simulation passed${results.some((r) => !r.simulated) ? " (a step after an approval is not simulated until the approval is mined)" : ""}; call again with dryRun: false to broadcast`, ...extra });
     }
     const ok = results.length === plan.steps.length && results.every((r) => r.status === "success");
-    return json({ ...planView(plan), ok, dryRun: false, from: owner.address, steps: results.map((r) => ({ kind: r.kind, txHash: r.hash, status: r.status, blockNumber: r.blockNumber, summary: r.request.summary, explorer: `${v.chain.blockExplorers?.default.url}/tx/${r.hash}` })), cycle: VAULT_CYCLE });
+    return json({ ...view, ok, dryRun: false, from: owner.address, steps: results.map((r) => ({ kind: r.kind, txHash: r.hash, status: r.status, blockNumber: r.blockNumber, summary: r.request.summary, explorer: `${client.chain.blockExplorers?.default.url}/tx/${r.hash}` })), ...extra });
   } catch (e) {
     return fail(`${plan.summary} failed: ${errorText(e)}`);
   }
+}
+
+function sendPlanOrExplain(ctx: KitContext, plan: VaultPlan, confirm: boolean, dryRun: boolean | undefined) {
+  return runPlanOrExplain(ctx, plan, ctx.vault("owner"), planView(plan), confirm, dryRun, { cycle: VAULT_CYCLE });
 }
 
 const vaultRef = z.string().min(1).describe("Fund address, share symbol (hhNVDA-CC, NVDA-CC) or stock ticker when it names one fund (GOOGL)");
@@ -773,6 +784,310 @@ function registerVaultTools(server: McpServer, ctx: KitContext) {
         return sendPlanOrExplain(ctx, plan, confirm, dryRun);
       } catch (e) {
         return fail(`vault_cancel failed: ${errorText(e)}`);
+      }
+    },
+  );
+}
+
+// ---------------------------------------------------------------- Share lending (hhUSDG vault + Blue market on fund shares)
+
+const LENDING_NOTE =
+  "Share lending is instant (no epochs): the USDG lending vault hhUSDG is a Morpho Vault V2 (ERC-4626) whose USDG is supplied to the Morpho Blue market " +
+  "where Stock Yield fund shares (hhNVDA-CC) are collateral; interest accrues per second from borrowers. Borrowers are liquidated when the health factor falls below 1 " +
+  "(debt above LLTV 62.5% of the oracle's share value); the collateral oracle (ShareRiskOracle) is a conservative share value re-marked every week after the Monday lock, " +
+  "so keep the LTV at or below 70% of the LLTV. Collateral shares must be in the wallet: shares a fund paid out are claimed first with vault_claim, deposited shares appear " +
+  "on the account's next fund action. The market id can change (an oracle migration creates a new market); the tools read the current one from the vault. Non-US only.";
+
+const pct = (x: number | null | undefined) => (x === null || x === undefined ? null : `${(x * 100).toFixed(2)}%`);
+
+function oracleView(o: OracleStatus) {
+  return {
+    address: o.address,
+    state: o.state,
+    meaning: o.state === "live" ? "the fund's own price answers" : o.state === "held" ? "stock market closed: the feed's last print is held (decays after a long outage in trading hours)" : "no usable price: borrow, withdrawCollateral and liquidate are frozen until it answers (repay and supplyCollateral work)",
+    collateralPriceUsdgPerShare: o.collateralPriceUsdgRaw === undefined ? null : formatUsdg(o.collateralPriceUsdgRaw),
+    priceRaw: o.priceRaw,
+    stockSpot: o.spotRaw === undefined ? null : formatUnits(o.spotRaw, 18),
+    nav: o.navRaw === undefined ? null : formatUsdg(o.navRaw),
+    openCallLiabilities: o.liabilitiesRaw === undefined ? null : formatUsdg(o.liabilitiesRaw),
+    error: o.error,
+  };
+}
+
+function marketView(m: BorrowStatus["market"]) {
+  return {
+    id: m.id,
+    loanToken: m.loanToken,
+    collateralToken: m.collateralToken,
+    oracle: m.oracle,
+    irm: m.irm,
+    lltv: pct(Number(m.lltv) / 1e18),
+    lltvRaw: m.lltv,
+    oraclePriceRaw: m.oraclePriceRaw,
+    collateralPriceUsdgPerShare: m.collateralPriceUsdgRaw === null ? null : formatUsdg(m.collateralPriceUsdgRaw),
+    borrowRate: pct(m.borrowRate),
+    borrowRatePerSecondRaw: m.borrowRatePerSecondRaw,
+    utilization: pct(m.utilization),
+    totalSupply: formatUsdg(m.totalSupplyRaw),
+    totalSupplyRaw: m.totalSupplyRaw,
+    totalBorrow: formatUsdg(m.totalBorrowRaw),
+    totalBorrowRaw: m.totalBorrowRaw,
+    available: formatUsdg(m.available),
+    availableRaw: m.available,
+    isLiquidityMarket: m.isLiquidityMarket,
+    note: m.note,
+    oracleStatus: oracleView(m.oracleStatus),
+  };
+}
+
+export function lendView(s: LendStatus) {
+  return {
+    vault: s.vault,
+    name: s.name,
+    symbol: s.symbol,
+    asset: s.asset,
+    totalAssets: formatUsdg(s.totalAssetsRaw),
+    totalAssetsRaw: s.totalAssetsRaw,
+    idle: formatUsdg(s.idleRaw),
+    allocated: formatUsdg(s.allocatedRaw),
+    cap: formatUsdg(s.capRaw),
+    capRaw: s.capRaw,
+    capLeft: formatUsdg(s.capLeftRaw),
+    withdrawableNow: formatUsdg(s.liquidityRaw),
+    utilization: pct(s.utilization),
+    supplyApy: pct(s.supplyApy),
+    supplyApyNote: s.supplyApyNote,
+    performanceFee: pct(s.performanceFee),
+    market: s.market ? { id: s.market.id, borrowRate: pct(s.market.borrowRate), utilization: pct(s.market.utilization), totalBorrow: formatUsdg(s.market.totalBorrowRaw), available: formatUsdg(s.market.available), collateralToken: s.market.collateralToken, oracle: s.market.oracle } : null,
+    oracle: s.oracle ? oracleView(s.oracle) : null,
+    discovery: s.discovery === "vault" ? "market read from the vault's liquidity adapter" : "vault unreadable: market from the deployment registry",
+    my: s.my
+      ? {
+          account: s.my.account,
+          shares: formatUnits(s.my.sharesRaw, 18),
+          sharesRaw: s.my.sharesRaw,
+          assets: formatUsdg(s.my.assetsRaw),
+          assetsRaw: s.my.assetsRaw,
+          walletUsdg: formatUsdg(s.my.walletUsdgRaw),
+          walletUsdgRaw: s.my.walletUsdgRaw,
+          canDeposit: s.my.canDeposit,
+          canWithdraw: s.my.canWithdraw,
+          nextAction: s.my.sharesRaw !== 0n ? "holding hhUSDG; lend_withdraw (amount or \"all\") any time there is liquidity" : s.my.walletUsdgRaw !== 0n ? "lend_deposit to start earning" : "fund the wallet with USDG first",
+        }
+      : undefined,
+  };
+}
+
+export function borrowView(s: BorrowStatus) {
+  const my = s.my;
+  return {
+    blue: s.blue,
+    market: marketView(s.market),
+    my: {
+      account: my.account,
+      collateralShares: formatShares(my.collateralRaw),
+      collateralRaw: my.collateralRaw,
+      collateralValue: my.collateralValueRaw === null ? null : formatUsdg(my.collateralValueRaw),
+      debt: formatUsdg(my.borrowAssetsRaw),
+      borrowAssetsRaw: my.borrowAssetsRaw,
+      borrowSharesRaw: my.borrowSharesRaw,
+      maxBorrow: my.maxBorrowRaw === null ? null : formatUsdg(my.maxBorrowRaw),
+      maxBorrowRaw: my.maxBorrowRaw,
+      borrowable: my.borrowableRaw === null ? null : formatUsdg(my.borrowableRaw),
+      recommendedBorrowable: my.recommendedBorrowableRaw === null ? null : formatUsdg(my.recommendedBorrowableRaw),
+      healthFactor: my.healthFactor,
+      ltv: pct(my.ltv),
+      liquidationPriceUsdgPerShare: my.liquidationPriceUsdgRaw === null ? null : formatUsdg(my.liquidationPriceUsdgRaw),
+      liquidationPriceRaw: my.liquidationPriceRaw,
+      wallet: { fundShares: formatShares(my.walletSharesRaw), usdg: formatUsdg(my.walletUsdgRaw) },
+      nextAction:
+        my.healthFactor !== null && my.healthFactor < 1
+          ? "LIQUIDATABLE: borrow_repay or borrow_supply_collateral now"
+          : my.borrowAssetsRaw !== 0n
+            ? `debt open at health factor ${my.healthFactor}; borrow_repay (amount or "all") to reduce it, borrow_withdraw_collateral only while it stays >= 1`
+            : my.collateralRaw !== 0n
+              ? `collateral pledged, no debt: borrow_take up to ${my.recommendedBorrowableRaw === null ? "-" : formatUsdg(my.recommendedBorrowableRaw)} USDG keeps LTV <= ${LTV_WARN_FRACTION * 100}% of LLTV, or borrow_withdraw_collateral`
+              : my.walletSharesRaw !== 0n
+                ? "fund shares in the wallet: borrow_supply_collateral to pledge them"
+                : "no fund shares in the wallet: deposit into a Stock Yield vault first (vault_deposit), or vault_claim shares the fund owes you",
+    },
+    discovery: s.discovery === "vault" ? "market read from the vault's liquidity adapter" : "vault unreadable: market from the deployment registry",
+    warnings: s.warnings,
+  };
+}
+
+function lendingPlanView(plan: LendingPlan) {
+  return {
+    action: plan.action,
+    account: plan.account,
+    market: plan.market ? { id: plan.market.id, oracle: plan.market.oracle, lltv: pct(Number(plan.market.lltv) / 1e18) } : undefined,
+    summary: plan.summary,
+    warnings: plan.warnings,
+    after: plan.after ? { collateralShares: formatShares(plan.after.collateralRaw), debt: formatUsdg(plan.after.borrowAssetsRaw), healthFactor: plan.after.healthFactor, ltv: pct(plan.after.ltv), liquidationPriceUsdgPerShare: plan.after.liquidationPriceUsdgRaw === null ? null : formatUsdg(plan.after.liquidationPriceUsdgRaw) } : undefined,
+    steps: plan.steps.map((s) => ({ kind: s.kind, to: s.to, data: s.data, summary: s.summary })),
+  };
+}
+
+function sendLendingPlanOrExplain(ctx: KitContext, plan: LendingPlan, confirm: boolean, dryRun: boolean | undefined) {
+  return runPlanOrExplain(ctx, plan, ctx.lending("owner"), lendingPlanView(plan), confirm, dryRun, { note: LENDING_NOTE });
+}
+
+const marketIdField = z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional().describe("Blue market id; default: the market the lending vault currently supplies (read from the vault, so a migration needs no change)");
+const usdgOrAll = z.string().regex(/^(all|\d+(\.\d+)?)$/i);
+const sharesOrAll = z.string().regex(/^(all|\d+(\.\d+)?)$/i);
+
+function registerLendingTools(server: McpServer, ctx: KitContext) {
+  server.registerTool(
+    "lend_status",
+    {
+      title: "Lending vault status (hhUSDG)",
+      description:
+        "Hedgehood's USDG lending vault: size, idle vs supplied, the curator's cap and room left, what can be withdrawn right now, utilization and the current supply rate (borrow rate x utilization, after the 10% performance fee), the Blue market it supplies and the collateral oracle's state, plus your hhUSDG shares, their USDG value and wallet USDG. Read-only. " +
+        LENDING_NOTE,
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const s = await ctx.lending("none").lendStatus(ctx.account);
+        return json({ chainId: ctx.chainId, account: ctx.account, ...lendView(s), note: LENDING_NOTE });
+      } catch (e) {
+        return fail(`lend_status failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "lend_deposit",
+    {
+      title: "Lend USDG (owner key)",
+      description:
+        "Deposits USDG from the owner wallet into the hhUSDG lending vault for your account: ERC-20 approve when the allowance is short, then deposit(assets, onBehalf). Instant; the USDG is supplied to the Blue market and earns the supply rate from that block; withdraw any time there is unborrowed liquidity (lend_withdraw). Checks the wallet, the vault's gate and the cap first. Owner key (HEDGEHOOD_OWNER_KEY_FILE). dryRun (default true) simulates and returns the unsigned transactions; false broadcasts them in order. Requires confirm: true. " +
+        LENDING_NOTE,
+      inputSchema: { usdg: decimalAmount.describe("USDG to lend, e.g. \"100\""), receiver: address.optional().describe("Account credited with the hhUSDG shares; default: your account"), confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ usdg, receiver, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const plan = await ctx.lending("owner").planLendDeposit({ usdgRaw: parseUsdg(usdg), receiver });
+        return sendLendingPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`lend_deposit failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "lend_withdraw",
+    {
+      title: "Withdraw lent USDG (owner key)",
+      description:
+        "Withdraws USDG from the hhUSDG lending vault to the owner wallet: withdraw(assets, receiver, account) for an amount, redeem(all shares) for \"all\". Instant while the vault has liquidity (idle USDG + the market's unborrowed USDG); when borrowers hold the rest, only that much can leave until they repay. Owner key. dryRun (default true) simulates only. Requires confirm: true.",
+      inputSchema: { usdg: usdgOrAll.describe("USDG to withdraw, e.g. \"50\", or \"all\""), receiver: address.optional().describe("Recipient; default: the owner address"), confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ usdg, receiver, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const plan = await ctx.lending("owner").planLendWithdraw({ usdg, receiver });
+        return sendLendingPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`lend_withdraw failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "borrow_status",
+    {
+      title: "Borrow position on fund shares",
+      description:
+        "The Blue market where Stock Yield fund shares are collateral for USDG (default: the market the lending vault supplies; `marketId` for another): LLTV, the collateral oracle's price and state (live | held | unavailable), borrow rate, utilization, supplied / borrowed / available; and your position: collateral shares and their value, debt (interest accrued to now), max borrow at the LLTV, what you can still borrow (and what keeps LTV <= 70% of LLTV), health factor, LTV, the share price at which you would be liquidated, wallet fund shares and USDG. Read-only. " +
+        LENDING_NOTE,
+      inputSchema: { marketId: marketIdField },
+    },
+    async ({ marketId }) => {
+      try {
+        const s = await ctx.lending("none").borrowStatus(ctx.account, marketId);
+        return json({ chainId: ctx.chainId, account: ctx.account, ...borrowView(s), note: LENDING_NOTE });
+      } catch (e) {
+        return fail(`borrow_status failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "borrow_supply_collateral",
+    {
+      title: "Pledge fund shares as collateral (owner key)",
+      description:
+        "Moves Stock Yield fund shares (hhNVDA-CC) from the owner wallet into the Blue market as collateral for your account: ERC-20 approve to Blue when short, then supplyCollateral(market, shares, account). The shares must already be in the wallet: shares the fund owes you are claimed first with vault_claim; pledged shares keep earning the fund's premium (NAV) but cannot be redeemed from the fund until withdrawn from Blue. Nothing is borrowed yet; works even while the oracle is unavailable. Owner key. dryRun (default true) simulates only. Requires confirm: true. " +
+        LENDING_NOTE,
+      inputSchema: { shares: sharesOrAll.describe("Fund shares to pledge, e.g. \"10\", or \"all\" (the wallet balance)"), marketId: marketIdField, confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ shares, marketId, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const plan = await ctx.lending("owner").planSupplyCollateral({ shares, marketId });
+        return sendLendingPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`borrow_supply_collateral failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "borrow_take",
+    {
+      title: "Borrow USDG against fund shares (owner key)",
+      description:
+        `Borrows USDG from the Blue market against your pledged fund shares: borrow(market, usdg, account, receiver). Refused when the collateral oracle has no usable price, when the market lacks liquidity, or when the health factor after the loan would be below 1; WARNS when the LTV after would exceed ${LTV_WARN_FRACTION * 100}% of the LLTV (the oracle is re-marked weekly; a stock drop or a wide mark can liquidate a tight position). Interest accrues per second at the market's rate. Owner key. dryRun (default true) simulates only. Requires confirm: true. ` +
+        LENDING_NOTE,
+      inputSchema: { usdg: decimalAmount.describe("USDG to borrow, e.g. \"500\""), receiver: address.optional().describe("Recipient of the USDG; default: the owner address"), marketId: marketIdField, confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ usdg, receiver, marketId, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const plan = await ctx.lending("owner").planBorrow({ usdgRaw: parseUsdg(usdg), receiver, marketId });
+        return sendLendingPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`borrow_take failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "borrow_repay",
+    {
+      title: "Repay USDG debt (owner key)",
+      description:
+        "Repays your USDG debt on the Blue market from the owner wallet: ERC-20 approve to Blue when short, then repay by assets for an amount or by borrow shares for \"all\" (so the debt that keeps accruing until the block is cleared exactly; the approval carries a small margin). Works while the oracle is unavailable. Owner key. dryRun (default true) simulates only. Requires confirm: true.",
+      inputSchema: { usdg: usdgOrAll.describe("USDG to repay, e.g. \"100\", or \"all\""), marketId: marketIdField, confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ usdg, marketId, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const plan = await ctx.lending("owner").planRepay({ usdg, marketId });
+        return sendLendingPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`borrow_repay failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "borrow_withdraw_collateral",
+    {
+      title: "Withdraw collateral shares (owner key)",
+      description:
+        "Takes pledged fund shares back out of the Blue market to the owner wallet: withdrawCollateral(market, shares, account, receiver). With debt open the health factor after must stay at or above 1 (and the oracle must answer); \"all\" requires the debt to be repaid first. Afterwards the shares can be redeemed from the fund again (vault_redeem). Owner key. dryRun (default true) simulates only. Requires confirm: true.",
+      inputSchema: { shares: sharesOrAll.describe("Collateral shares to withdraw, e.g. \"5\", or \"all\""), receiver: address.optional().describe("Recipient; default: the owner address"), marketId: marketIdField, confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ shares, receiver, marketId, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const plan = await ctx.lending("owner").planWithdrawCollateral({ shares, receiver, marketId });
+        return sendLendingPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`borrow_withdraw_collateral failed: ${errorText(e)}`);
       }
     },
   );

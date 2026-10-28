@@ -26,8 +26,15 @@ import {
   planClose,
   pnlByInstrument,
   positionPnl,
+  LTV_WARN_FRACTION,
+  type BorrowStatus,
   type ClosePlan,
   type HistoryEvent,
+  type LendStatus,
+  type LendingPlan,
+  type OracleStatus,
+  type PlanStep,
+  type PlanStepResult,
   type PnlView,
   type TxRequest,
   type VaultInfo,
@@ -539,6 +546,7 @@ export function buildProgram(): Command {
     });
 
   registerVaultCommands(program);
+  registerLendingCommands(program);
 
   program.addOption(new Option("--dry-run", "default; sends are simulated unless --send is given").hideHelp());
   return program;
@@ -586,20 +594,24 @@ function vaultStatusHuman(v: VaultInfo): string {
   ].join("\n");
 }
 
-/** Runs a vault plan from the owner key: dry run unless --send; prints every step. */
-async function runPlan(cmd: Command, ctx: KitContext, plan: VaultPlan, sendFlag: boolean | undefined) {
-  requireOwner(ctx);
-  const v = ctx.vault("owner");
-  const results = await v.sendPlan(plan, { dryRun: !sendFlag });
-  const lines = [plan.summary, `  ${VAULT_NOTE}`];
+/** Runs a plan of owner-key steps (vault or lending): dry run unless --send; prints every step. */
+async function runSteps(cmd: Command, client: { sendPlan: (p: never, o: { dryRun: boolean }) => Promise<PlanStepResult[]>; chain: { blockExplorers?: { default: { url: string } } } }, plan: { steps: PlanStep[]; summary: string }, header: string[], jsonHead: Record<string, unknown>, sendFlag: boolean | undefined) {
+  const results = await client.sendPlan(plan as never, { dryRun: !sendFlag });
+  const lines = [...header];
   for (const r of results) {
     if (r.dryRun) lines.push(`DRY RUN${r.simulated ? " (simulation passed)" : " (not simulated: needs the approval above mined first)"}: ${r.request.summary}\n  from ${r.from}\n  to   ${r.request.to}\n  data ${r.request.data}`);
-    else lines.push(`${r.status === "success" ? "OK" : "REVERTED"} ${r.request.summary}\n  tx ${r.hash}\n  ${v.chain.blockExplorers?.default.url}/tx/${r.hash}`);
+    else lines.push(`${r.status === "success" ? "OK" : "REVERTED"} ${r.request.summary}\n  tx ${r.hash}\n  ${client.chain.blockExplorers?.default.url}/tx/${r.hash}`);
   }
   if (results.some((r) => r.dryRun)) lines.push("  add --send to broadcast");
   const failed = !results.every((r) => r.dryRun || r.status === "success") || results.length !== plan.steps.length;
-  out(cmd, { vault: plan.vault, symbol: plan.symbol, account: plan.account, summary: plan.summary, dryRun: !sendFlag, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated, txHash: r.hash, status: r.status, blockNumber: r.blockNumber })) }, lines.join("\n"));
+  out(cmd, { ...jsonHead, summary: plan.summary, dryRun: !sendFlag, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated, txHash: r.hash, status: r.status, blockNumber: r.blockNumber })) }, lines.join("\n"));
   if (failed) process.exitCode = 1;
+}
+
+/** Runs a vault plan from the owner key: dry run unless --send; prints every step. */
+async function runPlan(cmd: Command, ctx: KitContext, plan: VaultPlan, sendFlag: boolean | undefined) {
+  requireOwner(ctx);
+  await runSteps(cmd, ctx.vault("owner"), plan, [plan.summary, `  ${VAULT_NOTE}`], { vault: plan.vault, symbol: plan.symbol, account: plan.account }, sendFlag);
 }
 
 function registerVaultCommands(program: Command) {
@@ -685,6 +697,121 @@ function registerVaultCommands(program: Command) {
       const plan = which === "deposit" ? await v.planCancelDeposit({ vault: addr, to: opts.to as Address | undefined }) : await v.planCancelRedeem({ vault: addr });
       await runPlan(cmd, ctx, plan, opts.send);
     });
+}
+
+// ---------------------------------------------------------------- Share lending
+
+const LENDING_NOTE = "Instant (no epochs). Borrowers are liquidated below health factor 1; the collateral oracle is re-marked weekly after the Monday lock, so keep LTV <= 70% of the LLTV. The market id is read from the lending vault (it changes on an oracle migration).";
+
+const pctOf = (x: number | null | undefined) => (x === null || x === undefined ? "-" : `${(x * 100).toFixed(2)}%`);
+const oracleLine = (o: OracleStatus) => `oracle ${o.address} ${o.state}${o.collateralPriceUsdgRaw !== undefined ? ` ${formatUsdg(o.collateralPriceUsdgRaw)} USDG/share` : ""}${o.spotRaw !== undefined ? ` (stock ${formatUnits(o.spotRaw, 18)})` : ""}${o.error ? ` ${o.error}` : ""}`;
+
+function lendHuman(s: LendStatus): string {
+  const lines = [
+    `${s.symbol} ${s.vault} (${s.name})  total ${formatUsdg(s.totalAssetsRaw)} USDG  idle ${formatUsdg(s.idleRaw)}  supplied ${formatUsdg(s.allocatedRaw)}  cap ${formatUsdg(s.capRaw)} (room ${formatUsdg(s.capLeftRaw)})`,
+    `  supply rate ${pctOf(s.supplyApy)}  utilization ${pctOf(s.utilization)}  withdrawable now ${formatUsdg(s.liquidityRaw)}  performance fee ${pctOf(s.performanceFee)}${s.supplyApyNote ? `\n  (${s.supplyApyNote})` : ""}`,
+  ];
+  if (s.market) lines.push(`  market ${s.market.id}  borrow rate ${pctOf(s.market.borrowRate)}  borrowed ${formatUsdg(s.market.totalBorrowRaw)} of ${formatUsdg(s.market.totalSupplyRaw)}  ${oracleLine(s.market.oracleStatus)}`);
+  if (s.discovery === "config") lines.push("  (vault unreadable: market from the deployment registry)");
+  if (s.my) lines.push(`  my ${formatUnits(s.my.sharesRaw, 18)} ${s.symbol} = ${formatUsdg(s.my.assetsRaw)} USDG  wallet ${formatUsdg(s.my.walletUsdgRaw)} USDG  canDeposit ${s.my.canDeposit}  canWithdraw ${s.my.canWithdraw}`);
+  lines.push(`  ${LENDING_NOTE}`);
+  return lines.join("\n");
+}
+
+function borrowHuman(s: BorrowStatus): string {
+  const m = s.market;
+  const my = s.my;
+  const lines = [
+    `market ${m.id}${m.isLiquidityMarket ? " (the vault's liquidity market)" : ""}  LLTV ${pctOf(Number(m.lltv) / 1e18)}  collateral ${m.collateralToken}  loan ${m.loanToken}`,
+    `  ${oracleLine(m.oracleStatus)}`,
+    `  borrow rate ${pctOf(m.borrowRate)} APR  utilization ${pctOf(m.utilization)}  supplied ${formatUsdg(m.totalSupplyRaw)}  borrowed ${formatUsdg(m.totalBorrowRaw)}  available ${formatUsdg(m.available)}`,
+    `  my collateral ${formatShares(my.collateralRaw)} shares${my.collateralValueRaw !== null ? ` = ${formatUsdg(my.collateralValueRaw)} USDG` : ""}  debt ${formatUsdg(my.borrowAssetsRaw)} USDG  max borrow ${my.maxBorrowRaw === null ? "-" : formatUsdg(my.maxBorrowRaw)}  borrowable ${my.borrowableRaw === null ? "-" : formatUsdg(my.borrowableRaw)} (recommended ${my.recommendedBorrowableRaw === null ? "-" : formatUsdg(my.recommendedBorrowableRaw)})`,
+    `  health factor ${my.healthFactor ?? "-"}  LTV ${pctOf(my.ltv)}  liquidation at ${my.liquidationPriceUsdgRaw === null ? "-" : formatUsdg(my.liquidationPriceUsdgRaw) + " USDG/share"}  wallet ${formatShares(my.walletSharesRaw)} shares, ${formatUsdg(my.walletUsdgRaw)} USDG`,
+  ];
+  for (const w of s.warnings) lines.push(`  ! ${w}`);
+  lines.push(`  ${LENDING_NOTE}`);
+  return lines.join("\n");
+}
+
+function lendingJson(s: LendStatus | BorrowStatus) {
+  return s;
+}
+
+async function runLendingPlan(cmd: Command, ctx: KitContext, plan: LendingPlan, sendFlag: boolean | undefined) {
+  requireOwner(ctx);
+  const header = [plan.summary, ...plan.warnings.map((w) => `  ! ${w}`)];
+  if (plan.after) header.push(`  after: collateral ${formatShares(plan.after.collateralRaw)} shares, debt ${formatUsdg(plan.after.borrowAssetsRaw)} USDG, health factor ${plan.after.healthFactor ?? "-"}, LTV ${pctOf(plan.after.ltv)}, liquidation at ${plan.after.liquidationPriceUsdgRaw === null ? "-" : formatUsdg(plan.after.liquidationPriceUsdgRaw) + " USDG/share"}`);
+  header.push(`  ${LENDING_NOTE}`);
+  await runSteps(cmd, ctx.lending("owner"), plan, header, { action: plan.action, account: plan.account, market: plan.market?.id, warnings: plan.warnings, after: plan.after }, sendFlag);
+}
+
+function registerLendingCommands(program: Command) {
+  const lend = program.command("lend").description("Lend USDG in the hhUSDG lending vault (Morpho Vault V2; instant; owner key for writes, dry run unless --send). " + LENDING_NOTE);
+  lend
+    .command("status")
+    .description("The lending vault: size, cap, liquidity, supply rate, the market it supplies, your hhUSDG shares")
+    .action(async (_o: unknown, cmd: Command) => {
+      const ctx = ctxFrom(cmd, true);
+      const withAccount = ctx.account.toLowerCase() !== ZERO;
+      const s = await ctx.lending("none").lendStatus(withAccount ? ctx.account : null);
+      out(cmd, { account: withAccount ? ctx.account : undefined, ...lendingJson(s) }, lendHuman(s));
+    });
+  lend
+    .command("deposit")
+    .description("Lend USDG: approve + deposit(usdg, account) into the vault")
+    .argument("<usdg>")
+    .option("--receiver <address>", "account credited with the hhUSDG shares; default: the account")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (usdg: string, opts: { receiver?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const plan = await ctx.lending("owner").planLendDeposit({ usdgRaw: parseUsdg(usdg), receiver: opts.receiver as Address | undefined });
+      await runLendingPlan(cmd, ctx, plan, opts.send);
+    });
+  lend
+    .command("withdraw")
+    .description("Withdraw lent USDG (an amount, or `all` = redeem every share); instant while the vault has liquidity")
+    .argument("<usdg|all>")
+    .option("--receiver <address>", "recipient; default: the owner address")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (usdg: string, opts: { receiver?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const plan = await ctx.lending("owner").planLendWithdraw({ usdg, receiver: opts.receiver as Address | undefined });
+      await runLendingPlan(cmd, ctx, plan, opts.send);
+    });
+
+  const borrow = program.command("borrow").description("Borrow USDG against Stock Yield fund shares on Morpho Blue (owner key for writes, dry run unless --send). " + LENDING_NOTE);
+  const marketOpt = (c: Command) => c.option("--market <id>", "Blue market id; default: the market the lending vault supplies");
+  marketOpt(borrow.command("status").description("The market (LLTV, oracle, rate, liquidity) and your position (collateral, debt, health factor, LTV, liquidation price)")).action(async (opts: { market?: string }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    const s = await ctx.lending("none").borrowStatus(ctx.account, opts.market);
+    out(cmd, { account: ctx.account, ...lendingJson(s) }, borrowHuman(s));
+  });
+  marketOpt(borrow.command("collateral").description("Pledge fund shares from the wallet (or `all`): approve + supplyCollateral; claim them from the fund first (`vault claim`)").argument("<shares|all>").option("--send", "broadcast instead of dry run")).action(async (shares: string, opts: { market?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planSupplyCollateral({ shares, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
+  marketOpt(borrow.command("take").description(`Borrow USDG against the pledged shares; refused below health factor 1 or without an oracle price, warns above ${LTV_WARN_FRACTION * 100}% of the LLTV`).argument("<usdg>").option("--receiver <address>", "recipient; default: the owner address").option("--send", "broadcast instead of dry run")).action(async (usdg: string, opts: { market?: string; receiver?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planBorrow({ usdgRaw: parseUsdg(usdg), receiver: opts.receiver as Address | undefined, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
+  marketOpt(borrow.command("repay").description("Repay USDG debt (an amount, or `all` = by borrow shares, exact): approve + repay").argument("<usdg|all>").option("--send", "broadcast instead of dry run")).action(async (usdg: string, opts: { market?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planRepay({ usdg, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
+  marketOpt(borrow.command("withdraw-collateral").description("Take pledged shares back (an amount, or `all` once the debt is repaid); the health factor after must stay >= 1").argument("<shares|all>").option("--receiver <address>", "recipient; default: the owner address").option("--send", "broadcast instead of dry run")).action(async (shares: string, opts: { market?: string; receiver?: string; send?: boolean }, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    requireOwner(ctx);
+    const plan = await ctx.lending("owner").planWithdrawCollateral({ shares, receiver: opts.receiver as Address | undefined, marketId: opts.market });
+    await runLendingPlan(cmd, ctx, plan, opts.send);
+  });
 }
 
 export { privateKeyToAccount };

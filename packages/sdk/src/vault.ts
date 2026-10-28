@@ -7,7 +7,7 @@ import { stakeThresholdGateAbi } from "./abi/stakeThresholdGate.js";
 import { vaultRegistryAbi } from "./abi/vaultRegistry.js";
 import { encodeApprove, type TxRequest } from "./calldata.js";
 import { chains, getVaults, type VaultDeployment, type VaultFund } from "./chains.js";
-import { sendTxRequest, type SendResult } from "./send.js";
+import { sendPlan, sendTxRequest, type SendResult } from "./send.js";
 import { formatShares, formatUsdg } from "./units.js";
 
 /**
@@ -681,19 +681,7 @@ export class VaultClient {
    * otherwise sends them in order, waiting for each receipt, and stops at the first revert.
    */
   async sendPlan(plan: VaultPlan, opts: { dryRun?: boolean } = {}): Promise<VaultStepResult[]> {
-    const dryRun = opts.dryRun ?? true;
-    const out: VaultStepResult[] = [];
-    for (const step of plan.steps) {
-      if (dryRun) {
-        out.push({ ...(await this.send(step, { dryRun: true, simulate: step.simulate })), kind: step.kind });
-        continue;
-      }
-      const r = await this.send(step, { dryRun: false });
-      const receipt = await this.waitForReceipt(r.hash!);
-      out.push({ ...r, kind: step.kind, status: receipt.status, blockNumber: receipt.blockNumber });
-      if (receipt.status !== "success") break;
-    }
-    return out;
+    return sendPlan(this, plan, opts);
   }
 
   // ---------------------------------------------------------------- one-call conveniences

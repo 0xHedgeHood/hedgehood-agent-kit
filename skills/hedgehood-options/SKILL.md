@@ -1,6 +1,6 @@
 ---
 name: hedgehood-options
-description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinhood Chain as an AI agent through Hedgehood's RFQ market: deposit, quote, fill, close before expiry, track P&L and history, settle, redeem, with a session key that can never withdraw; and deposit into or redeem from Hedgehood's Stock Yield vaults (weekly covered-call / wheel funds on tokenized stocks, NAV shares, asynchronous epochs). Use when the user wants an agent to buy or write calls/puts on tokenized stocks, check option positions or P&L, exit a position, earn option premium passively on a stock through a vault, check or claim a vault position, or set up the Hedgehood MCP server.
+description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinhood Chain as an AI agent through Hedgehood's RFQ market: deposit, quote, fill, close before expiry, track P&L and history, settle, redeem, with a session key that can never withdraw; and deposit into or redeem from Hedgehood's Stock Yield vaults (weekly covered-call / wheel funds on tokenized stocks, NAV shares, asynchronous epochs); and lend USDG (hhUSDG vault) or borrow USDG against Stock Yield fund shares on Morpho (share lending). Use when the user wants an agent to buy or write calls/puts on tokenized stocks, check option positions or P&L, exit a position, earn option premium passively on a stock through a vault, check or claim a vault position, lend USDG for interest, borrow USDG against vault shares, or set up the Hedgehood MCP server.
 ---
 
 # Hedgehood options for agents
@@ -96,6 +96,55 @@ request for a later cohort reverts `PendingOtherEpoch`). Shares are 18 decimals,
 default true), report the tx hashes after a real send, and remind the user that the result arrives at the freeze, not
 in the receipt.
 
+## Share lending
+
+Two **instant** (no epoch) sides, both on Morpho, both owner key:
+
+- **Lend** USDG into `hhUSDG`, Hedgehood's lending vault (a Morpho Vault V2, ERC-4626). It supplies the Morpho Blue
+  market below; interest accrues every second from borrowers, less a 10% performance fee; the curator caps how much it
+  supplies. `lend_status` (size, cap left, withdrawable now, utilization, `supplyApy`, your shares and their USDG value),
+  `lend_deposit(usdg)`, `lend_withdraw(usdg | "all")`. A withdrawal is instant while the vault has unborrowed liquidity;
+  if borrowers hold it, only `withdrawableNow` can leave until they repay. With no borrowers the rate is zero: say so.
+- **Borrow** USDG against Stock Yield fund shares (`hhNVDA-CC`) on the Blue market (LLTV 62.5%):
+  `borrow_supply_collateral(shares | "all")` → `borrow_take(usdg)` → `borrow_repay(usdg | "all")` →
+  `borrow_withdraw_collateral(shares | "all")`. `borrow_status` shows the oracle price, rate, your collateral, debt
+  (accrued to now), `maxBorrow`, `recommendedBorrowable`, `healthFactor`, `ltv` and `liquidationPriceUsdgPerShare`.
+  Pledged shares keep earning the fund's premium (NAV) but cannot be redeemed from the fund until withdrawn from Blue.
+
+**Lend or borrow?** Lend when the user has idle USDG and wants interest with instant exit (risk: bad debt if a
+liquidation fails, and withdrawals waiting for repayments at high utilization). Borrow when the user holds fund shares
+and wants USDG without redeeming (which takes up to a week): the loan is instant, but the position can be liquidated.
+
+**The health-factor rule.** `healthFactor = collateral value x LLTV / debt`; below **1** anyone can liquidate the
+position (repaying debt and seizing shares at a discount). The collateral oracle (`ShareRiskOracle`) is a conservative
+share value (fund assets minus the open calls' value), **re-marked every week after the Monday lock**, so the price can
+step down on Monday even if the stock did not move. Keep the LTV at or below **70% of the LLTV** (43.75% of the
+collateral value; `recommendedBorrowable`); the tools refuse anything that ends below HF 1 and warn above that line.
+Tell the user the liquidation price after each borrow. When the oracle is `unavailable` (no usable price), borrow,
+collateral withdrawal and liquidation are frozen and the tools refuse them; repay and pledging still work. `held` means
+the stock market is closed and the last print is held.
+
+**The path from a vault to collateral.** Only shares in the owner wallet can be pledged. Shares from a deposit appear
+after the fund's freeze (on the account's next fund action); shares a fund paid out (or anything shown as `claimable`)
+need `vault_claim` first. So: `vault_deposit` → wait for the freeze → (`vault_claim` if claimable) →
+`borrow_supply_collateral` → `borrow_take`. To exit: `borrow_repay("all")` → `borrow_withdraw_collateral("all")` →
+`vault_redeem` if wanted. `"all"` on repay repays by borrow shares, so the debt that accrues until the block is cleared
+exactly (keep a little extra USDG in the wallet).
+
+**Migration note.** The mainnet market will move to a new oracle, which means a **new market id** (an audit fix). The
+tools read the current market from the lending vault (its liquidity adapter), so nothing changes for an agent; an
+old-market position is still visible with `borrow_status(marketId: <old id>)` and can be repaid / withdrawn there with
+the same `marketId` argument. Never hard-code a market id. **Non-US only**, like everything here.
+
+| symptom (lending) | meaning | do |
+|---|---|---|
+| `refusing to borrow …: health factor … < 1` | the loan would exceed LLTV x collateral value | borrow less (`recommendedBorrowable`) or pledge more |
+| `no usable price` | the ShareRiskOracle reverts (fail-closed) | wait; repay or pledge if needed; do not retry the borrow |
+| `only … USDG can be withdrawn right now` | the rest of the vault is lent out | withdraw that much now, the rest after repayments |
+| `holds … fund shares, less than …` / `claim them from the fund first` | shares not in the wallet | `vault_status`; `vault_claim`; wait for the freeze |
+| `… is still owed; repay first` | collateral `all` with debt open | `borrow_repay("all")`, then withdraw |
+| `insufficient collateral` (Blue) | the oracle moved between plan and send | `borrow_status` again, smaller amount |
+
 ## Setup (MCP server)
 
 Claude Code (plugin): `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` then `/plugin install hedgehood-options`.
@@ -122,7 +171,7 @@ OpenClaw: add the same `mcpServers` block to the agent's MCP config. Create the 
 Chain: `--testnet` (46630, default) or `--mainnet` (4663) on the `npx` command, or `HEDGEHOOD_CHAIN_ID`. The backend hosts
 default to `agent-api` / `agent-index` / `agent-pay.hedgehood.io`; a hosted read-only MCP (no keys, no fills) is at
 `https://mcp.hedgehood.io/mcp`. Add `HEDGEHOOD_OWNER_KEY_FILE` only on a machine you trust with funds (it unlocks `withdraw`, `deposit_x402` from the owner
-wallet, `authorize_session`, `register_agent`). `npx @hedgehood-io/mcp --check` prints the resolved configuration with keys
+wallet, `authorize_session`, `register_agent`, the vault writes and the lend / borrow writes). `npx @hedgehood-io/mcp --check` prints the resolved configuration with keys
 shown only as set/missing.
 
 ## Troubleshooting

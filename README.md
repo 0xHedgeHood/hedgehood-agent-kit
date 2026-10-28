@@ -16,10 +16,10 @@ RFQ maker and filled on chain with a **session key that can never withdraw**.
 
 | package | what | install |
 |---|---|---|
-| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, P&L and history readers, x402 USDG payer, ERC-8004 helpers, `VaultClient` for the Stock Yield vaults | `pnpm add @hedgehood-io/sdk viem` |
-| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 24 tools (18 market + 6 vault), every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
-| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw`, `session authorize\|revoke\|status`, `vaults`, `vault status\|deposit\|redeem\|claim\|cancel` | `npx @hedgehood-io/cli --help` |
-| [`skills/hedgehood-options`](skills/hedgehood-options/SKILL.md) | the skill an agent reads: market model, the loop, the Stock Yield vaults, key hygiene, troubleshooting | `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` |
+| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, P&L and history readers, x402 USDG payer, ERC-8004 helpers, `VaultClient` for the Stock Yield vaults, `LendingClient` for share lending (lend USDG / borrow against fund shares) | `pnpm add @hedgehood-io/sdk viem` |
+| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 32 tools (18 market + 6 vault + 8 lending), every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
+| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw`, `session authorize\|revoke\|status`, `vaults`, `vault status\|deposit\|redeem\|claim\|cancel`, `lend status\|deposit\|withdraw`, `borrow status\|collateral\|take\|repay\|withdraw-collateral` | `npx @hedgehood-io/cli --help` |
+| [`skills/hedgehood-options`](skills/hedgehood-options/SKILL.md) | the skill an agent reads: market model, the loop, the Stock Yield vaults, share lending, key hygiene, troubleshooting | `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` |
 | [`examples/`](examples) | a 30-line "agent buys a weekly call" script and an MCP config snippet | `pnpm tsx examples/buy-weekly-call.ts` |
 
 ## Quickstart (testnet, 5 minutes)
@@ -82,6 +82,33 @@ MCP: `list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_clai
 like `fill_quote`: `confirm: true`, dry run unless `dryRun: false`, owner key). The hosted read-only server exposes
 `list_vaults` / `vault_status` with the same shapes.
 
+### Share lending (mainnet 4663 and testnet)
+
+Two instant (no-epoch) sides on Morpho: **lend** USDG into the `hhUSDG` lending vault (a Morpho Vault V2, ERC-4626;
+interest accrues per second from borrowers, 10% performance fee, curator caps), or **borrow** USDG on the Morpho Blue
+market whose collateral is a Stock Yield fund share (`hhNVDA-CC`), LLTV 62.5%. The collateral oracle (`ShareRiskOracle`)
+is a conservative share value re-marked every week after the Monday lock; a position with health factor below 1 can be
+liquidated, so the tools refuse a borrow or collateral withdrawal that would end below 1 and warn above 70% of the LLTV.
+With no usable oracle price they refuse borrow / withdraw-collateral (Blue would revert); repay and pledging still work.
+Fund shares must be in the wallet to pledge: claim what a fund owes you first (`vault claim`). Owner key for every write.
+
+```sh
+hedgehood --mainnet lend status                                       # size, cap, liquidity, supply rate, your hhUSDG (no key)
+hedgehood --mainnet --owner-key-file ~/.hedgehood/owner.key lend deposit 100            # dry run: approve + deposit
+hedgehood --mainnet --owner-key-file ... lend withdraw all --send     # redeem every share (instant while liquidity allows)
+hedgehood --mainnet --account <addr> borrow status                    # LLTV, oracle, rate; collateral, debt, HF, LTV, liquidation price
+hedgehood --mainnet --owner-key-file ... borrow collateral all        # approve + supplyCollateral (fund shares from the wallet)
+hedgehood --mainnet --owner-key-file ... borrow take 50               # refused if HF < 1 after; warns above 70% of LLTV
+hedgehood --mainnet --owner-key-file ... borrow repay all --send      # repay by shares: clears the accruing debt exactly
+hedgehood --mainnet --owner-key-file ... borrow withdraw-collateral all --send
+```
+
+The market is **discovered from the lending vault** (its `liquidityAdapter` / `liquidityData` and the adapter's
+`marketIds`), with the deployment registry (`chains.ts` `lending.markets`) as the fallback, so the scheduled mainnet
+oracle migration (new market id) needs no kit release; `--market <id>` / `marketId` targets another market. MCP:
+`lend_status`, `lend_deposit`, `lend_withdraw`, `borrow_status`, `borrow_supply_collateral`, `borrow_take`, `borrow_repay`,
+`borrow_withdraw_collateral` (writes gated like `vault_deposit`).
+
 ## MCP server
 
 ```json
@@ -114,9 +141,12 @@ Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`
 `positions` (active: open positions with avg price, mark, unrealized P&L, time to expiry), `get_pnl`, `get_history`
 (past: fills, settlements, redeems), `redeem`, `withdraw` (owner key), `authorize_session` (owner key), `leaderboard`,
 `my_record`, `get_agent_record`, `register_agent` (ERC-8004, owner key), `decode_instrument`; Stock Yield vaults:
-`list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel` (owner key). Write tools
+`list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel` (owner key); share lending:
+`lend_status`, `lend_deposit`, `lend_withdraw`, `borrow_status`, `borrow_supply_collateral`, `borrow_take`, `borrow_repay`,
+`borrow_withdraw_collateral` (owner key). Write tools
 (`fill_quote`, `close_position`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`,
-`vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel`) do nothing without `confirm: true`; with it they simulate
+`vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel`, `lend_deposit`, `lend_withdraw`, `borrow_*` except
+`borrow_status`) do nothing without `confirm: true`; with it they simulate
 and return the unsigned transaction(s) unless `dryRun: false`, and then report the tx hash(es).
 
 ## Security model
@@ -169,6 +199,15 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
   the public `GET https://hedgehood.app/api/stockyield/funds` when it answers, else from the chain. Testnet 46630:
   registry `0xBeE38aF4Fc4f50A0C04bDdA45Bec6cBABFf476b9`, one fund `hhNVDA-CC` `0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4`
   on open-mint tNVDA2 (fixture feed; not mainnet configuration).
+- Share lending (Morpho Blue `morpho-org/morpho-blue` 8e26ca6, AdaptiveCurveIrm `morpho-blue-irm` b9a5806, Vault V2
+  `morpho-org/vault-v2` 10ed1ea + `MorphoMarketV1AdapterV2`, hedgehood-vaults `contracts/src/collateral/ShareRiskOracle.sol`
+  at `dd9bddd`; ABIs vendored with `scripts/vendor-abis.mjs --lending`). Mainnet 4663: canonical Blue
+  `0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010`, lending vault `hhUSDG` `0x54Bc097643BB9fd4ab004f11859893655529E954`
+  (adapter `0xdEbAd49D242967CBf0DDAe8626873ad54cF7878A`, Safe owner/curator, 24 h timelock, cap 20k USDG, fee 10%),
+  market `0x789202f8…b7aa` (hhNVDA-CC vs USDG, oracle `0x6EcA44BBB41D3176A451910C4f735A51AdAb4237`, IRM `0x2BD3…0fa1`, LLTV
+  62.5%; to be migrated to a new oracle and market id, which the kit picks up from the vault). Testnet 46630: test Blue
+  `0xa0BA91A2F99894044CCD82cA48e5C795BA7570B6`, vault `0x6ab073F0E3F1610C4Ad9e7Dc19Ca25F831682f00`, v5 market
+  `0x375cd2da…32df` (PoC parameters, not mainnet configuration).
 
 ## Development
 
@@ -176,6 +215,7 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
 pnpm install
 pnpm -r typecheck && pnpm -r test && pnpm -r build
 node scripts/vendor-abis.mjs <hedgehood-options/contracts/out> <commit>   # refresh ABIs after a contract change
+node scripts/vendor-abis.mjs --lending <hedgehood-vaults checkout> <commit>  # Blue, IRM, ShareRiskOracle, Vault V2 + adapter
 ```
 
 See [RELEASING.md](RELEASING.md) (npm) and [REGISTRIES.md](REGISTRIES.md) (MCP registry, Smithery, Glama, plugin

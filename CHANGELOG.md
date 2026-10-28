@@ -24,6 +24,22 @@ Stock Yield vaults: agents deposit into and withdraw from Hedgehood's v2 `EpochF
   `vault_cancel` (writes gated like `fill_quote`: `confirm` + `dryRun` / `HEDGEHOOD_DRY_RUN`; owner key). The server
   now starts on mainnet 4663, where only the vaults are deployed (`ctx.marketDeployment` is optional; market tools
   report the missing listing). `HEDGEHOOD_VAULT_API_URL` (`off` = chain only). 24 tools; 5 new tests (16 total).
+- Share lending (same release): `@hedgehood-io/sdk` `LendingClient`: `lendStatus(account)` (vault size, idle /
+  allocated, cap and room, withdrawable now, utilization, supply rate = borrow rate x utilization x (1 - fee), the
+  account's hhUSDG shares and value), `planLendDeposit` (approve + `deposit`) / `planLendWithdraw` (amount = `withdraw`,
+  `"all"` = `redeem` every share), `borrowStatus(account, marketId?)` (LLTV, oracle price and state, rate, totals; the
+  account's collateral, accrued debt, max borrow, health factor, LTV, liquidation price), and the plans
+  `planSupplyCollateral` (approve + `supplyCollateral`), `planBorrow`, `planRepay` (`"all"` repays by shares) and
+  `planWithdrawCollateral`, all through the shared `sendPlan` (moved to `send.ts`; `VaultClient.sendPlan` uses it). Guards:
+  a borrow or collateral withdrawal ending below health factor 1, or made while the `ShareRiskOracle` has no price, is
+  refused; the plan warns above 70% of LLTV. The market is discovered from the vault's liquidity adapter and allocated
+  market ids (`discoverMarkets`), with the new `lending` entry of the deployment registry as fallback (mainnet: Blue
+  `0x9D53…1010`, vault `0x54Bc…E954`, market `0x7892…b7aa`; testnet: test Blue `0xa0BA…70B6`, vault `0x6ab0…2f00`, v5
+  market `0x375c…32df`). ABIs vendored with `scripts/vendor-abis.mjs --lending` from hedgehood-vaults `dd9bddd`
+  (`morphoBlueAbi`, `adaptiveCurveIrmAbi`, `shareRiskOracleAbi`, `vaultV2Abi`, `morphoMarketV1AdapterV2Abi`). CLI:
+  `lend status|deposit|withdraw`, `borrow status|collateral|take|repay|withdraw-collateral` (`--market`, `--send`,
+  `--json`). MCP: `lend_status`, `lend_deposit`, `lend_withdraw`, `borrow_status`, `borrow_supply_collateral`,
+  `borrow_take`, `borrow_repay`, `borrow_withdraw_collateral` (32 tools). Tests: SDK 83, MCP 22, CLI 17.
 - Docs: README (vault quickstart, tool and command lists, addresses), `docs/BACKEND_API.md` (the funds API and the
   hosted-MCP tool names), the skill's "Stock Yield vaults" section (vault vs market, the three-step flow, up to a week
   to redeem, non-US only), `AGENTS.md`. Versions are not bumped in this change.

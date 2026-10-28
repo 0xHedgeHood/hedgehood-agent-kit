@@ -37,3 +37,38 @@ export async function sendTxRequest(s: Sender, request: TxRequest, opts: { dryRu
   const hash = await wallet.sendTransaction({ to: request.to, data: request.data, value: request.value ?? 0n });
   return { dryRun: false, request, hash, from, simulated: simulate };
 }
+
+/** One step of a plan: an unsigned transaction with a kind tag and whether a dry run can simulate it on its own. */
+export interface PlanStep extends TxRequest {
+  kind: string;
+  /** False for a step that only succeeds after an earlier step of the plan is mined (an approve, typically). */
+  simulate: boolean;
+}
+
+export interface PlanStepResult<K extends string = string> extends SendResult {
+  kind: K;
+  status?: "success" | "reverted";
+  blockNumber?: bigint;
+}
+
+/**
+ * Runs a plan of owner-wallet transactions: a dry run (default) simulates every step that can be simulated and returns
+ * the unsigned transactions; otherwise it sends them in order, waits for each receipt and stops at the first revert.
+ * Shared by the vault and lending clients.
+ */
+export async function sendPlan<S extends PlanStep>(s: Sender, plan: { steps: S[] }, opts: { dryRun?: boolean } = {}): Promise<Array<PlanStepResult<S["kind"]>>> {
+  const dryRun = opts.dryRun ?? true;
+  const out: Array<PlanStepResult<S["kind"]>> = [];
+  for (const step of plan.steps) {
+    const kind = step.kind as S["kind"];
+    if (dryRun) {
+      out.push({ ...(await sendTxRequest(s, step, { dryRun: true, simulate: step.simulate })), kind });
+      continue;
+    }
+    const r = await sendTxRequest(s, step, { dryRun: false });
+    const receipt = await s.publicClient.waitForTransactionReceipt({ hash: r.hash! });
+    out.push({ ...r, kind, status: receipt.status, blockNumber: receipt.blockNumber });
+    if (receipt.status !== "success") break;
+  }
+  return out;
+}

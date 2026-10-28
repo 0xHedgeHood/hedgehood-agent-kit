@@ -35,7 +35,12 @@ describe("hedgehood cli", () => {
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();
-    expect(names).toEqual(["close", "decode", "deposit", "fill", "history", "instruments", "join", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
+    expect(names).toEqual(["borrow", "close", "decode", "deposit", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
+    const lend = p.commands.find((c) => c.name() === "lend")!;
+    expect(lend.commands.map((c) => c.name()).sort()).toEqual(["deposit", "status", "withdraw"]);
+    const borrow = p.commands.find((c) => c.name() === "borrow")!;
+    expect(borrow.commands.map((c) => c.name()).sort()).toEqual(["collateral", "repay", "status", "take", "withdraw-collateral"]);
+    for (const name of ["collateral", "repay", "take", "withdraw-collateral"]) expect(borrow.commands.find((c) => c.name() === name)!.options.some((o) => o.long === "--send"), name).toBe(true);
     const session = p.commands.find((c) => c.name() === "session")!;
     expect(session.commands.map((c) => c.name()).sort()).toEqual(["authorize", "revoke", "status"]);
     const vault = p.commands.find((c) => c.name() === "vault")!;
