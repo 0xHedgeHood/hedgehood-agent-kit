@@ -3,7 +3,7 @@ import { encodeInstrumentId, formatSignedUsdg, formatTimeToExpiry, positionPnl, 
 
 const EXPIRY = 1793390400n;
 const NOW = Number(EXPIRY) - 2 * 86400 - 3 * 3600 - 7 * 60;
-const pos: Position = { instrumentId: encodeInstrumentId(EXPIRY, 220_000_000n, false), expiry: EXPIRY, strike: 220_000_000n, isPut: false, quantityRaw: 2n * 10n ** 18n };
+const pos: Position = { instrumentId: encodeInstrumentId(EXPIRY, 220_000_000n, false), expiry: EXPIRY, strike: 220_000_000n, shareStrike: 220_000_000n, uiMultiplier: 10n ** 18n, isPut: false, quantityRaw: 2n * 10n ** 18n };
 const pnl: PnlView = {
   account: "0x3333333333333333333333333333333333333333",
   asOf: NOW,

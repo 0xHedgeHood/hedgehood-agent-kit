@@ -21,8 +21,15 @@ kit reads and the `chainId` it expects in quotes. Today the backend's registry h
 Conventions: JSON; integers that may exceed 2^53 are decimal strings (`*Raw`: USDG raw 6 decimals, shares 18 decimals);
 prices per share (`bid`/`ask`/`mid`, `price.start/end`, `markPrice`) are JSON numbers in USDG per share; times unix
 seconds; errors `{ "error": <code>, "reason": <text> }`. Instruments are named `UNDERLYING-YYYYMMDD-STRIKE-C|P` with the
-New York date and the USD strike as Python `f"{usd:g}"` prints it (`NVDA-20261030-220-C`, `…-222.5-P`); the kit
-derives the name from an id with `instrumentName()` and resolves a name with `resolveInstrumentName()`.
+New York date and the **listed per-share** strike in USD as Python `f"{usd:g}"` prints it (`NVDA-20261030-220-C`,
+`…-222.5-P`). Since hedgehood-options PR #54 (`aa47f7f`) the market lays its grid in listed per-share USD and stores
+each strike per token as `k = round(shareStrike x M / 1e18)`, M = the expiry's snapshotted `uiMultiplier`; the name's
+strike is `round(k x 1e18 / M)` (NVDA mainnet M = 1.000775159164630595: id strike 220.170535, name `…-220-C`). The
+kit derives the name from an id with `instrumentName(…, uiMultiplier)` / `MarketClient.instrumentName(id)` and
+resolves a name against the expiry's strikes with `MarketClient.resolveInstrumentName()`; quote requests
+(`QuoteRequest.uiMultiplier`) and marks send the per-share name. With M = 1e18 (testnet tNVDA2) nothing changes. The
+backend must name and parse the same way (`rfq/registry.py` `strike_entry` / `instrument_key` keyed `usd = raw / 1e6`
+at `18d189c`: per-token, so it agrees only while M = 1e18).
 
 ## RFQ
 
@@ -116,5 +123,77 @@ the owner key) works.
 
 `https://mcp.hedgehood.io/mcp` (Python FastMCP, stateless streamable HTTP, JSON responses): `list_markets`,
 `list_instruments`, `get_mark`, `get_quote(instrument, side, quantity, account, session_key?)`, `get_positions`,
-`get_leaderboard`, `get_agent_record`, `how_to_deposit`. Read-only and keyless; the local `@hedgehood-io/mcp` adds the
-signing tools (`fill_quote`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`).
+`get_leaderboard`, `get_agent_record`, `how_to_deposit`, and for the Stock Yield vaults `list_vaults` and
+`vault_status(account, vault?)` with the shapes below. Read-only and keyless; the local `@hedgehood-io/mcp` adds the
+signing tools (`fill_quote`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`,
+`vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel`, and the share-lending writes).
+Share lending adds the read-only `lend_status(account)` and `borrow_status(account, marketId?)` (shapes below); the
+local server also has the writes `lend_deposit`, `lend_withdraw`, `borrow_supply_collateral`, `borrow_take`,
+`borrow_repay`, `borrow_withdraw_collateral`.
+
+## Stock Yield funds API (hedgehood.app)
+
+`GET https://hedgehood.app/api/stockyield/funds` (keyuyuan/rh `rhsvc/stockyield_funds.py`, served by the hedgehood.app
+API behind a 30 s warm cache; mainnet 4663 only; no auth) → `{ chainId, funds: [row], builtAt }`. A row is the fund's
+on-chain snapshot with every integer as a decimal string: `{ chainId, vault, name, symbol, stock, stockSymbol, usdg,
+usdgSymbol, strategy { address, name, code, legs[] } | null, depositGate, paused, phase, effectivePhase
+(Collecting|Locked|Frozen), currentEpoch, schedules { "<epoch>": { depositCutoff, tradeStart, tradeEnd, expiry,
+maxAtmDeviationBps } } (current and the next two), depositCapUsdg, stockHeld, usdgHeld, pendingStock, pendingUsdg,
+reservedStock, reservedUsdg, totalSupply, markPrice, price (live Oracle price, "0" while the market is closed), readAt,
+epochs: [{ navUsdg, income, settledAt, navPrice?, depositStock?, depositUsdg?, depositsRefunded? }] (last settled epochs,
+newest first), stake (HEDGE threshold, 0 = open gate), feeBps }`; a fund the API could not read comes back as `{ vault,
+error }` and is read from the chain instead. Override with `HEDGEHOOD_VAULT_API_URL` / `--vault-api-url` (`off` =
+chain only). The kit never trusts the API for the fund list: `VaultRegistry.vaults()` on chain is authoritative and API
+rows are joined by address; the account's shares, queues and claimables are always read on chain.
+
+`list_vaults` / `vault_status` shape (the hosted MCP serves the same): per fund `{ vault, symbol, name, strategy { code,
+name }, stock { address, symbol, decimals: 18 }, usdg, gate { address, kind: open|stake|none|unknown }, paused,
+depositCap, capUsed, capLeft, totalShares, holdings { stock, usdg }, nav { usdgPerShare | null, navUsdg, stockPrice,
+source: live|mark|none }, epoch { index, state: open|frozen|locked|settling, phase, nextFreezeAt, nextSettleAt,
+nextCohort, schedule }, lastEpoch { index, premiumIncome, navAtFreeze, weeklyYield, settledAt } | null, feeBps?,
+source: api|chain, my { account, shares, uncreditedShares?, pendingDeposit { epoch, usdg, stock, cancellable } | null,
+pendingRedeem { epoch, shares, cancellable } | null, claimable { stock, usdg }, canDeposit, wallet { usdg, stock },
+nextAction } }`. Amounts are decimal strings (USDG 6 decimals, shares and stock 18), times ISO-8601. `state` is
+derived from the contract's `phase` and the epoch schedule: `open` while collecting before the cutoff, `frozen` once
+the cutoff passed (freeze done or overdue) until an engine locks, `locked` until the expiry, `settling` after it;
+`nextFreezeAt` is the cutoff of the cohort a request made now would join, `nextSettleAt` the current epoch's expiry.
+`weeklyYield` = the last settled epoch's premium income over the NAV it started with (assets at the freeze plus that
+cohort's deposits).
+
+## Share lending (chain only)
+
+No backend: everything is read from the chain (`packages/sdk/src/lending.ts`, `LendingClient`). Contracts: the USDG
+lending vault `hhUSDG` (Morpho Vault V2, ERC-4626), its `MorphoMarketV1AdapterV2`, Morpho Blue, the market's
+`AdaptiveCurveIrm` and its `ShareRiskOracle`; addresses in `chains.ts` `lending`.
+
+**Market discovery** (what the hosted MCP must mirror, so a migration needs no redeploy): read `vault.liquidityAdapter()`
+and `vault.liquidityData()`; the data is `abi.encode(MarketParams(loanToken, collateralToken, oracle, irm, lltv))` and its
+`keccak256` is the market new deposits go to (the default market). Then `adapter.marketIdsLength()` / `marketIds(i)`
+lists every market with a non-zero allocation; `blue.idToMarketParams(id)` gives their params. Only when the vault
+cannot be read fall back to the registry list. The vault's caps per market are `vault.absoluteCap(id)` /
+`allocation(id)` for the three adapter ids: `keccak256(abi.encode("this", adapter))`,
+`keccak256(abi.encode("collateralToken", collateral))`, `keccak256(abi.encode("this/marketParams", adapter, params))`.
+
+**Math.** Market totals are accrued to the current block as Blue does (`borrowRateView` x elapsed, three-term Taylor,
+fee shares). Debt = `toAssetsUp(borrowShares, totalBorrowAssets, totalBorrowShares)` (virtual 1e6 shares / 1 asset).
+Collateral value = `collateral x oracle.price() / 1e36`; max borrow = value x LLTV; health factor = max borrow / debt
+(null with no debt); LTV = debt / value; liquidation price (1e36) = `ceil(debt x 1e36 x 1e18 / (collateral x lltv))`,
+in USDG per share = price / 1e18. Supply rate = borrow rate (simple annual) x utilization x (1 - Blue fee) x allocated /
+totalAssets x (1 - performance fee), capped at the vault's `maxRate`; null with a note when there is no market.
+Oracle state: `price()` reverts = `unavailable` (borrow / withdrawCollateral / liquidate frozen; tools refuse those),
+else `spot()` `live` flag true = `live`, false = `held` (market closed: last print held).
+
+`lend_status` shape: `{ chainId, account, vault, name, symbol, asset, totalAssets, totalAssetsRaw, idle, allocated, cap,
+capRaw, capLeft, withdrawableNow, utilization, supplyApy, supplyApyNote, performanceFee, market { id, borrowRate,
+utilization, totalBorrow, available, collateralToken, oracle } | null, oracle <oracleStatus> | null, discovery, my {
+account, shares, sharesRaw, assets, assetsRaw, walletUsdg, walletUsdgRaw, canDeposit, canWithdraw, nextAction } }`.
+
+`borrow_status` shape: `{ chainId, account, blue, market { id, loanToken, collateralToken, oracle, irm, lltv, lltvRaw,
+oraclePriceRaw, collateralPriceUsdgPerShare, borrowRate, borrowRatePerSecondRaw, utilization, totalSupply,
+totalSupplyRaw, totalBorrow, totalBorrowRaw, available, availableRaw, isLiquidityMarket, note, oracleStatus { address,
+state: live|held|unavailable, meaning, collateralPriceUsdgPerShare, priceRaw, stockSpot, nav, openCallLiabilities,
+error } }, my { account, collateralShares, collateralRaw, collateralValue, debt, borrowAssetsRaw, borrowSharesRaw,
+maxBorrow, maxBorrowRaw, borrowable, recommendedBorrowable, healthFactor, ltv, liquidationPriceUsdgPerShare,
+liquidationPriceRaw, wallet { fundShares, usdg }, nextAction }, discovery, warnings[] }`. Percentages are strings
+("44.67%"), USDG amounts decimal strings with 6 decimals, shares 18, `*Raw` integer strings; `healthFactor` is a number
+(4 decimals) or null.

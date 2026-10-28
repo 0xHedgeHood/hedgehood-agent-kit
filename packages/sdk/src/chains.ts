@@ -60,6 +60,75 @@ export interface ChainDeployment {
   /** Hedgehood agent-market backend hosts (the same hosts serve both chains; the chain id selects the deployment). */
   api: BackendHosts;
   markets: MarketDeployment[];
+  /** The Stock Yield vaults (v2 `EpochFund` hub) on this chain, when deployed. */
+  vaults?: VaultDeployment;
+  /** Share lending (a Morpho Blue market on fund shares + the USDG lending vault) on this chain, when deployed. */
+  lending?: LendingDeployment;
+}
+
+/** One Morpho Blue market; its id is `keccak256(abi.encode(loanToken, collateralToken, oracle, irm, lltv))`. */
+export interface LendingMarket {
+  id: `0x${string}`;
+  loanToken: Address;
+  /** The fund share token (an `EpochFund`) pledged as collateral. */
+  collateralToken: Address;
+  /** `ShareRiskOracle`: a conservative share value in Blue's 1e36 price format, marked weekly after the Monday lock. */
+  oracle: Address;
+  irm: Address;
+  /** Liquidation loan-to-value, WAD (625000000000000000n = 62.5%). */
+  lltv: bigint;
+  note?: string;
+}
+
+/**
+ * Share lending on one chain: the Morpho Blue core, the USDG lending vault (Morpho Vault V2, ERC-4626, "hhUSDG") whose
+ * liquidity adapter supplies the Blue market, and the market list at the time of writing. The vault is the source of
+ * truth at runtime: `LendingClient.discoverMarkets()` reads its liquidity adapter / data and the adapter's allocated
+ * market ids, and only falls back to `markets` here when that fails, so a market migration (a new oracle means a new
+ * market id) needs no code change for agents.
+ */
+export interface LendingDeployment {
+  /** Morpho Blue core (canonical on mainnet; a test instance on testnet). */
+  blue: Address;
+  /** The USDG lending vault (Morpho Vault V2, ERC-4626). */
+  vault: Address;
+  /** The vault's `MorphoMarketV1AdapterV2` at the time of writing (re-read from the vault at runtime). */
+  adapter?: Address;
+  usdg: Address;
+  markets: LendingMarket[];
+  deployBlock?: bigint;
+  note?: string;
+}
+
+/** One Stock Yield fund: an `EpochFund` holding one tokenized stock and USDG, issuing transferable NAV shares. */
+export interface VaultFund {
+  /** Share symbol, e.g. "hhNVDA-CC" (hh + stock + strategy code). */
+  symbol: string;
+  vault: Address;
+  /** The 18-decimal stock token the fund holds. */
+  stock: Address;
+  stockSymbol: string;
+  /** Strategy code: CC (covered call), WHEEL, CSP, CCC. */
+  strategy: string;
+}
+
+/**
+ * The v2 Stock Yield vault stack on one chain: the `VaultRegistry` that lists the funds (the on-chain source of truth
+ * at runtime; `funds` below is the list at the time of writing, for symbol lookup and documentation), the deposit gates
+ * the funds use, and the public read API (mainnet only) `VaultClient.listVaults` enriches from.
+ */
+export interface VaultDeployment {
+  registry: Address;
+  /** `OpenDepositGate`: admits every account the owner has not banned (every mainnet fund since 2026-10-18). */
+  openGate?: Address;
+  /** `StakeThresholdGate`: admits accounts meeting the HEDGE staking threshold (the initial mainnet gate). */
+  stakeGate?: Address;
+  usdg: Address;
+  funds: VaultFund[];
+  /** `GET` → `{ chainId, funds: [...], builtAt }`: the funds' on-chain snapshots, read once for every visitor. */
+  api?: string;
+  deployBlock?: bigint;
+  note?: string;
 }
 
 /** The backend services (hedgehood-options `feat/rfq-backend`): RFQ quote service, indexer, x402 deposit gateway, hosted read-only MCP. */
@@ -109,9 +178,39 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
         source: "0xc599E3B843D30010b555A08E041Db77DAE33DBb9",
         deployBlock: 143952569n,
         protocolFeeBps: 50,
-        note: "tNVDA2 on Robinhood testnet, deployed 2026-10-28; fixture feeds, not mainnet configuration",
+        // built from hedgehood-options 131c1ae (before PR #54): its sessions()/authorizeSession predate the spend
+        // budget the vendored aa47f7f ABI encodes; replace with the redeployed market + book once they exist
+        note: "tNVDA2 on Robinhood testnet, deployed 2026-10-28 from the pre-audit-fix build; fixture feeds, not mainnet configuration",
       },
     ],
+    vaults: {
+      registry: "0xBeE38aF4Fc4f50A0C04bDdA45Bec6cBABFf476b9",
+      openGate: "0x5b4EE28Efc1f545f9D24f9474F0AeE9c22f8eBD6",
+      stakeGate: "0x4afEE26277FAd0CC57da204126ceCC4Ae694a5B7",
+      usdg: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d",
+      funds: [{ symbol: "hhNVDA-CC", vault: "0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4", stock: "0x267ddeE02B44FDF4D073E124869DaA5BDbF1759D", stockSymbol: "NVDA", strategy: "CC" }],
+      deployBlock: 134760389n,
+      note: "v2 hub pilot redeployed 2026-10-14 (hedgehood-vaults local/testnet-hub-20261013-2359/deployment.json); the fund's depositGate() is an OpenDepositGate (read on chain 2026-10-28); open-mint tNVDA2, fixture feed, TestnetOwnerModule owner: not mainnet configuration",
+    },
+    lending: {
+      blue: "0xa0BA91A2F99894044CCD82cA48e5C795BA7570B6",
+      vault: "0x6ab073F0E3F1610C4Ad9e7Dc19Ca25F831682f00",
+      adapter: "0x89ace3cb69f676d41aBa380563F267cD7b8A98f3",
+      usdg: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d",
+      markets: [
+        {
+          id: "0x375cd2da2b6d1cdd8288331d388f795784917a0ac704732e91c92bde6b9832df",
+          loanToken: "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d",
+          collateralToken: "0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4",
+          oracle: "0x1291A39e96Cd1ce736084548b15532D9a8D4bE77",
+          irm: "0xAf61C1DEDffD90D39E7D90641A8AB1B59497a9fF",
+          lltv: 625000000000000000n,
+          note: "v5 oracle market on the test Blue instance (hedgehood-vaults local/share-collateral-a/deployment-46630-v5.json)",
+        },
+      ],
+      deployBlock: 139866161n,
+      note: "test Blue instance + AdaptiveCurveIrm copy, hhNVDA-CC shares vs tUSDG, v5 ShareRiskOracle; lending vault hhUSDG (local/share-collateral-a/lending-vault-46630.json, timelock 0, EOA curator): PoC parameters, not mainnet configuration",
+    },
   },
   4663: {
     chainId: 4663,
@@ -122,8 +221,58 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
     identityRegistry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
     api: HEDGEHOOD_API,
     markets: [], // V2 not deployed on mainnet yet (pending audit)
+    vaults: {
+      registry: "0x868502F926AE068B61EA9CC55042A9F962651e76",
+      openGate: "0x337B27c931873e6Ef087e8f84034b96F1d6eeFA5",
+      stakeGate: "0xDE1c8Af7ac54D8422Bbc80A9fb2278a5fFB87e15",
+      usdg: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      funds: [
+        { symbol: "hhNVDA-CC", vault: "0x4a1c42b0E0D229B677D574d3dCdc2A5Dff848373", stock: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", stockSymbol: "NVDA", strategy: "CC" },
+        { symbol: "hhNVDA-WHEEL", vault: "0x78FA8c1294553894F7AD7f2eDf4D1E17B61188bD", stock: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC", stockSymbol: "NVDA", strategy: "WHEEL" },
+        { symbol: "hhGOOGL-CC", vault: "0x70E8198C7281d9FC42eE828DD7fa80732b0dBF13", stock: "0x2e0847E8910a9732eB3fb1bb4b70a580ADAD4FE3", stockSymbol: "GOOGL", strategy: "CC" },
+        { symbol: "hhTSLA-CC", vault: "0x2b62087D9065D106FEb5547e63370A67b6097b8C", stock: "0x322F0929c4625eD5bAd873c95208D54E1c003b2d", stockSymbol: "TSLA", strategy: "CC" },
+        { symbol: "hhAMZN-CC", vault: "0x40ddB6576840F636122A9C7afe94f45Cf744902d", stock: "0x12f190a9F9d7D37a250758b26824B97CE941bF54", stockSymbol: "AMZN", strategy: "CC" },
+        { symbol: "hhMETA-CC", vault: "0x4E41Ef5EBdad32fA336E4b6d8968a974E71ccb1F", stock: "0xc0D6457C16Cc70d6790Dd43521C899C87ce02f35", stockSymbol: "META", strategy: "CC" },
+        { symbol: "hhAAPL-CC", vault: "0xE0bBb2aAB7399E6140cA48970894333f0618CE80", stock: "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9", stockSymbol: "AAPL", strategy: "CC" },
+        { symbol: "hhMSFT-CC", vault: "0xaEBfBDc1965C6466988b8F55a04945FC25a43e89", stock: "0xe93237C50D904957Cf27E7B1133b510C669c2e74", stockSymbol: "MSFT", strategy: "CC" },
+      ],
+      api: "https://hedgehood.app/api/stockyield/funds",
+      note: "deployed 2026-10-15, OpenDepositGate since 2026-10-18 (hedgehood-vaults docs/OPTION_VAULT_V2.md, contracts/script/config/v2.4663.json); owner Safe 0xB5C9…489b; Sourcify-verified",
+    },
+    lending: {
+      blue: "0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010",
+      vault: "0x54Bc097643BB9fd4ab004f11859893655529E954",
+      adapter: "0xdEbAd49D242967CBf0DDAe8626873ad54cF7878A",
+      usdg: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      markets: [
+        {
+          id: "0x789202f84d066bdad8115d39d5dea0af80ccd52dd6727461d98daa638ed9b7aa",
+          loanToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+          collateralToken: "0x4a1c42b0E0D229B677D574d3dCdc2A5Dff848373",
+          oracle: "0x6EcA44BBB41D3176A451910C4f735A51AdAb4237",
+          irm: "0x2BD3d5965B26B51814AC95127B2b80dD6CcC0fa1",
+          lltv: 625000000000000000n,
+          note: "collateral-01: hhNVDA-CC shares vs USDG, live 2026-10-26 (hedgehood-vaults local/share-collateral-a/deployment-4663.json). Scheduled to migrate to a new ShareRiskOracle (new market id) before 2026-12-24; the vault's liquidity market is read at runtime",
+        },
+      ],
+      note: "canonical Morpho Blue on Robinhood Chain, AdaptiveCurveIrm 0x2BD3…0fa1, LLTV 62.5%; lending vault hhUSDG = Morpho Vault V2 (local/share-collateral-a/lending-vault-4663.json): owner/curator/allocator Safe 0xB5C9…489b, 24 h timelock, absolute cap 20k USDG on the market, performance fee 10%",
+    },
   },
 };
+
+/** The share lending deployment of a chain, or a clear error. */
+export function getLending(chainId: number): LendingDeployment {
+  const l = getDeployment(chainId).lending;
+  if (!l) throw new Error(`share lending is not deployed on chain ${chainId}`);
+  return l;
+}
+
+/** The Stock Yield vault deployment of a chain, or a clear error. */
+export function getVaults(chainId: number): VaultDeployment {
+  const v = getDeployment(chainId).vaults;
+  if (!v) throw new Error(`no Stock Yield vaults deployed on chain ${chainId}`);
+  return v;
+}
 
 export function getDeployment(chainId: number): ChainDeployment {
   const d = deployments[chainId as SupportedChainId];

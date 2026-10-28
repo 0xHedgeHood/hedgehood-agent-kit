@@ -1,5 +1,5 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "rootDir": ".", "noEmit": true },
-  "include": ["src", "test"]
+  "compilerOptions": { "rootDir": "..", "noEmit": true, "paths": { "@hedgehood-io/sdk": ["./src/index.ts"] } },
+  "include": ["src", "test", "../mcp/test/fakes.ts"]
 }

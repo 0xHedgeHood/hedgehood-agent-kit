@@ -80,12 +80,19 @@ export function encodeWithdraw(market: Address, amountRaw: bigint, to: Address):
   return { to: market, data: encodeFunctionData({ abi: marketV2Abi, functionName: "withdraw", args: [amountRaw, to] }), summary: `withdraw(${amountRaw} USDG raw, to ${to})` };
 }
 
-/** `authorizeSession(key, expiresAt, scope, maxRequirement)`; sent by the account (owner key). */
-export function encodeAuthorizeSession(market: Address, key: Address, expiresAt: bigint | number, scope: bigint, maxRequirement: bigint): TxRequest {
+const MAX_UINT256 = (1n << 256n) - 1n;
+const capText = (v: bigint) => (v === MAX_UINT256 ? "unlimited" : v.toString());
+
+/**
+ * `authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend)`; sent by the account (owner key). For both caps
+ * 0 means none (0 maxSpend: the key cannot buy; 0 maxRequirement: it cannot raise the requirement) and
+ * `type(uint256).max` means unlimited.
+ */
+export function encodeAuthorizeSession(market: Address, key: Address, expiresAt: bigint | number, scope: bigint, maxRequirement: bigint, maxSpend: bigint): TxRequest {
   return {
     to: market,
-    data: encodeFunctionData({ abi: marketV2Abi, functionName: "authorizeSession", args: [key, BigInt(expiresAt), scope, maxRequirement] }),
-    summary: `authorizeSession(${key}, until ${expiresAt}, scope ${scope}, maxRequirement ${maxRequirement})`,
+    data: encodeFunctionData({ abi: marketV2Abi, functionName: "authorizeSession", args: [key, BigInt(expiresAt), scope, maxRequirement, maxSpend] }),
+    summary: `authorizeSession(${key}, until ${expiresAt}, scope ${scope}, maxRequirement ${capText(maxRequirement)}, maxSpend ${capText(maxSpend)})`,
   };
 }
 

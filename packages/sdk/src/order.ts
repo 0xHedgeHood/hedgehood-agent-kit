@@ -70,10 +70,13 @@ export interface Order {
   premiumStartRaw: bigint;
   /** Total premium at validUntil (equal to start = flat quote). */
   premiumEndRaw: bigint;
+  /** A session-signed order (signer != maker) must carry startTime >= the session's `authorizedAt`: sign with now. */
   startTime: bigint;
   validUntil: bigint;
+  /** The token's live uiMultiplier the price was written under (the book requires an exact match at fill time). */
   stockMultiplier: bigint;
   nonce: bigint;
+  /** Balance mode for the maker; must be true when signer != maker (`SessionWalletMode` otherwise). */
   fromBalance: boolean;
 }
 
@@ -254,10 +257,13 @@ export function currentPremiumRaw(order: Order, now: bigint | number): bigint {
   return rising ? start + moved : start - moved;
 }
 
-/** `premiumFor(order, fillQuantityRaw)` at `now`: pro rata, rounded up. */
+/**
+ * `premiumFor(order, fillQuantityRaw)` at `now`: pro rata, rounded in the maker's favour: up for an ask (it receives),
+ * down for a bid (it pays), so a bid maker never pays more than its signed total across split fills.
+ */
 export function premiumFor(order: Order, fillQuantityRaw: bigint, now: bigint | number): bigint {
   if (fillQuantityRaw <= 0n || fillQuantityRaw > order.quantityRaw) throw new RangeError("invalid fill quantity");
-  return mulDiv(currentPremiumRaw(order, now), fillQuantityRaw, order.quantityRaw, true);
+  return mulDiv(currentPremiumRaw(order, now), fillQuantityRaw, order.quantityRaw, order.side === Side.Ask);
 }
 
 /** `takerFeeFor(premium)`: protocolFeeBps of it, rounded up. */
@@ -287,6 +293,7 @@ export function orderProblems(order: Order, expect?: { chainId?: bigint | number
   if (order.premiumStartRaw !== order.premiumEndRaw && order.startTime >= order.validUntil) out.push("decay window invalid (startTime >= validUntil)");
   if (order.minFillRaw > order.quantityRaw) out.push("minFillRaw > quantityRaw");
   if (order.stockMultiplier === 0n) out.push("stockMultiplier is zero");
+  if (order.signer.toLowerCase() !== order.maker.toLowerCase() && !order.fromBalance) out.push("session-signed order is not fromBalance (the market reverts SessionWalletMode)");
   if (order.validUntil > expiryOf(order.instrumentId)) out.push("validUntil after the instrument's expiry");
   if (expect?.chainId !== undefined && order.chainId !== BigInt(expect.chainId)) out.push(`chainId ${order.chainId} != ${expect.chainId}`);
   if (expect?.orderBook && order.settlement.toLowerCase() !== expect.orderBook.toLowerCase()) out.push("settlement is not the expected order book");

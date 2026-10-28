@@ -1,9 +1,25 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { buildProgram, parseSince } from "../src/cli.js";
-import { ACCOUNT, NAME210P, NAME220C, fakeWorld, withGlobalFetch } from "../../mcp/test/fakes.js";
+import { decodeFunctionData, type Hex } from "viem";
+import { marketV2Abi, UNLIMITED } from "@hedgehood-io/sdk";
+import { buildProgram, parseCap, parseSince } from "../src/cli.js";
+import { ACCOUNT, NAME210P, NAME220C, NVDA_M, defaultChain, fakeWorld, withGlobalFetch } from "../../mcp/test/fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const GLOBALS = ["--account", ACCOUNT, "--rfq-url", "https://rfq.test", "--indexer-url", "https://index.test"];
+
+const OWNER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
+
+/** Runs the CLI with the owner key in the environment as well. */
+async function runAsOwner(args: string[], world = fakeWorld()) {
+  const prev = process.env.HEDGEHOOD_OWNER_KEY;
+  process.env.HEDGEHOOD_OWNER_KEY = OWNER_KEY;
+  try {
+    return await run(args, world);
+  } finally {
+    if (prev === undefined) delete process.env.HEDGEHOOD_OWNER_KEY;
+    else process.env.HEDGEHOOD_OWNER_KEY = prev;
+  }
+}
 
 /** Runs the CLI against the fake node / maker / indexer and returns what it printed. */
 async function run(args: string[], world = fakeWorld()) {
@@ -35,9 +51,17 @@ describe("hedgehood cli", () => {
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();
-    expect(names).toEqual(["close", "decode", "deposit", "fill", "history", "instruments", "join", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "withdraw"]);
+    expect(names).toEqual(["borrow", "close", "decode", "deposit", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
+    const lend = p.commands.find((c) => c.name() === "lend")!;
+    expect(lend.commands.map((c) => c.name()).sort()).toEqual(["deposit", "status", "withdraw"]);
+    const borrow = p.commands.find((c) => c.name() === "borrow")!;
+    expect(borrow.commands.map((c) => c.name()).sort()).toEqual(["collateral", "repay", "status", "take", "withdraw-collateral"]);
+    for (const name of ["collateral", "repay", "take", "withdraw-collateral"]) expect(borrow.commands.find((c) => c.name() === name)!.options.some((o) => o.long === "--send"), name).toBe(true);
     const session = p.commands.find((c) => c.name() === "session")!;
     expect(session.commands.map((c) => c.name()).sort()).toEqual(["authorize", "revoke", "status"]);
+    const vault = p.commands.find((c) => c.name() === "vault")!;
+    expect(vault.commands.map((c) => c.name()).sort()).toEqual(["cancel", "claim", "deposit", "redeem", "status"]);
+    for (const name of ["cancel", "claim", "deposit", "redeem"]) expect(vault.commands.find((c) => c.name() === name)!.options.some((o) => o.long === "--send"), name).toBe(true);
   });
 
   it("every sending command is dry run unless --send", () => {
@@ -139,5 +163,53 @@ describe("hedgehood cli", () => {
     expect(process.exitCode).toBe(1);
     await expect(run(["close"])).rejects.toThrow(/give an instrument, or --all/);
     await expect(run(["close", NAME220C, "--all"])).rejects.toThrow(/--all takes no instrument/);
+  });
+
+  it("session authorize requires --max-spend, maps unlimited to max uint and defaults --max-requirement to 0", async () => {
+    await expect(run(["session", "authorize"])).rejects.toThrow(/--max-spend is required.*Suggested: --max-spend 100/);
+    expect(parseCap("unlimited", "--x")).toBe(UNLIMITED);
+    expect(parseCap("12.5", "--x")).toBe(12_500_000n);
+    expect(() => parseCap("lots", "--max-spend")).toThrow(/--max-spend must be a USDG amount or "unlimited"/);
+    const args = (data: string) => decodeFunctionData({ abi: marketV2Abi, data: data as Hex }).args as readonly unknown[];
+    const budget = json((await runAsOwner(["session", "authorize", "--max-spend", "100", "--json"])).text);
+    expect(budget.dryRun).toBe(true);
+    expect(args(String(budget.data)).slice(2)).toEqual([3n, 0n, 100_000_000n]);
+    const open = await runAsOwner(["session", "authorize", "--max-spend", "unlimited", "--max-requirement", "unlimited", "--no-cancel"]);
+    expect(open.text).toMatch(/DRY RUN .*maxRequirement unlimited, maxSpend unlimited/);
+    expect(args(open.world.chain.simulated[0]!).slice(2)).toEqual([1n, UNLIMITED, UNLIMITED]);
+    // join with the owner key needs it too; without the owner key it prints the 5-argument cast command
+    await expect(runAsOwner(["join"])).rejects.toThrow(/--max-spend is required/);
+    const joined = await run(["join"]);
+    expect(joined.text).toMatch(/authorizeSession\(address,uint64,uint256,uint256,uint256\)' 0x[0-9a-fA-F]{40} \d+ 3 0 <maxSpendRaw>/);
+  });
+
+  it("session status and positions show spendLeft, authorizedAt and the caps", async () => {
+    const chain = defaultChain();
+    chain.session = [4_000_000_000n, 1_790_000_000n, 3n, UNLIMITED, 42_500_000n];
+    const { text } = await run(["session", "status"], fakeWorld({ chain }));
+    expect(text).toMatch(/ACTIVE trade=true cancel=true authorized 2026-09-21T14:13:20Z until 2096-10-02T07:06:40Z spendLeft 42\.5 maxRequirement unlimited/);
+    expect(text).toMatch(/balance mode only/);
+    const j = json((await run(["session", "status", "--json"], fakeWorld({ chain }))).text);
+    expect(j).toMatchObject({ authorizedAt: "1790000000", spendLeft: "42500000", maxRequirement: UNLIMITED.toString() });
+    const spent = defaultChain();
+    spent.session = [4_000_000_000n, 1_790_000_000n, 1n, 0n, 0n];
+    expect((await run(["positions"], fakeWorld({ chain: spent }))).text).toMatch(/spendLeft none \(0\) maxRequirement none \(0\)/);
+  });
+
+  it("names, quotes and decodes by the listed per-share strike under NVDA's mainnet uiMultiplier", async () => {
+    const world = () => fakeWorld({ chain: { ...defaultChain(), uiMultiplier: NVDA_M } });
+    const inst = await run(["instruments", "1793390400"], world());
+    expect(inst.text.split("\n").filter(Boolean).map((l) => l.split(" ")[0])).toEqual(["NVDA-20261030-210-C", "NVDA-20261030-210-P", "NVDA-20261030-220-C", "NVDA-20261030-220-P"]);
+    const q = await run(["quote", "NVDA-20261030-220-C", "--side", "buy", "--json"], world());
+    const quote = json(q.text);
+    const id = (BigInt(1793390400) << 96n) | (220_170_535n << 1n);
+    expect((quote.order as Record<string, unknown>).instrumentId).toBe(id.toString());
+    expect(q.world.backend.find((b) => b.url.pathname === "/v1/rfq")!.body).toMatchObject({ instrument: "NVDA-20261030-220-C" });
+    const byStrike = json((await run(["quote", "1793390400:220:call", "--side", "buy", "--json"], world())).text);
+    expect((byStrike.order as Record<string, unknown>).instrumentId).toBe(id.toString());
+    const d = await run(["decode", id.toString()], world());
+    expect(d.text).toMatch(/2026-10-30 220 C .*strike 220 \(per token 220\.170535, uiMultiplier 1\.000775159164630595\)/);
+    const offline = await run(["decode", id.toString(), "--multiplier", NVDA_M.toString()]);
+    expect(offline.text).toMatch(/strike 220 /);
   });
 });

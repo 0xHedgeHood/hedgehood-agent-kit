@@ -14,9 +14,13 @@ if (args.includes("--help") || args.includes("-h")) {
   hedgehood-mcp --check         print the resolved configuration (keys shown as set/missing) and exit
   --testnet | --mainnet         select the 46630 / 4663 deployment (same public backend hosts); default testnet
 
-Environment: HEDGEHOOD_CHAIN_ID, HEDGEHOOD_RPC_URL, HEDGEHOOD_API_URL, HEDGEHOOD_UNDERLYING, HEDGEHOOD_ACCOUNT,
-HEDGEHOOD_SESSION_KEY_FILE (or HEDGEHOOD_SESSION_KEY), HEDGEHOOD_OWNER_KEY_FILE (optional), HEDGEHOOD_DRY_RUN,
-HEDGEHOOD_MAX_DEPOSIT. See https://github.com/0xHedgeHood/hedgehood-agent-kit.
+Environment: HEDGEHOOD_CHAIN_ID, HEDGEHOOD_RPC_URL, HEDGEHOOD_RFQ_URL, HEDGEHOOD_INDEXER_URL, HEDGEHOOD_GATEWAY_URL,
+HEDGEHOOD_VAULT_API_URL, HEDGEHOOD_UNDERLYING, HEDGEHOOD_ACCOUNT, HEDGEHOOD_SESSION_KEY_FILE (or HEDGEHOOD_SESSION_KEY),
+HEDGEHOOD_OWNER_KEY_FILE (optional; needed by withdraw, sessions and every vault_* / lend_* / borrow_* write),
+HEDGEHOOD_DRY_RUN, HEDGEHOOD_MAX_DEPOSIT. Tools: the option market (quotes, fills, positions, P&L), the Stock Yield
+vaults (list_vaults, vault_status, vault_deposit, vault_redeem, vault_claim, vault_cancel) and share lending
+(lend_status, lend_deposit, lend_withdraw, borrow_status, borrow_supply_collateral, borrow_take, borrow_repay,
+borrow_withdraw_collateral). See https://github.com/0xHedgeHood/hedgehood-agent-kit.
 `);
   process.exit(0);
 }
@@ -27,7 +31,7 @@ async function main() {
   const config = loadConfig();
   const ctx = createContext(config);
   if (args.includes("--check")) {
-    process.stdout.write(JSON.stringify({ ...describeConfig(config), account: ctx.account, sessionAddress: ctx.session?.address, ownerAddress: ctx.owner?.address, market: ctx.deployment.market, orderBook: ctx.deployment.orderBook }, null, 2) + "\n");
+    process.stdout.write(JSON.stringify({ ...describeConfig(config), account: ctx.account, sessionAddress: ctx.session?.address, ownerAddress: ctx.owner?.address, market: ctx.marketDeployment?.market ?? "(no option market on this chain)", orderBook: ctx.marketDeployment?.orderBook, vaultRegistry: ctx.vaults?.registry ?? "(no vaults on this chain)", vaultFunds: ctx.vaults?.funds.map((f) => f.symbol), lendingVault: ctx.lendingDeployment?.vault ?? "(no share lending on this chain)", morphoBlue: ctx.lendingDeployment?.blue }, null, 2) + "\n");
     return;
   }
   const httpIdx = args.indexOf("--http");

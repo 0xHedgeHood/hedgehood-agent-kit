@@ -2,13 +2,15 @@ import { describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { privateKeyToAccount } from "viem/accounts";
-import { encodeInstrumentId, orderToJson, Side, signOrder, type Order } from "@hedgehood-io/sdk";
+import { decodeFunctionData, type Hex } from "viem";
+import { encodeInstrumentId, marketV2Abi, orderBookV2Abi, orderToJson, Side, signOrder, tokenStrikeOf, UNLIMITED, type Order } from "@hedgehood-io/sdk";
 import { createContext } from "../src/context.js";
 import { createServer } from "../src/server.js";
 import { loadConfig, normalizeKey } from "../src/config.js";
-import { CALL220, NAME210P, NAME220C, ONE, fakeWorld, withGlobalFetch } from "./fakes.js";
+import { CALL220, NAME210P, NAME220C, NVDA_M, ONE, defaultChain, fakeWorld, withGlobalFetch } from "./fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
+const OWNER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 const ACCOUNT = "0x3333333333333333333333333333333333333333" as const;
 const BOOK = "0x7288a3D12e15379C3b64988b54Ab4Da759638cf5";
@@ -16,8 +18,8 @@ const MARKET = "0xC289617d613C9865a6595B365DaD88277282e0Ac";
 const EXPIRY = 1793390400n;
 const INSTRUMENT = encodeInstrumentId(EXPIRY, 220_000_000n, false);
 
-async function connect(fetchImpl?: typeof fetch) {
-  const config = loadConfig({ HEDGEHOOD_CHAIN_ID: "46630", HEDGEHOOD_SESSION_KEY: SESSION_KEY, HEDGEHOOD_ACCOUNT: ACCOUNT, HEDGEHOOD_RFQ_URL: "https://rfq.test", HEDGEHOOD_INDEXER_URL: "https://index.test", HEDGEHOOD_GATEWAY_URL: "https://pay.test" });
+async function connect(fetchImpl?: typeof fetch, env: Record<string, string> = {}) {
+  const config = loadConfig({ HEDGEHOOD_CHAIN_ID: "46630", HEDGEHOOD_SESSION_KEY: SESSION_KEY, HEDGEHOOD_ACCOUNT: ACCOUNT, HEDGEHOOD_RFQ_URL: "https://rfq.test", HEDGEHOOD_INDEXER_URL: "https://index.test", HEDGEHOOD_GATEWAY_URL: "https://pay.test", ...env });
   const ctx = createContext(config, { fetch: fetchImpl });
   const server = createServer(ctx);
   const [a, b] = InMemoryTransport.createLinkedPair();
@@ -52,8 +54,8 @@ describe("mcp server", () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["authorize_session", "close_position", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "list_instruments", "list_markets", "my_record", "positions", "redeem", "register_agent", "withdraw"]);
-    for (const w of ["fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent"]) {
+    expect(names).toEqual(["authorize_session", "borrow_repay", "borrow_status", "borrow_supply_collateral", "borrow_take", "borrow_withdraw_collateral", "close_position", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "lend_deposit", "lend_status", "lend_withdraw", "list_instruments", "list_markets", "list_vaults", "my_record", "positions", "redeem", "register_agent", "vault_cancel", "vault_claim", "vault_deposit", "vault_redeem", "vault_status", "withdraw"]);
+    for (const w of ["fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent", "vault_deposit", "vault_redeem", "vault_claim", "vault_cancel", "lend_deposit", "lend_withdraw", "borrow_supply_collateral", "borrow_take", "borrow_repay", "borrow_withdraw_collateral"]) {
       const t = tools.find((x) => x.name === w)!;
       const props = (t.inputSchema as { properties: Record<string, unknown> }).properties;
       expect(props.confirm, w).toBeDefined();
@@ -61,10 +63,84 @@ describe("mcp server", () => {
     }
   });
 
-  it("decode_instrument is pure and formats the label", async () => {
-    const { client } = await connect();
-    const r = await client.callTool({ name: "decode_instrument", arguments: { instrumentId: INSTRUMENT.toString() } });
-    expect(JSON.parse(text(r))).toMatchObject({ strike: "220", isPut: false, label: "NVDA 2026-10-30 220 C" });
+  it("decode_instrument formats the label with the listed per-share strike of the expiry", async () => {
+    const world = fakeWorld();
+    const { client } = await connect(world.fetch);
+    const r = await withGlobalFetch(world.fetch, () => client.callTool({ name: "decode_instrument", arguments: { instrumentId: INSTRUMENT.toString() } }));
+    expect(JSON.parse(text(r))).toMatchObject({ strike: "220", isPut: false, label: "NVDA 2026-10-30 220 C", instrument: "NVDA-20261030-220-C" });
+    // NVDA mainnet multiplier: the id packs the per-token strike 220.170535, the name shows 220
+    const id = encodeInstrumentId(EXPIRY, tokenStrikeOf(220_000_000n, NVDA_M), false);
+    const nv = fakeWorld({ chain: { ...defaultChain(), uiMultiplier: NVDA_M } });
+    const { client: c2 } = await connect(nv.fetch);
+    const r2 = JSON.parse(text(await withGlobalFetch(nv.fetch, () => c2.callTool({ name: "decode_instrument", arguments: { instrumentId: id.toString() } }))));
+    expect(r2).toMatchObject({ strike: "220", strikeRaw: "220170535", uiMultiplier: NVDA_M.toString(), instrument: "NVDA-20261030-220-C", label: "NVDA 2026-10-30 220 C" });
+    const r3 = JSON.parse(text(await client.callTool({ name: "decode_instrument", arguments: { instrumentId: id.toString(), uiMultiplier: NVDA_M.toString() } })));
+    expect(r3.strike).toBe("220");
+  });
+
+  it("names, quotes and resolves instruments by the per-share strike under a non-1e18 uiMultiplier", async () => {
+    const world = fakeWorld({ chain: { ...defaultChain(), uiMultiplier: NVDA_M } });
+    const { client } = await connect(world.fetch);
+    const call = (name: string, args: Record<string, unknown>) => withGlobalFetch(world.fetch, () => client.callTool({ name, arguments: args }));
+    const list = JSON.parse(text(await call("list_instruments", {})));
+    const names = list[0].instruments.map((x: { instrument: string }) => x.instrument);
+    expect(names).toEqual(["NVDA-20261030-210-C", "NVDA-20261030-210-P", "NVDA-20261030-220-C", "NVDA-20261030-220-P"]);
+    expect(list[0].instruments[2]).toMatchObject({ strike: "220", strikeRaw: "220170535", label: "NVDA 2026-10-30 220 C" });
+    const id = encodeInstrumentId(EXPIRY, 220_170_535n, false);
+    const q = JSON.parse(text(await call("get_quote", { instrument: "NVDA-20261030-220-C", side: "buy", quantity: "1" })));
+    expect(q).toMatchObject({ instrument: "NVDA-20261030-220-C", instrumentId: id.toString(), label: "NVDA 2026-10-30 220 C" });
+    expect(world.backend.find((b) => b.url.pathname === "/v1/rfq")!.body).toMatchObject({ instrument: "NVDA-20261030-220-C" });
+    // expiry + per-share strike + kind maps to the same per-token id
+    const q2 = JSON.parse(text(await call("get_quote", { expiry: EXPIRY.toString(), strike: "220", kind: "call", side: "buy", quantity: "1" })));
+    expect(q2.instrumentId).toBe(id.toString());
+    const markets = JSON.parse(text(await call("list_markets", {})));
+    expect(markets.expiries[0]).toMatchObject({ strikes: ["210", "220"], perTokenStrikesRaw: ["210162783", "220170535"], uiMultiplier: NVDA_M.toString() });
+  });
+
+  it("authorize_session requires maxSpend, maps unlimited to max uint and defaults maxRequirement to 0", async () => {
+    const world = fakeWorld();
+    const { client, ctx } = await connect(world.fetch, { HEDGEHOOD_OWNER_KEY: OWNER_KEY });
+    const call = (args: Record<string, unknown>) => withGlobalFetch(world.fetch, () => client.callTool({ name: "authorize_session", arguments: args }));
+    const missing = await call({ confirm: true });
+    expect(missing.isError).toBe(true);
+    expect(text(missing)).toMatch(/maxSpend is required/);
+    const args = (data: Hex) => decodeFunctionData({ abi: marketV2Abi, data }).args as readonly unknown[];
+    const budget = JSON.parse(text(await call({ maxSpend: "100" })));
+    expect(budget).toMatchObject({ needsConfirm: true, terms: { maxSpend: "100", maxRequirement: "none (0)" } });
+    expect(args(budget.data).slice(2)).toEqual([3n, 0n, 100_000_000n]);
+    expect(args(budget.data)[0]).toBe(ctx.session!.address);
+    const open = JSON.parse(text(await call({ maxSpend: "unlimited", maxRequirement: "Unlimited", cancel: false })));
+    expect(args(open.data).slice(2)).toEqual([1n, UNLIMITED, UNLIMITED]);
+    expect(open.wouldSend).toMatch(/maxRequirement unlimited, maxSpend unlimited/);
+    const none = JSON.parse(text(await call({ maxSpend: "0", maxRequirement: "250" })));
+    expect(args(none.data).slice(3)).toEqual([250_000_000n, 0n]);
+    const revoke = JSON.parse(text(await call({ revoke: true })));
+    expect(revoke.wouldSend).toMatch(/revokeSession/);
+  });
+
+  it("positions shows the session's spendLeft, authorizedAt and caps", async () => {
+    const chain = defaultChain();
+    chain.session = [4_000_000_000n, 1_790_000_000n, 1n, UNLIMITED, 12_500_000n];
+    const world = fakeWorld({ chain });
+    const { client } = await connect(world.fetch);
+    const body = JSON.parse(text(await withGlobalFetch(world.fetch, () => client.callTool({ name: "positions", arguments: {} }))));
+    expect(body.session).toMatchObject({ active: true, canTrade: true, canCancel: false, spendLeft: "12.5", maxRequirement: "unlimited", authorizedAt: "1790000000", authorizedAtIso: "2026-09-21T14:13:20.000Z" });
+  });
+
+  it("the session path forces balance mode and explains SessionWalletMode / SessionLimit reverts", async () => {
+    const world = fakeWorld();
+    const { client } = await connect(world.fetch);
+    const run = (name: string, args: Record<string, unknown>) => withGlobalFetch(world.fetch, () => client.callTool({ name, arguments: args }));
+    // close_position with fromBalance false from a session key: forced to balance mode, with a note
+    const forced = JSON.parse(text(await run("close_position", { instrument: NAME220C, fromBalance: false, confirm: true })));
+    expect(forced).toMatchObject({ ok: true, simulated: true, fromBalance: true, note: expect.stringMatching(/SessionWalletMode/) });
+    expect((decodeFunctionData({ abi: orderBookV2Abi, data: world.chain.simulated[0]! }).args as readonly unknown[])[4]).toBe(true);
+    // a fill the market refuses over the budget: the revert is decoded with what to do
+    world.chain.fillRevert = "SessionLimit";
+    const q = JSON.parse(text(await run("get_quote", { instrument: NAME220C, side: "buy", quantity: "1" })));
+    const r = await run("fill_quote", { digest: q.digest, confirm: true });
+    expect(r.isError).toBe(true);
+    expect(text(r)).toMatch(/reverted SessionLimit: .*spend budget/);
   });
 
   it("fill_quote refuses an unknown digest, a missing confirm, and a quote for another taker", async () => {
@@ -97,7 +173,7 @@ describe("mcp server", () => {
     const r = await client.callTool({ name: "withdraw", arguments: { amount: "1", confirm: true } });
     expect(r.isError).toBe(true);
     expect(text(r)).toMatch(/owner key/);
-    const r2 = await client.callTool({ name: "authorize_session", arguments: { confirm: true } });
+    const r2 = await client.callTool({ name: "authorize_session", arguments: { maxSpend: "100", confirm: true } });
     expect(r2.isError).toBe(true);
     expect(text(r2)).toMatch(/owner key/);
   });

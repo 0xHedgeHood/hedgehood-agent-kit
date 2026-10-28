@@ -1,7 +1,7 @@
 import type { Address, Hex } from "viem";
 import { encodeFillOrderAs } from "./calldata.js";
 import { getDeployment, type BackendHosts } from "./chains.js";
-import { instrumentName, decodeInstrumentId } from "./instrument.js";
+import { instrumentNameOf, UNIT_MULTIPLIER } from "./instrument.js";
 import {
   currentPremiumRaw,
   orderDigest,
@@ -202,6 +202,11 @@ export interface QuoteRequest {
   sessionKey?: Address;
   /** Underlying ticker (for the instrument name); default "NVDA". */
   underlying?: string;
+  /**
+   * The expiry's snapshotted uiMultiplier (`MarketClient.expiryMultiplier`), so the instrument name carries the listed
+   * per-share strike; default 1e18 (per-token and per-share strikes coincide).
+   */
+  uiMultiplier?: bigint;
 }
 
 export interface PositionRow {
@@ -451,9 +456,9 @@ export class RfqClient {
     return r.instruments ?? [];
   }
 
-  /** Indicative mark by backend instrument name (`NVDA-20261030-220-C`) or by id + underlying. */
-  async mark(instrument: string | { instrumentId: bigint; underlying: string }): Promise<MarkView> {
-    const name = typeof instrument === "string" ? instrument : nameOf(instrument.instrumentId, instrument.underlying);
+  /** Indicative mark by backend instrument name (`NVDA-20261030-220-C`) or by id + underlying (+ the expiry's uiMultiplier). */
+  async mark(instrument: string | { instrumentId: bigint; underlying: string; uiMultiplier?: bigint }): Promise<MarkView> {
+    const name = typeof instrument === "string" ? instrument : instrumentNameOf(instrument.instrumentId, instrument.underlying, instrument.uiMultiplier ?? UNIT_MULTIPLIER);
     return this.request<MarkView>("rfq", "GET", RfqPaths.mark, undefined, { instrument: name });
   }
 
@@ -462,7 +467,7 @@ export class RfqClient {
    * retried once after `feedRetryMs` (the pricing feed cycles every 20 s); any other refusal surfaces at once.
    */
   async requestQuote(req: QuoteRequest): Promise<QuoteResponse> {
-    const body: Record<string, unknown> = { instrument: nameOf(req.instrumentId, req.underlying ?? "NVDA"), side: req.side, quantity: sharesDecimal(req.quantityRaw), taker: req.taker };
+    const body: Record<string, unknown> = { instrument: nameOf(req), side: req.side, quantity: sharesDecimal(req.quantityRaw), taker: req.taker };
     if (req.sessionKey) body.sessionKey = req.sessionKey;
     try {
       return await this.request<QuoteResponse>("rfq", "POST", RfqPaths.rfq, body);
@@ -479,7 +484,7 @@ export class RfqClient {
       jsonrpc: "2.0",
       id: 1,
       method: "getSignerSideOrder",
-      params: { instrument: nameOf(req.instrumentId, req.underlying ?? "NVDA"), side: req.side, amount: sharesDecimal(req.quantityRaw), takerWallet: req.taker, ...(req.sessionKey ? { sessionKey: req.sessionKey } : {}) },
+      params: { instrument: nameOf(req), side: req.side, amount: sharesDecimal(req.quantityRaw), takerWallet: req.taker, ...(req.sessionKey ? { sessionKey: req.sessionKey } : {}) },
     });
     if (r.error) throw new RfqError(`getSignerSideOrder: ${r.error.message}${r.error.data?.reason ? `: ${r.error.data.reason}` : ""}`, undefined, r.error.data?.code, r);
     if (!r.result) throw new RfqError("getSignerSideOrder: empty result", undefined, undefined, r);
@@ -530,7 +535,7 @@ export class RfqClient {
       order,
       signature: r.signature,
       digest,
-      instrument: r.instrument ?? nameOf(order.instrumentId, req.underlying ?? "NVDA"),
+      instrument: r.instrument ?? nameOf({ ...req, instrumentId: order.instrumentId }),
       fillable: !dryRun,
       dryRun,
       canFill: r.funding?.canFill ?? preview.canFill ?? null,
@@ -594,9 +599,9 @@ export function isFeedNotHealthy(e: unknown): e is RfqError {
 
 const ZERO = "0x0000000000000000000000000000000000000000";
 
-function nameOf(instrumentId: bigint, underlying: string): string {
-  const d = decodeInstrumentId(instrumentId);
-  return instrumentName(underlying, d.expiry, d.strike, d.isPut);
+/** The backend name of a quote request's instrument: listed per-share strike under the expiry's uiMultiplier. */
+function nameOf(req: Pick<QuoteRequest, "instrumentId" | "underlying" | "uiMultiplier">): string {
+  return instrumentNameOf(req.instrumentId, req.underlying ?? "NVDA", req.uiMultiplier ?? UNIT_MULTIPLIER);
 }
 
 /** 18-decimal raw -> the decimal share string the backend parses ("0.5"). */
