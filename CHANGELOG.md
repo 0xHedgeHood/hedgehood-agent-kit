@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+Stock Yield vaults: agents deposit into and withdraw from Hedgehood's v2 `EpochFund`s through the same kit.
+
+- `@hedgehood-io/sdk`: `VaultClient` (`listVaults`, `status`, `vaultInfo`, `accountInfo`, `resolveVault`, and the
+  owner-wallet plans `planDeposit` / `requestDeposit` (ERC-20 approve(s) + `requestDeposit`), `planRedeem` /
+  `requestRedeem` (amount or `"all"`), `cancelDeposit`, `cancelRedeem`, `claim`; `sendPlan` runs a plan dry (default)
+  or for real, in order). Fund snapshots come from the public `GET https://hedgehood.app/api/stockyield/funds` on
+  mainnet when it answers, else from the chain (`VaultRegistry.vaults()` + fund views); NAV per share is derived from
+  `stockHeld`, `usdgHeld`, the live Oracle price (or the fund's last mark when the market is closed) and `totalSupply`.
+  Epoch state is `open | frozen | locked | settling` with `nextFreezeAt` / `nextSettleAt`. `getVaults(chainId)` and the
+  `vaults` entry of the deployment registry (mainnet registry `0x8685…1e76`, OpenDepositGate `0x337B…eFA5`, the eight
+  funds; testnet registry `0xBeE3…76b9`, one `hhNVDA-CC`). ABIs vendored from hedgehood-vaults
+  `contracts/src/v2` at tag `audit-v2-freeze-2026-10-21` (`scripts/vendor-abis.mjs --vaults`): `epochFundAbi`,
+  `vaultRegistryAbi`, `openDepositGateAbi`, `stakeThresholdGateAbi`. `sendTxRequest` shared by both clients. 13 new
+  unit tests (71 total).
+- `@hedgehood-io/cli`: `vaults` (table; no key needed), `vault status [--vault]`, `vault deposit <usdg> --vault
+  <addr|symbol> [--stock] [--send]`, `vault redeem <shares|all> --vault … [--send]`, `vault claim --vault … [--to]
+  [--send]`, `vault cancel deposit|redeem --vault … [--send]`; owner key only, dry run unless `--send`, `--json`
+  everywhere; `--vault-api-url <url|off>`. 4 new tests (13 total).
+- `@hedgehood-io/mcp`: tools `list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_claim`,
+  `vault_cancel` (writes gated like `fill_quote`: `confirm` + `dryRun` / `HEDGEHOOD_DRY_RUN`; owner key). The server
+  now starts on mainnet 4663, where only the vaults are deployed (`ctx.marketDeployment` is optional; market tools
+  report the missing listing). `HEDGEHOOD_VAULT_API_URL` (`off` = chain only). 24 tools; 5 new tests (16 total).
+- Docs: README (vault quickstart, tool and command lists, addresses), `docs/BACKEND_API.md` (the funds API and the
+  hosted-MCP tool names), the skill's "Stock Yield vaults" section (vault vs market, the three-step flow, up to a week
+  to redeem, non-US only), `AGENTS.md`. Versions are not bumped in this change.
+
 ## 0.2.0 (2026-10-28)
 
 Close, P&L, active positions and past activity as first-class agent features.

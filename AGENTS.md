@@ -15,8 +15,14 @@ server that signs with the agent's key), `packages/cli` (`hedgehood`), the Claud
 - `pnpm -r typecheck && pnpm -r test && pnpm -r build` must stay green; CI runs them on Node 20 and 22.
 - Never commit keys, `.env` files, key files or anything under `~/.hedgehood`. Tests use well-known throwaway keys only.
 - The contract sources are **not** in this repo (private until the audit); only ABIs are vendored. Refresh them with
-  `node scripts/vendor-abis.mjs <hedgehood-options/contracts/out> <commit>` and record the commit in the header and in
-  `CHANGELOG.md`. Never edit the generated ABI files by hand.
+  `node scripts/vendor-abis.mjs <hedgehood-options/contracts/out> <commit>` (market) or
+  `node scripts/vendor-abis.mjs --vaults <hedgehood-vaults/contracts/out> <tag|commit>` (Stock Yield vaults: EpochFund,
+  VaultRegistry, the gates) and record the commit in the header and in `CHANGELOG.md`. Never edit the generated ABI
+  files by hand.
+- Vault writes (`VaultClient` plans, `hedgehood vault …`, `vault_*` tools) are owner-key only: the fund authorizes the
+  account itself or an on-chain position manager, never a market session key. Keep the deployment registry
+  (`chains.ts` `vaults`) in step with hedgehood-vaults `docs/OPTION_VAULT_V2.md`; the on-chain `VaultRegistry` stays the
+  source of truth at runtime.
 - The EIP-712 struct string in `packages/sdk/src/order.ts` must match the contract's `ORDER_TYPEHASH`; the test pins
   the hash, so a contract change shows up as a failing test, not a silent mismatch.
 - The backend API is documented in `docs/BACKEND_API.md` (hedgehood-options `feat/rfq-backend`); a route or shape change
@@ -30,7 +36,7 @@ server that signs with the agent's key), `packages/cli` (`hedgehood`), the Claud
 ## Layout
 
 ```
-packages/sdk/src/{chains,instrument,order,calldata,units,market,rfq,close,pnl,x402,identity}.ts, abi/
+packages/sdk/src/{chains,instrument,order,calldata,units,market,send,vault,rfq,close,pnl,x402,identity}.ts, abi/
 packages/mcp/src/{config,context,server,http,bin}.ts, server.json
 packages/cli/src/{cli,bin}.ts
 skills/hedgehood-options/SKILL.md   .claude-plugin/{plugin,marketplace}.json

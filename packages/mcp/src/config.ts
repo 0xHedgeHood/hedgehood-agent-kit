@@ -21,6 +21,8 @@ import type { Address, Hex } from "viem";
  *   HEDGEHOOD_OWNER_KEY         (keep the owner key offline where you can; the session key is enough to trade)
  *   HEDGEHOOD_DRY_RUN           "false" to make sends real by default (tools still need confirm: true)
  *   HEDGEHOOD_MAX_DEPOSIT       cap per x402 deposit, USDG (default 1000)
+ *   HEDGEHOOD_VAULT_API_URL     Stock Yield fund snapshot API for list_vaults (default: the chain's registry entry,
+ *                               https://hedgehood.app/api/stockyield/funds on mainnet); "off" reads the chain only
  */
 export interface KitConfig {
   chainId: number;
@@ -34,6 +36,8 @@ export interface KitConfig {
   ownerKey?: Hex;
   dryRunDefault: boolean;
   maxDepositUsdg: string;
+  /** Stock Yield fund snapshot API; `false` = chain reads only. Undefined = the chain's registry default (mainnet only). */
+  vaultApiUrl?: string | false;
 }
 
 const KEY_RE = /^0x[0-9a-fA-F]{64}$/;
@@ -84,6 +88,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): KitConfig {
   if (chainId !== 46630 && chainId !== 4663) throw new Error(`HEDGEHOOD_CHAIN_ID must be 46630 or 4663 (got ${env.HEDGEHOOD_CHAIN_ID})`);
   const account = envValue(env, "HEDGEHOOD_ACCOUNT");
   if (account && !/^0x[0-9a-fA-F]{40}$/.test(account)) throw new Error("HEDGEHOOD_ACCOUNT is not an address");
+  const vaultApi = envValue(env, "HEDGEHOOD_VAULT_API_URL");
   return {
     chainId,
     rpcUrl: envValue(env, "HEDGEHOOD_RPC_URL"),
@@ -96,6 +101,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): KitConfig {
     ownerKey: keyFrom(env, "HEDGEHOOD_OWNER_KEY_FILE", "HEDGEHOOD_OWNER_KEY"),
     dryRunDefault: (envValue(env, "HEDGEHOOD_DRY_RUN") ?? "true").toLowerCase() !== "false",
     maxDepositUsdg: envValue(env, "HEDGEHOOD_MAX_DEPOSIT") ?? "1000",
+    vaultApiUrl: vaultApi === undefined ? undefined : /^(off|false|0|none)$/i.test(vaultApi) ? false : vaultApi,
   };
 }
 
@@ -113,5 +119,6 @@ export function describeConfig(cfg: KitConfig): Record<string, unknown> {
     ownerKey: cfg.ownerKey ? "set" : "missing",
     dryRunDefault: cfg.dryRunDefault,
     maxDepositUsdg: cfg.maxDepositUsdg,
+    vaultApiUrl: cfg.vaultApiUrl === false ? "off (chain only)" : (cfg.vaultApiUrl ?? "(registry default)"),
   };
 }

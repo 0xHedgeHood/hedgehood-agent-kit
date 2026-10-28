@@ -27,8 +27,12 @@ import {
   type ClosePlan,
   type QuoteResponse,
   type TxRequest,
+  type VaultAccountInfo,
+  type VaultInfo,
+  type VaultPlan,
   type VerifiedQuote,
 } from "@hedgehood-io/sdk";
+import { formatUnits } from "viem";
 import type { Address, Hex } from "viem";
 import type { MarketClient } from "@hedgehood-io/sdk";
 import { z } from "zod";
@@ -132,7 +136,7 @@ function closeView(plan: ClosePlan, underlying: string) {
 
 export function createServer(ctx: KitContext): McpServer {
   const server = new McpServer({ name: "hedgehood-options", version: "0.2.0" });
-  const underlying = ctx.deployment.underlying;
+  const underlying = ctx.marketDeployment?.underlying ?? "NVDA";
 
   server.registerTool(
     "list_markets",
@@ -546,7 +550,232 @@ export function createServer(ctx: KitContext): McpServer {
     },
   );
 
+  registerVaultTools(server, ctx);
   return server;
+}
+
+// ---------------------------------------------------------------- Stock Yield vaults
+
+const VAULT_CYCLE =
+  "Vaults are asynchronous: a request queues until the fund's next epoch freeze (Monday morning New York for the mainnet funds), " +
+  "the freeze prices deposits at NAV and pays redemptions in kind (stock + USDG), and the result is then claimed with vault_claim. " +
+  "Deposits are not instant and a redeem waits for the current weekly option to expire, so it can take up to a week. Requests can be cancelled until the cutoff with vault_cancel.";
+
+const iso = (t?: bigint) => (t === undefined || t === 0n ? undefined : new Date(Number(t) * 1000).toISOString());
+
+function vaultAccountView(my: VaultAccountInfo) {
+  return {
+    account: my.account,
+    shares: formatShares(my.sharesRaw),
+    uncreditedShares: my.uncreditedSharesRaw !== 0n ? formatShares(my.uncreditedSharesRaw) : undefined,
+    pendingDeposit: my.pendingDeposit ? { epoch: my.pendingDeposit.epoch, usdg: formatUsdg(my.pendingDeposit.usdgRaw), stock: formatShares(my.pendingDeposit.stockRaw), cancellable: my.pendingDeposit.cancellable } : null,
+    pendingRedeem: my.pendingRedeem ? { epoch: my.pendingRedeem.epoch, shares: formatShares(my.pendingRedeem.sharesRaw), cancellable: my.pendingRedeem.cancellable } : null,
+    claimable: { stock: formatShares(my.claimableStockRaw), usdg: formatUsdg(my.claimableUsdgRaw) },
+    canDeposit: my.canDeposit,
+    wallet: { usdg: formatUsdg(my.walletUsdgRaw), stock: formatShares(my.walletStockRaw) },
+    nextAction:
+      my.claimableStockRaw !== 0n || my.claimableUsdgRaw !== 0n
+        ? "vault_claim: redeemed or refunded assets are waiting"
+        : my.pendingRedeem
+          ? `wait for the freeze of epoch ${my.pendingRedeem.epoch}, then vault_claim`
+          : my.pendingDeposit
+            ? `wait for the freeze of epoch ${my.pendingDeposit.epoch}; the shares appear on your next action`
+            : my.sharesRaw !== 0n
+              ? "holding shares; vault_redeem to exit (paid at the next freeze after the current option expires)"
+              : my.canDeposit
+                ? "vault_deposit to join the next epoch"
+                : "not admitted by the deposit gate",
+  };
+}
+
+export function vaultView(v: VaultInfo) {
+  const nav = v.nav.usdgPerShareRaw;
+  return {
+    vault: v.vault,
+    symbol: v.symbol,
+    name: v.name,
+    strategy: v.strategy,
+    stock: v.stock,
+    usdg: v.usdg,
+    gate: v.gate,
+    paused: v.paused,
+    depositCap: formatUsdg(v.depositCapUsdgRaw),
+    capUsed: formatUsdg(v.capUsedUsdgRaw),
+    capLeft: formatUsdg(v.capUsedUsdgRaw >= v.depositCapUsdgRaw ? 0n : v.depositCapUsdgRaw - v.capUsedUsdgRaw),
+    totalShares: formatShares(v.totalSharesRaw),
+    holdings: { stock: formatShares(v.stockHeldRaw), usdg: formatUsdg(v.usdgHeldRaw) },
+    nav: { usdgPerShare: nav === undefined ? null : formatUsdg(nav), navUsdg: formatUsdg(v.nav.navUsdgRaw), stockPrice: v.nav.priceRaw === 0n ? null : formatUnits(v.nav.priceRaw, 18), source: v.nav.source },
+    epoch: {
+      index: v.epoch.index,
+      state: v.epoch.state,
+      phase: v.epoch.phase,
+      nextFreezeAt: iso(v.epoch.nextFreezeAt),
+      nextSettleAt: iso(v.epoch.nextSettleAt),
+      nextCohort: v.epoch.nextCohort,
+      schedule: { depositCutoff: iso(v.epoch.schedule.depositCutoff), tradeStart: iso(v.epoch.schedule.tradeStart), tradeEnd: iso(v.epoch.schedule.tradeEnd), expiry: iso(v.epoch.schedule.expiry) },
+    },
+    lastEpoch: v.lastEpoch ? { index: v.lastEpoch.index, premiumIncome: formatUsdg(v.lastEpoch.incomeUsdgRaw), navAtFreeze: formatUsdg(v.lastEpoch.navAtFreezeUsdgRaw), weeklyYield: v.lastEpoch.weeklyYieldBps === undefined ? null : `${(v.lastEpoch.weeklyYieldBps / 100).toFixed(2)}%`, settledAt: iso(v.lastEpoch.settledAt) } : null,
+    feeBps: v.feeBps,
+    source: v.source,
+    my: v.my ? vaultAccountView(v.my) : undefined,
+  };
+}
+
+function planView(plan: VaultPlan) {
+  return { vault: plan.vault, symbol: plan.symbol, account: plan.account, summary: plan.summary, steps: plan.steps.map((s) => ({ kind: s.kind, to: s.to, data: s.data, summary: s.summary })) };
+}
+
+/** Same gating as sendOrExplain, for a plan of one or more owner-key transactions. */
+async function sendPlanOrExplain(ctx: KitContext, plan: VaultPlan, confirm: boolean, dryRun: boolean | undefined) {
+  const dry = dryRun ?? ctx.config.dryRunDefault;
+  if (!confirm) return json({ ...planView(plan), ok: false, needsConfirm: true, wouldSend: plan.summary, dryRun: dry, hint: "call again with confirm: true", cycle: VAULT_CYCLE });
+  const owner = requireOwner(ctx);
+  const v = ctx.vault("owner");
+  try {
+    const results = await v.sendPlan(plan, { dryRun: dry });
+    if (dry) {
+      return json({ ...planView(plan), ok: true, dryRun: true, from: owner.address, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated })), hint: `simulation passed${results.some((r) => !r.simulated) ? " (a step after an approval is not simulated until the approval is mined)" : ""}; call again with dryRun: false to broadcast`, cycle: VAULT_CYCLE });
+    }
+    const ok = results.length === plan.steps.length && results.every((r) => r.status === "success");
+    return json({ ...planView(plan), ok, dryRun: false, from: owner.address, steps: results.map((r) => ({ kind: r.kind, txHash: r.hash, status: r.status, blockNumber: r.blockNumber, summary: r.request.summary, explorer: `${v.chain.blockExplorers?.default.url}/tx/${r.hash}` })), cycle: VAULT_CYCLE });
+  } catch (e) {
+    return fail(`${plan.summary} failed: ${errorText(e)}`);
+  }
+}
+
+const vaultRef = z.string().min(1).describe("Fund address, share symbol (hhNVDA-CC, NVDA-CC) or stock ticker when it names one fund (GOOGL)");
+
+function registerVaultTools(server: McpServer, ctx: KitContext) {
+  server.registerTool(
+    "list_vaults",
+    {
+      title: "List Stock Yield vaults",
+      description:
+        "Hedgehood's Stock Yield vaults (v2 EpochFund) on this chain: for each fund its share symbol, strategy, stock, deposit gate, cap and cap used, total shares, NAV per share in USDG, the epoch (index, state open|frozen|locked|settling, next freeze and next settlement times), the last settled epoch's premium income, and your shares / pending requests / claimables. Reads the chain (VaultRegistry) and, on mainnet, the public fund snapshot API. Read-only. " +
+        VAULT_CYCLE +
+        " Non-US only.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const v = ctx.vault("none");
+        const list = await v.listVaults({ account: ctx.account });
+        return json({ chainId: ctx.chainId, account: ctx.account, registry: v.registry, api: v.apiUrl ?? null, vaults: list.map(vaultView), cycle: VAULT_CYCLE });
+      } catch (e) {
+        return fail(`list_vaults failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_status",
+    {
+      title: "My vault positions",
+      description: "Your position in the Stock Yield vaults: shares held (and not yet credited), a queued deposit or redemption with its epoch and whether it can still be cancelled, assets waiting to be claimed, wallet balances, and the suggested next action. One fund with `vault`, else every fund you touched or can deposit into. Read-only. " + VAULT_CYCLE,
+      inputSchema: { vault: vaultRef.optional() },
+    },
+    async ({ vault }) => {
+      try {
+        const v = ctx.vault("none");
+        const vaults = vault ? [await v.resolveVault(vault)] : undefined;
+        const list = await v.status(ctx.account, { vaults });
+        const touched = vault ? list : list.filter((x) => x.my && (x.my.sharesRaw !== 0n || x.my.pendingDeposit || x.my.pendingRedeem || x.my.claimableStockRaw !== 0n || x.my.claimableUsdgRaw !== 0n || x.my.canDeposit));
+        return json({ chainId: ctx.chainId, account: ctx.account, vaults: touched.map((x) => ({ vault: x.vault, symbol: x.symbol, epoch: vaultView(x).epoch, nav: vaultView(x).nav, ...vaultAccountView(x.my!) })) });
+      } catch (e) {
+        return fail(`vault_status failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_deposit",
+    {
+      title: "Deposit into a Stock Yield vault (owner key)",
+      description:
+        "Queues a deposit of USDG (and/or the fund's stock) from the owner wallet into a vault for your account: ERC-20 approve(s) to the fund when the allowance is short, then requestDeposit(stock, usdg, receiver). " +
+        VAULT_CYCLE +
+        " Checks the deposit gate, pause, cap, minimums and wallet balance first. Owner key (HEDGEHOOD_OWNER_KEY_FILE); a market session key cannot do this. dryRun (default true) simulates and returns the unsigned transactions; false broadcasts them in order and reports the tx hashes. Requires confirm: true.",
+      inputSchema: {
+        vault: vaultRef,
+        usdg: decimalAmount.optional().describe("USDG to deposit, e.g. \"100\""),
+        stock: decimalAmount.optional().describe("Stock tokens to deposit instead of / besides USDG, e.g. \"0.5\" (18 decimals)"),
+        receiver: address.optional().describe("Account credited with the shares; default: your account"),
+        confirm: confirmField,
+        dryRun: dryRunField,
+      },
+    },
+    async ({ vault, usdg, stock, receiver, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const v = ctx.vault("owner");
+        const plan = await v.planDeposit({ vault: await v.resolveVault(vault), usdgRaw: usdg ? parseUsdg(usdg) : undefined, stockRaw: stock ? parseShares(stock) : undefined, receiver });
+        return sendPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`vault_deposit failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_redeem",
+    {
+      title: "Redeem Stock Yield vault shares (owner key)",
+      description:
+        "Queues a redemption of shares (an amount or \"all\") for your account: requestRedeem(shares, account). The shares move to escrow now and are paid in kind (stock + USDG, pro rata) at the cohort's freeze, which comes after the current weekly option expires; then call vault_claim. " +
+        VAULT_CYCLE +
+        " Owner key. dryRun (default true) simulates only. Requires confirm: true.",
+      inputSchema: { vault: vaultRef, shares: z.string().regex(/^(all|\d+(\.\d+)?)$/i).describe("Shares to redeem, e.g. \"2.5\", or \"all\""), confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ vault, shares, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const v = ctx.vault("owner");
+        const plan = await v.planRedeem({ vault: await v.resolveVault(vault), shares });
+        return sendPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`vault_redeem failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_claim",
+    {
+      title: "Claim from a Stock Yield vault (owner key)",
+      description: "Pays your redeemed (or refunded) stock and USDG out of a vault: claim(account, to). Only possible once the cohort of your redemption has frozen; vault_status shows what is claimable. Owner key. dryRun (default true) simulates only. Requires confirm: true.",
+      inputSchema: { vault: vaultRef, to: address.optional().describe("Recipient; default: the owner address"), confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ vault, to, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const v = ctx.vault("owner");
+        const plan = await v.planClaim({ vault: await v.resolveVault(vault), to });
+        return sendPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`vault_claim failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "vault_cancel",
+    {
+      title: "Cancel a queued vault request (owner key)",
+      description: "Cancels your queued deposit (returned to `to`, default the owner wallet) or queued redemption (shares back to your balance) in a vault, possible until that cohort's cutoff (vault_status: cancellable). Owner key. dryRun (default true) simulates only. Requires confirm: true.",
+      inputSchema: { vault: vaultRef, which: z.enum(["deposit", "redeem"]), to: address.optional().describe("deposit only: where the returned assets go; default: the owner address"), confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ vault, which, to, confirm, dryRun }) => {
+      try {
+        requireOwner(ctx);
+        const v = ctx.vault("owner");
+        const addr = await v.resolveVault(vault);
+        const plan = which === "deposit" ? await v.planCancelDeposit({ vault: addr, to }) : await v.planCancelRedeem({ vault: addr });
+        return sendPlanOrExplain(ctx, plan, confirm, dryRun);
+      } catch (e) {
+        return fail(`vault_cancel failed: ${errorText(e)}`);
+      }
+    },
+  );
 }
 
 export type { QuoteResponse };

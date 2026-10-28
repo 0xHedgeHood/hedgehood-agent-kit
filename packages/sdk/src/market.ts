@@ -9,7 +9,6 @@ import {
   type Chain,
 } from "viem";
 import type { LocalAccount } from "viem/accounts";
-import { createWalletClient } from "viem";
 import { marketV2Abi } from "./abi/cashOptionMarketV2.js";
 import { orderBookV2Abi } from "./abi/cashOptionOrderBookV2.js";
 import { erc20Abi } from "./abi/erc20.js";
@@ -28,6 +27,7 @@ import {
 import { chains, getDeployment, getMarket, type MarketDeployment } from "./chains.js";
 import { decodeInstrumentId, encodeInstrumentId } from "./instrument.js";
 import { orderToTuple, SCOPE_CANCEL, SCOPE_TRADE, type Order } from "./order.js";
+import { sendTxRequest, type SendResult } from "./send.js";
 
 export interface MarketClientOptions {
   chainId: number;
@@ -87,13 +87,7 @@ export interface SessionInfo {
   active: boolean;
 }
 
-export interface SendResult {
-  /** True when nothing was sent. */
-  dryRun: boolean;
-  request: TxRequest;
-  hash?: Hash;
-  from?: Address;
-}
+export type { SendResult } from "./send.js";
 
 /** Read and write helpers for one CashOptionMarketV2 + its book. Every write defaults to a dry run. */
 export class MarketClient {
@@ -253,16 +247,7 @@ export class MarketClient {
    * both cases so a dry run still reports the revert reason a send would hit.
    */
   async send(request: TxRequest, opts: { dryRun?: boolean; simulate?: boolean } = {}): Promise<SendResult> {
-    const dryRun = opts.dryRun ?? true;
-    if (!this.signer) throw new Error("no signer configured");
-    const from = this.signer.address;
-    if (opts.simulate ?? true) {
-      await this.publicClient.call({ account: from, to: request.to, data: request.data, value: request.value });
-    }
-    if (dryRun) return { dryRun: true, request, from };
-    const wallet = createWalletClient({ account: this.signer, chain: this.chain, transport: http(this.rpcUrl) });
-    const hash = await wallet.sendTransaction({ to: request.to, data: request.data, value: request.value ?? 0n });
-    return { dryRun: false, request, hash, from };
+    return sendTxRequest(this, request, opts);
   }
 
   async waitForReceipt(hash: Hash) {

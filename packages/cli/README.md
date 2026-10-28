@@ -18,11 +18,20 @@ hedgehood redeem <expiry> [--send]
 hedgehood withdraw 50 [--to 0x..] [--send]   # owner key
 hedgehood session authorize|revoke|status
 hedgehood register --name "my-agent"         # ERC-8004, mainnet, owner key
+
+# Stock Yield vaults (owner key; requests queue until the next epoch freeze, a redeem can take up to a week)
+hedgehood --mainnet vaults                                   # NAV/share, epoch state, next freeze, cap, last week's yield
+hedgehood --mainnet vault status [--vault hhNVDA-CC]         # shares, queued requests (cancellable?), claimable
+hedgehood --mainnet vault deposit 100 --vault hhNVDA-CC [--stock 0.5] [--send]   # approve + requestDeposit
+hedgehood --mainnet vault redeem all --vault hhNVDA-CC [--send]                  # paid in kind at the next freeze
+hedgehood --mainnet vault claim --vault hhNVDA-CC [--to 0x..] [--send]
+hedgehood --mainnet vault cancel deposit|redeem --vault hhNVDA-CC [--send]
 ```
 
-Instruments: a backend name (`NVDA-20261030-220-C`), a packed id, or `expiry:strike:call|put`.
+Instruments: a backend name (`NVDA-20261030-220-C`), a packed id, or `expiry:strike:call|put`. Vaults: an address, a
+share symbol (`hhNVDA-CC`, `NVDA-CC`) or a ticker that names one fund (`GOOGL`).
 Global options: `--testnet` (default) | `--mainnet` | `--chain <id>`, `--rpc`, `--rfq-url`, `--indexer-url`, `--gateway-url`,
-`--account <owner>`, `--underlying NVDA`, `--session-key-file`, `--owner-key-file`, `--json`. Environment variables of
-`@hedgehood-io/mcp` are honoured too.
+`--vault-api-url <url|off>`, `--account <owner>`, `--underlying NVDA`, `--session-key-file`, `--owner-key-file`, `--json`.
+Environment variables of `@hedgehood-io/mcp` are honoured too.
 
 https://github.com/0xHedgeHood/hedgehood-agent-kit. MIT.

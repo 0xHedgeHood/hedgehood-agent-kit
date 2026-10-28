@@ -16,10 +16,10 @@ RFQ maker and filled on chain with a **session key that can never withdraw**.
 
 | package | what | install |
 |---|---|---|
-| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, P&L and history readers, x402 USDG payer, ERC-8004 helpers | `pnpm add @hedgehood-io/sdk viem` |
-| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 18 tools, every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
-| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw`, `session authorize\|revoke\|status` | `npx @hedgehood-io/cli --help` |
-| [`skills/hedgehood-options`](skills/hedgehood-options/SKILL.md) | the skill an agent reads: market model, the loop, key hygiene, troubleshooting | `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` |
+| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, P&L and history readers, x402 USDG payer, ERC-8004 helpers, `VaultClient` for the Stock Yield vaults | `pnpm add @hedgehood-io/sdk viem` |
+| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 24 tools (18 market + 6 vault), every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
+| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw`, `session authorize\|revoke\|status`, `vaults`, `vault status\|deposit\|redeem\|claim\|cancel` | `npx @hedgehood-io/cli --help` |
+| [`skills/hedgehood-options`](skills/hedgehood-options/SKILL.md) | the skill an agent reads: market model, the loop, the Stock Yield vaults, key hygiene, troubleshooting | `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` |
 | [`examples/`](examples) | a 30-line "agent buys a weekly call" script and an MCP config snippet | `pnpm tsx examples/buy-weekly-call.ts` |
 
 ## Quickstart (testnet, 5 minutes)
@@ -58,6 +58,30 @@ costs under 6 USDG"*. The agent calls `get_quote`, shows you the price, then `fi
 *"how am I doing?"* is `positions` / `get_pnl`, *"what did I trade?"* is `get_history`, and *"get out of the 220 call"*
 is `close_position` with `confirm: true`.
 
+### Stock Yield vaults (mainnet 4663 and testnet)
+
+The same kit deposits into and withdraws from Hedgehood's **Stock Yield vaults**: v2 `EpochFund`s that hold one
+tokenized stock (NVDA, GOOGL, TSLA, AMZN, META, AAPL, MSFT) and USDG, write a covered call (or run the wheel) on it
+every week, and issue transferable NAV shares (`hhNVDA-CC`, …). The premium stays in NAV. Everything is asynchronous:
+a deposit queues until the next epoch freeze (Monday morning New York), is priced at that NAV and becomes shares; a
+redemption queues the same way and is paid in kind (stock + USDG) at the freeze after the current option expires; both
+are then claimed. Requests can be cancelled until the cutoff. Vault actions are sent by the **owner wallet** (the
+account itself); a market session key cannot touch a vault.
+
+```sh
+hedgehood --mainnet vaults                                         # NAV/share, epoch state, next freeze, cap, last week's yield (no key)
+hedgehood --mainnet --owner-key-file ~/.hedgehood/owner.key vault deposit 100 --vault hhNVDA-CC        # dry run: approve + requestDeposit
+hedgehood --mainnet --owner-key-file ~/.hedgehood/owner.key vault deposit 100 --vault hhNVDA-CC --send
+hedgehood --mainnet vault status --vault NVDA-CC                   # shares, queued requests (cancellable?), claimable
+hedgehood --mainnet --owner-key-file ... vault redeem all --vault hhNVDA-CC --send   # paid at the next freeze, after expiry
+hedgehood --mainnet --owner-key-file ... vault claim --vault hhNVDA-CC --send        # once vault status shows claimable
+hedgehood --mainnet --owner-key-file ... vault cancel deposit --vault hhNVDA-CC --send
+```
+
+MCP: `list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel` (the writes are gated
+like `fill_quote`: `confirm: true`, dry run unless `dryRun: false`, owner key). The hosted read-only server exposes
+`list_vaults` / `vault_status` with the same shapes.
+
 ## MCP server
 
 ```json
@@ -89,15 +113,18 @@ is `close_position` with `confirm: true`.
 Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `deposit_x402`,
 `positions` (active: open positions with avg price, mark, unrealized P&L, time to expiry), `get_pnl`, `get_history`
 (past: fills, settlements, redeems), `redeem`, `withdraw` (owner key), `authorize_session` (owner key), `leaderboard`,
-`my_record`, `get_agent_record`, `register_agent` (ERC-8004, owner key), `decode_instrument`. Write tools
-(`fill_quote`, `close_position`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`) do nothing
-without `confirm: true`; with it they simulate and return the unsigned transaction unless `dryRun: false`, and then
-report the tx hash.
+`my_record`, `get_agent_record`, `register_agent` (ERC-8004, owner key), `decode_instrument`; Stock Yield vaults:
+`list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel` (owner key). Write tools
+(`fill_quote`, `close_position`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`,
+`vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel`) do nothing without `confirm: true`; with it they simulate
+and return the unsigned transaction(s) unless `dryRun: false`, and then report the tx hash(es).
 
 ## Security model
 
 - **No custody.** Nothing here holds funds. Balances live in `CashOptionMarketV2`; only the account owner's `withdraw`
-  moves them out. The RFQ backend never holds a key and never sends a transaction.
+  moves them out. The RFQ backend never holds a key and never sends a transaction. Vault shares and queues belong to
+  the account in the `EpochFund`; only the account (or a position manager it approved on chain) can redeem, cancel or
+  claim, so every vault write is sent from the owner key, never from a session key.
 - **Session keys.** The agent's key is authorized by the owner with `authorizeSession(key, expiresAt, scope,
   maxRequirement)`: it can sign and take orders and cancel, for one account, until `expiresAt`, and may not push the
   account's total collateral requirement above `maxRequirement`. It cannot withdraw, deposit from the account, change
@@ -133,6 +160,15 @@ report the tx hash.
   today (placeholder quote signatures, fixture pricing, gateway `SEND=0`): quotes verify but are not fillable until the
   desk mounts its key.
 - Agent identity: ERC-8004 Identity Registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` on 4663 (optional).
+- Stock Yield vaults (hedgehood-vaults `contracts/src/v2`, tag `audit-v2-freeze-2026-10-21`; ABIs vendored in
+  `packages/sdk/src/abi/{epochFund,vaultRegistry,openDepositGate,stakeThresholdGate}.ts`). Mainnet 4663:
+  `VaultRegistry` `0x868502F926AE068B61EA9CC55042A9F962651e76`, `OpenDepositGate` `0x337B27c931873e6Ef087e8f84034b96F1d6eeFA5`,
+  eight funds (`hhNVDA-CC` `0x4a1c42b0E0D229B677D574d3dCdc2A5Dff848373`, `hhNVDA-WHEEL`, `hhGOOGL-CC`, `hhTSLA-CC`,
+  `hhAMZN-CC`, `hhMETA-CC`, `hhAAPL-CC`, `hhMSFT-CC`; the full list is `getVaults(4663)` in `chains.ts`), owner Safe
+  `0xB5C9…489b`, cap 100k USDG per fund, fee 20% of premium. Fund snapshots (NAV, schedules, last epochs, fee) come from
+  the public `GET https://hedgehood.app/api/stockyield/funds` when it answers, else from the chain. Testnet 46630:
+  registry `0xBeE38aF4Fc4f50A0C04bDdA45Bec6cBABFf476b9`, one fund `hhNVDA-CC` `0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4`
+  on open-mint tNVDA2 (fixture feed; not mainnet configuration).
 
 ## Development
 

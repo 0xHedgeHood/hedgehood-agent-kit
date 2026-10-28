@@ -116,5 +116,36 @@ the owner key) works.
 
 `https://mcp.hedgehood.io/mcp` (Python FastMCP, stateless streamable HTTP, JSON responses): `list_markets`,
 `list_instruments`, `get_mark`, `get_quote(instrument, side, quantity, account, session_key?)`, `get_positions`,
-`get_leaderboard`, `get_agent_record`, `how_to_deposit`. Read-only and keyless; the local `@hedgehood-io/mcp` adds the
-signing tools (`fill_quote`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`).
+`get_leaderboard`, `get_agent_record`, `how_to_deposit`, and for the Stock Yield vaults `list_vaults` and
+`vault_status(account, vault?)` with the shapes below. Read-only and keyless; the local `@hedgehood-io/mcp` adds the
+signing tools (`fill_quote`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`,
+`vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel`).
+
+## Stock Yield funds API (hedgehood.app)
+
+`GET https://hedgehood.app/api/stockyield/funds` (keyuyuan/rh `rhsvc/stockyield_funds.py`, served by the hedgehood.app
+API behind a 30 s warm cache; mainnet 4663 only; no auth) → `{ chainId, funds: [row], builtAt }`. A row is the fund's
+on-chain snapshot with every integer as a decimal string: `{ chainId, vault, name, symbol, stock, stockSymbol, usdg,
+usdgSymbol, strategy { address, name, code, legs[] } | null, depositGate, paused, phase, effectivePhase
+(Collecting|Locked|Frozen), currentEpoch, schedules { "<epoch>": { depositCutoff, tradeStart, tradeEnd, expiry,
+maxAtmDeviationBps } } (current and the next two), depositCapUsdg, stockHeld, usdgHeld, pendingStock, pendingUsdg,
+reservedStock, reservedUsdg, totalSupply, markPrice, price (live Oracle price, "0" while the market is closed), readAt,
+epochs: [{ navUsdg, income, settledAt, navPrice?, depositStock?, depositUsdg?, depositsRefunded? }] (last settled epochs,
+newest first), stake (HEDGE threshold, 0 = open gate), feeBps }`; a fund the API could not read comes back as `{ vault,
+error }` and is read from the chain instead. Override with `HEDGEHOOD_VAULT_API_URL` / `--vault-api-url` (`off` =
+chain only). The kit never trusts the API for the fund list: `VaultRegistry.vaults()` on chain is authoritative and API
+rows are joined by address; the account's shares, queues and claimables are always read on chain.
+
+`list_vaults` / `vault_status` shape (the hosted MCP serves the same): per fund `{ vault, symbol, name, strategy { code,
+name }, stock { address, symbol, decimals: 18 }, usdg, gate { address, kind: open|stake|none|unknown }, paused,
+depositCap, capUsed, capLeft, totalShares, holdings { stock, usdg }, nav { usdgPerShare | null, navUsdg, stockPrice,
+source: live|mark|none }, epoch { index, state: open|frozen|locked|settling, phase, nextFreezeAt, nextSettleAt,
+nextCohort, schedule }, lastEpoch { index, premiumIncome, navAtFreeze, weeklyYield, settledAt } | null, feeBps?,
+source: api|chain, my { account, shares, uncreditedShares?, pendingDeposit { epoch, usdg, stock, cancellable } | null,
+pendingRedeem { epoch, shares, cancellable } | null, claimable { stock, usdg }, canDeposit, wallet { usdg, stock },
+nextAction } }`. Amounts are decimal strings (USDG 6 decimals, shares and stock 18), times ISO-8601. `state` is
+derived from the contract's `phase` and the epoch schedule: `open` while collecting before the cutoff, `frozen` once
+the cutoff passed (freeze done or overdue) until an engine locks, `locked` until the expiry, `settling` after it;
+`nextFreezeAt` is the cutoff of the cohort a request made now would join, `nextSettleAt` the current epoch's expiry.
+`weeklyYield` = the last settled epoch's premium income over the NAV it started with (assets at the freeze plus that
+cohort's deposits).

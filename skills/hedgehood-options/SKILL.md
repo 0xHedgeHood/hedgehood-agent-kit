@@ -1,6 +1,6 @@
 ---
 name: hedgehood-options
-description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinhood Chain as an AI agent through Hedgehood's RFQ market: deposit, quote, fill, close before expiry, track P&L and history, settle, redeem, with a session key that can never withdraw. Use when the user wants an agent to buy or write calls/puts on tokenized stocks, check option positions or P&L, exit a position, or set up the Hedgehood MCP server.
+description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinhood Chain as an AI agent through Hedgehood's RFQ market: deposit, quote, fill, close before expiry, track P&L and history, settle, redeem, with a session key that can never withdraw; and deposit into or redeem from Hedgehood's Stock Yield vaults (weekly covered-call / wheel funds on tokenized stocks, NAV shares, asynchronous epochs). Use when the user wants an agent to buy or write calls/puts on tokenized stocks, check option positions or P&L, exit a position, earn option premium passively on a stock through a vault, check or claim a vault position, or set up the Hedgehood MCP server.
 ---
 
 # Hedgehood options for agents
@@ -61,6 +61,41 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 - Sizes are shares (18 decimals on chain, "1" = one share); prices and strikes are USDG (6 decimals).
 - `trading closes 15 minutes before expiry`; `TradingUnavailable` near the close is expected.
 
+## Stock Yield vaults
+
+Hedgehood also runs **Stock Yield vaults**: v2 `EpochFund`s (mainnet 4663: `hhNVDA-CC`, `hhNVDA-WHEEL`, `hhGOOGL-CC`,
+`hhTSLA-CC`, `hhAMZN-CC`, `hhMETA-CC`, `hhAAPL-CC`, `hhMSFT-CC`; testnet: one `hhNVDA-CC`). A fund holds one tokenized
+stock plus USDG, writes a covered call (or runs the wheel) on it every week and issues transferable NAV shares; the
+premium stays in NAV, so the share price carries the yield. Deposits are USDG and/or the stock; the fund is long the
+stock, so NAV falls with it (the premium is a cushion, not a hedge). **Non-US only**, like the market.
+
+**Vault or market?** Use the *market* when the user wants a specific position (buy or write one strike and expiry,
+hedge, speculate, exit intraday): quotes are firm, fills are instant, closing is a fill of the opposite side. Use a
+*vault* when the user wants passive premium income on a stock they are happy to hold, with no strike selection, no
+collateral management and no weekly maintenance, and accepts a weekly cadence and a possible wait of up to a week to get
+out. A vault is not a trade: nothing fills, nothing can be closed early.
+
+**The three steps** (everything is asynchronous; tell the user so before the first call):
+1. **Request.** `vault_deposit(vault, usdg, confirm: true)` approves the fund and calls `requestDeposit`; the amount
+   leaves the owner wallet now and queues for the next epoch. `vault_redeem(vault, shares | "all", confirm: true)`
+   moves the shares to escrow and queues them. A queued request can be cancelled with `vault_cancel` until the cohort's
+   cutoff (`vault_status` shows `cancellable`).
+2. **Wait for the freeze / settlement.** At the epoch's deposit cutoff (Monday 09:25 New York on mainnet) the freeze
+   prices the queued deposits at that moment's NAV (they become shares) and pays the queued redemptions in kind (stock +
+   USDG, pro rata). A redemption requested during a week waits for the current option to expire (Friday close) and
+   for the next freeze: **a redeem can take up to a week**, a deposit until the next Monday. `list_vaults` shows the
+   epoch state (`open` → `frozen` → `locked` → `settling`), `nextFreezeAt` and `nextSettleAt`; use them to say when.
+3. **Claim.** After the freeze, `vault_status` lists what is `claimable`; `vault_claim(vault, confirm: true)` pays it
+   to the owner wallet (`to` optional). Deposited shares need no claim: they appear on the account's next action.
+
+Rules of thumb: vault writes need the **owner key** (`HEDGEHOOD_OWNER_KEY_FILE`); a market session key cannot act on a
+vault and the tools say so. `list_vaults` is the first call (NAV per share, cap left, last week's premium yield, your
+shares); check `gate` / `my.canDeposit` and `capLeft` before a deposit, and `my.pendingDeposit` / `my.pendingRedeem`
+before queuing another one (one open cohort per account per direction; a second request joins the same cohort, a
+request for a later cohort reverts `PendingOtherEpoch`). Shares are 18 decimals, USDG 6. Dry run first (`dryRun`
+default true), report the tx hashes after a real send, and remind the user that the result arrives at the freeze, not
+in the receipt.
+
 ## Setup (MCP server)
 
 Claude Code (plugin): `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` then `/plugin install hedgehood-options`.
@@ -105,6 +140,12 @@ shown only as set/missing.
 | `not_executable:feed_not_healthy` after the built-in retry | the desk's pricing feed is between cycles (20 s) | wait 20 s, quote or close again |
 | `no open position in …` from `close_position` | nothing to close in that instrument for this account | check `positions`; the account may differ from `HEDGEHOOD_ACCOUNT` |
 | backend 5xx / unreachable | RFQ service down; on-chain reads still work | retry with backoff; nothing was signed |
+| `NotEligible` / `not admitted by the deposit gate` (vault) | the receiver is banned by the open gate, or a stake gate's threshold is not met | check `gate.kind` in `list_vaults`; deposit from another account or stake |
+| `DepositCapExceeded` (vault) | the fund's cap is full | `capLeft` in `list_vaults`; smaller amount or another fund |
+| `PendingOtherEpoch` (vault) | the account already has a request queued for a different cohort | wait for that cohort's freeze (or cancel it), then request again |
+| `nothing to claim` (vault) | the redemption's cohort has not frozen yet | `vault_status`: wait for `nextFreezeAt`, then `vault_claim` |
+| `BadAmount` on cancel (vault) | the cohort's cutoff passed; the request is being processed | nothing to cancel; it becomes shares / claimable at the freeze |
+| `Paused` (vault) | the owner paused new deposits and locks; redemptions and claims still work | redeem or wait |
 
 ## Key hygiene
 

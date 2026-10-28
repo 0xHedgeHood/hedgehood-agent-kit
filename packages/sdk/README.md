@@ -33,7 +33,17 @@ math, `signOrder`, `verifyOrderSignature`), `calldata` (every write as an unsign
 (`MarketClient` reads and dry-run-first sends), `rfq` (`RfqClient`: quotes with one retry on `feed_not_healthy`,
 `getPnl`, `getHistory`), `close` (`planClose` / `closePosition`: the opposite-side fill that exits a position), `pnl`
 (`positionPnl`, `formatTimeToExpiry`), `x402` (`depositViaGateway`,
-USDG preset adapted from `@priors/x402`), `identity` (ERC-8004), `units`. ABIs: `marketV2Abi`, `orderBookV2Abi`,
-`erc20Abi`, `identityRegistryAbi`.
+USDG preset adapted from `@priors/x402`), `identity` (ERC-8004), `vault` (`VaultClient` for the Stock Yield vaults:
+`listVaults`, `status`, owner-wallet plans `requestDeposit` / `requestRedeem` / `cancelDeposit` / `cancelRedeem` /
+`claim`, dry run by default), `send` (`sendTxRequest`), `units`. ABIs: `marketV2Abi`, `orderBookV2Abi`, `erc20Abi`,
+`identityRegistryAbi`, `epochFundAbi`, `vaultRegistryAbi`, `openDepositGateAbi`, `stakeThresholdGateAbi`.
+
+```ts
+import { VaultClient, parseUsdg } from "@hedgehood-io/sdk";
+const vaults = new VaultClient({ chainId: 4663, account: OWNER, signer: ownerAccount });
+for (const v of await vaults.listVaults()) console.log(v.symbol, v.epoch.state, v.nav.usdgPerShareRaw, v.my?.sharesRaw);
+const { plan, results } = await vaults.requestDeposit({ vault: await vaults.resolveVault("hhNVDA-CC"), usdgRaw: parseUsdg("100") });
+// plan.steps = approve + requestDeposit; results are dry-run simulations until { dryRun: false }
+```
 
 MIT.

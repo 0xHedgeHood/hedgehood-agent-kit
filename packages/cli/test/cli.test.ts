@@ -35,9 +35,12 @@ describe("hedgehood cli", () => {
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();
-    expect(names).toEqual(["close", "decode", "deposit", "fill", "history", "instruments", "join", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "withdraw"]);
+    expect(names).toEqual(["close", "decode", "deposit", "fill", "history", "instruments", "join", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
     const session = p.commands.find((c) => c.name() === "session")!;
     expect(session.commands.map((c) => c.name()).sort()).toEqual(["authorize", "revoke", "status"]);
+    const vault = p.commands.find((c) => c.name() === "vault")!;
+    expect(vault.commands.map((c) => c.name()).sort()).toEqual(["cancel", "claim", "deposit", "redeem", "status"]);
+    for (const name of ["cancel", "claim", "deposit", "redeem"]) expect(vault.commands.find((c) => c.name() === name)!.options.some((o) => o.long === "--send"), name).toBe(true);
   });
 
   it("every sending command is dry run unless --send", () => {

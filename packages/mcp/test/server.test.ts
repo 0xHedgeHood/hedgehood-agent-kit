@@ -52,8 +52,8 @@ describe("mcp server", () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["authorize_session", "close_position", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "list_instruments", "list_markets", "my_record", "positions", "redeem", "register_agent", "withdraw"]);
-    for (const w of ["fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent"]) {
+    expect(names).toEqual(["authorize_session", "close_position", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "list_instruments", "list_markets", "list_vaults", "my_record", "positions", "redeem", "register_agent", "vault_cancel", "vault_claim", "vault_deposit", "vault_redeem", "vault_status", "withdraw"]);
+    for (const w of ["fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent", "vault_deposit", "vault_redeem", "vault_claim", "vault_cancel"]) {
       const t = tools.find((x) => x.name === w)!;
       const props = (t.inputSchema as { properties: Record<string, unknown> }).properties;
       expect(props.confirm, w).toBeDefined();

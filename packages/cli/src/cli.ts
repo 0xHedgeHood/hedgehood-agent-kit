@@ -30,8 +30,11 @@ import {
   type HistoryEvent,
   type PnlView,
   type TxRequest,
+  type VaultInfo,
+  type VaultPlan,
   type VerifiedQuote,
 } from "@hedgehood-io/sdk";
+import { formatUnits } from "viem";
 import { createContext, loadConfig, requireOwner, requireSession, type KitContext } from "@hedgehood-io/mcp";
 
 const DEFAULT_SESSION_KEY_FILE = "~/.hedgehood/session.key";
@@ -52,6 +55,7 @@ interface GlobalOpts {
   underlying?: string;
   sessionKeyFile?: string;
   ownerKeyFile?: string;
+  vaultApiUrl?: string;
   json?: boolean;
 }
 
@@ -69,6 +73,7 @@ function envFrom(o: GlobalOpts): NodeJS.ProcessEnv {
   if (o.sessionKeyFile) env.HEDGEHOOD_SESSION_KEY_FILE = o.sessionKeyFile;
   else if (!env.HEDGEHOOD_SESSION_KEY_FILE && !env.HEDGEHOOD_SESSION_KEY && existsSync(expand(DEFAULT_SESSION_KEY_FILE))) env.HEDGEHOOD_SESSION_KEY_FILE = DEFAULT_SESSION_KEY_FILE;
   if (o.ownerKeyFile) env.HEDGEHOOD_OWNER_KEY_FILE = o.ownerKeyFile;
+  if (o.vaultApiUrl) env.HEDGEHOOD_VAULT_API_URL = o.vaultApiUrl;
   return env;
 }
 
@@ -204,7 +209,8 @@ export function buildProgram(): Command {
     .option("--account <address>", "trading account (owner) the session key acts for")
     .option("--underlying <ticker>", "NVDA")
     .option("--session-key-file <path>", `session key file (default ${DEFAULT_SESSION_KEY_FILE} when present)`)
-    .option("--owner-key-file <path>", "owner key file, only for deposit/withdraw/session/join")
+    .option("--owner-key-file <path>", "owner key file, only for deposit/withdraw/session/join and every vault action")
+    .option("--vault-api-url <url|off>", "Stock Yield fund snapshot API for `vaults` (default: hedgehood.app on mainnet; off = chain only)")
     .option("--json", "machine-readable output");
 
   program
@@ -532,8 +538,153 @@ export function buildProgram(): Command {
       out(cmd, d, `${describeInstrument(BigInt(id))}  expiry ${d.expiry}  strike ${formatStrike(d.strike)}  ${d.isPut ? "put" : "call"}`);
     });
 
+  registerVaultCommands(program);
+
   program.addOption(new Option("--dry-run", "default; sends are simulated unless --send is given").hideHelp());
   return program;
+}
+
+// ---------------------------------------------------------------- Stock Yield vaults
+
+const VAULT_NOTE = "Vault requests queue until the next epoch freeze (Monday morning New York on mainnet); a redeem is paid in kind after the current weekly option expires, then claimed. Up to a week.";
+
+const whenIso = (t?: bigint) => (t === undefined || t === 0n ? "-" : iso(Number(t)));
+const navOf = (v: VaultInfo) => (v.nav.usdgPerShareRaw === undefined ? "-" : formatUsdg(v.nav.usdgPerShareRaw));
+const pendingOf = (v: VaultInfo) => {
+  const p: string[] = [];
+  if (v.my?.pendingDeposit) p.push(`dep ${v.my.pendingDeposit.usdgRaw ? formatUsdg(v.my.pendingDeposit.usdgRaw) + " USDG" : ""}${v.my.pendingDeposit.stockRaw ? " " + formatShares(v.my.pendingDeposit.stockRaw) + " stk" : ""} (e${v.my.pendingDeposit.epoch}${v.my.pendingDeposit.cancellable ? "" : ", frozen"})`);
+  if (v.my?.pendingRedeem) p.push(`red ${formatShares(v.my.pendingRedeem.sharesRaw)} (e${v.my.pendingRedeem.epoch}${v.my.pendingRedeem.cancellable ? "" : ", frozen"})`);
+  return p.length ? p.join("; ") : "-";
+};
+const claimableOf = (v: VaultInfo) => (v.my && (v.my.claimableStockRaw !== 0n || v.my.claimableUsdgRaw !== 0n) ? `${formatShares(v.my.claimableStockRaw)} stk + ${formatUsdg(v.my.claimableUsdgRaw)} USDG` : "-");
+
+function vaultsHuman(list: VaultInfo[], chainId: number, withAccount: boolean): string {
+  const rows = list.map((v) => {
+    const r = [v.symbol, v.epoch.state, whenIso(v.epoch.nextFreezeAt), navOf(v), formatUsdg(v.nav.navUsdgRaw), `${formatUsdg(v.capUsedUsdgRaw)}/${formatUsdg(v.depositCapUsdgRaw)}`, v.lastEpoch?.weeklyYieldBps === undefined ? "-" : `${(v.lastEpoch.weeklyYieldBps / 100).toFixed(2)}%`];
+    if (withAccount) r.push(v.my ? formatShares(v.my.sharesRaw) : "-", pendingOf(v), claimableOf(v));
+    return r;
+  });
+  const header = ["fund", "epoch", "next freeze (UTC)", "NAV/share", "NAV USDG", "cap used", "last wk"];
+  if (withAccount) header.push("my shares", "pending", "claimable");
+  return [`Stock Yield vaults on chain ${chainId}${list[0]?.source === "api" ? " (snapshot: hedgehood.app API + chain)" : " (chain)"}`, table(header, rows), VAULT_NOTE].join("\n");
+}
+
+function vaultJson(v: VaultInfo) {
+  return {
+    ...v,
+    nav: { ...v.nav, usdgPerShare: v.nav.usdgPerShareRaw === undefined ? null : formatUsdg(v.nav.usdgPerShareRaw), stockPrice: v.nav.priceRaw === 0n ? null : formatUnits(v.nav.priceRaw, 18) },
+    epoch: { ...v.epoch, nextFreezeAtIso: v.epoch.nextFreezeAt ? iso(Number(v.epoch.nextFreezeAt)) : null, nextSettleAtIso: v.epoch.nextSettleAt ? iso(Number(v.epoch.nextSettleAt)) : null },
+  };
+}
+
+function vaultStatusHuman(v: VaultInfo): string {
+  const m = v.my!;
+  return [
+    `${v.symbol} ${v.vault}  epoch ${v.epoch.index} ${v.epoch.state}  next freeze ${whenIso(v.epoch.nextFreezeAt)}  expiry ${whenIso(v.epoch.nextSettleAt)}  NAV/share ${navOf(v)}`,
+    `  shares ${formatShares(m.sharesRaw)}${m.uncreditedSharesRaw ? ` (${formatShares(m.uncreditedSharesRaw)} not credited yet)` : ""}  pending ${pendingOf(v)}  claimable ${claimableOf(v)}`,
+    `  wallet ${formatUsdg(m.walletUsdgRaw)} USDG, ${formatShares(m.walletStockRaw)} ${v.stock.symbol}  canDeposit ${m.canDeposit}`,
+  ].join("\n");
+}
+
+/** Runs a vault plan from the owner key: dry run unless --send; prints every step. */
+async function runPlan(cmd: Command, ctx: KitContext, plan: VaultPlan, sendFlag: boolean | undefined) {
+  requireOwner(ctx);
+  const v = ctx.vault("owner");
+  const results = await v.sendPlan(plan, { dryRun: !sendFlag });
+  const lines = [plan.summary, `  ${VAULT_NOTE}`];
+  for (const r of results) {
+    if (r.dryRun) lines.push(`DRY RUN${r.simulated ? " (simulation passed)" : " (not simulated: needs the approval above mined first)"}: ${r.request.summary}\n  from ${r.from}\n  to   ${r.request.to}\n  data ${r.request.data}`);
+    else lines.push(`${r.status === "success" ? "OK" : "REVERTED"} ${r.request.summary}\n  tx ${r.hash}\n  ${v.chain.blockExplorers?.default.url}/tx/${r.hash}`);
+  }
+  if (results.some((r) => r.dryRun)) lines.push("  add --send to broadcast");
+  const failed = !results.every((r) => r.dryRun || r.status === "success") || results.length !== plan.steps.length;
+  out(cmd, { vault: plan.vault, symbol: plan.symbol, account: plan.account, summary: plan.summary, dryRun: !sendFlag, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated, txHash: r.hash, status: r.status, blockNumber: r.blockNumber })) }, lines.join("\n"));
+  if (failed) process.exitCode = 1;
+}
+
+function registerVaultCommands(program: Command) {
+  program
+    .command("vaults")
+    .description("Stock Yield vaults (v2 EpochFund): NAV per share, epoch state, next freeze, cap, last week's premium yield, and your shares / pending / claimable when an account is known")
+    .action(async (_o: unknown, cmd: Command) => {
+      const ctx = ctxFrom(cmd, true);
+      const v = ctx.vault("none");
+      const withAccount = ctx.account.toLowerCase() !== ZERO;
+      const list = await v.listVaults({ account: withAccount ? ctx.account : null });
+      out(cmd, { chainId: ctx.chainId, account: withAccount ? ctx.account : undefined, registry: v.registry, api: v.apiUrl ?? null, vaults: list.map(vaultJson) }, vaultsHuman(list, ctx.chainId, withAccount));
+    });
+
+  const vault = program.command("vault").description("Stock Yield vault actions: deposit, redeem, claim, cancel (owner key; dry run unless --send). " + VAULT_NOTE);
+  vault
+    .command("status")
+    .description("Your shares, queued requests and claimables per vault")
+    .option("--vault <addr|symbol>", "one fund; default: every fund you touched or can deposit into")
+    .action(async (opts: { vault?: string }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      const v = ctx.vault("none");
+      const vaults = opts.vault ? [await v.resolveVault(opts.vault)] : undefined;
+      const list = await v.status(ctx.account, { vaults });
+      const shown = opts.vault ? list : list.filter((x) => x.my && (x.my.sharesRaw !== 0n || x.my.pendingDeposit || x.my.pendingRedeem || x.my.claimableStockRaw !== 0n || x.my.claimableUsdgRaw !== 0n || x.my.canDeposit));
+      out(cmd, { chainId: ctx.chainId, account: ctx.account, vaults: shown.map(vaultJson) }, [`account ${ctx.account}`, ...(shown.length ? shown.map(vaultStatusHuman) : ["  no vault positions"])].join("\n"));
+    });
+  vault
+    .command("deposit")
+    .description("Queue a USDG (and/or stock) deposit from the owner wallet: approve + requestDeposit")
+    .argument("<usdg>", "USDG amount (0 when depositing stock only)")
+    .requiredOption("--vault <addr|symbol>", "fund address, hhNVDA-CC / NVDA-CC, or a stock ticker naming one fund")
+    .option("--stock <amount>", "stock tokens to deposit as well (18 decimals)")
+    .option("--receiver <address>", "account credited with the shares; default: the account")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (usdg: string, opts: { vault: string; stock?: string; receiver?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const v = ctx.vault("owner");
+      const usdgRaw = parseUsdg(usdg);
+      const plan = await v.planDeposit({ vault: await v.resolveVault(opts.vault), usdgRaw: usdgRaw || undefined, stockRaw: opts.stock ? parseShares(opts.stock) : undefined, receiver: opts.receiver as Address | undefined });
+      await runPlan(cmd, ctx, plan, opts.send);
+    });
+  vault
+    .command("redeem")
+    .description("Queue a redemption of shares (or `all`); paid in kind at the next freeze after the current option expires, then `vault claim`")
+    .argument("<shares|all>")
+    .requiredOption("--vault <addr|symbol>")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (shares: string, opts: { vault: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const v = ctx.vault("owner");
+      const plan = await v.planRedeem({ vault: await v.resolveVault(opts.vault), shares });
+      await runPlan(cmd, ctx, plan, opts.send);
+    });
+  vault
+    .command("claim")
+    .description("Pay out redeemed or refunded stock + USDG (claim(account, to))")
+    .requiredOption("--vault <addr|symbol>")
+    .option("--to <address>", "recipient; default: the owner address")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (opts: { vault: string; to?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const v = ctx.vault("owner");
+      const plan = await v.planClaim({ vault: await v.resolveVault(opts.vault), to: opts.to as Address | undefined });
+      await runPlan(cmd, ctx, plan, opts.send);
+    });
+  vault
+    .command("cancel")
+    .description("Cancel a queued deposit (returned to --to, default the owner) or redemption, until the cohort's cutoff")
+    .argument("<deposit|redeem>")
+    .requiredOption("--vault <addr|symbol>")
+    .option("--to <address>", "deposit only: where the returned assets go")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (which: string, opts: { vault: string; to?: string; send?: boolean }, cmd: Command) => {
+      if (which !== "deposit" && which !== "redeem") throw new Error("cancel takes `deposit` or `redeem`");
+      const ctx = ctxFrom(cmd);
+      requireOwner(ctx);
+      const v = ctx.vault("owner");
+      const addr = await v.resolveVault(opts.vault);
+      const plan = which === "deposit" ? await v.planCancelDeposit({ vault: addr, to: opts.to as Address | undefined }) : await v.planCancelRedeem({ vault: addr });
+      await runPlan(cmd, ctx, plan, opts.send);
+    });
 }
 
 export { privateKeyToAccount };

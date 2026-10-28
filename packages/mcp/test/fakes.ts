@@ -5,7 +5,7 @@
  */
 import { decodeFunctionData, encodeFunctionResult, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { encodeFillOrderAs, encodeInstrumentId, erc20Abi, instrumentName, marketV2Abi, orderBookV2Abi, orderDigest, orderToJson, Side, signOrder, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
+import { encodeFillOrderAs, encodeInstrumentId, epochFundAbi, erc20Abi, instrumentName, marketV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, Side, signOrder, vaultRegistryAbi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
 
 export const ACCOUNT = "0x3333333333333333333333333333333333333333" as Address;
 export const BOOK = "0x7288a3D12e15379C3b64988b54Ab4Da759638cf5" as Address;
@@ -25,10 +25,211 @@ export interface ChainState {
   requirementRaw: bigint;
   /** eth_call payloads the node received for the book (simulated fills). */
   simulated: Hex[];
+  /** The Stock Yield fund (testnet hhNVDA-CC addresses). */
+  vault: VaultState;
 }
 
 export function defaultChain(): ChainState {
-  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [] };
+  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [], vault: defaultVault() };
+}
+
+// ---------------------------------------------------------------- Stock Yield vault fixtures (testnet 46630 hhNVDA-CC)
+
+export const VAULT = "0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4" as Address;
+export const VAULT_REGISTRY = "0xBeE38aF4Fc4f50A0C04bDdA45Bec6cBABFf476b9" as Address;
+export const VAULT_GATE = "0x5b4EE28Efc1f545f9D24f9474F0AeE9c22f8eBD6" as Address;
+export const VAULT_STOCK = "0x267ddeE02B44FDF4D073E124869DaA5BDbF1759D" as Address;
+export const VAULT_USDG = "0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d" as Address;
+export const VAULT_ORACLE = "0x6f4c6a29DD973e33e075Dc7EF94A5D4772dDf793" as Address;
+/** Wed 2026-10-28 ~00:53 UTC: inside epoch 3 (cutoff Mon 10/26 13:30Z, expiry Fri 10/30 19:59Z). */
+export const VAULT_NOW = 1793100000n;
+export const EPOCH3 = { depositCutoff: 1793021400n, tradeStart: 1793021700n, tradeEnd: 1793043000n, expiry: 1793390340n };
+export const EPOCH4 = { depositCutoff: 1793626200n, tradeStart: 1793626500n, tradeEnd: 1793647800n, expiry: 1793995140n };
+
+type Schedule = { depositCutoff: bigint; tradeStart: bigint; tradeEnd: bigint; expiry: bigint };
+type EpochFixture = { frozenAt: bigint; settledAt: bigint; navPrice: bigint; navUsdg: bigint; depositStock: bigint; depositUsdg: bigint; income: bigint };
+
+export interface VaultState {
+  now: bigint;
+  /** 0 Collecting, 1 Locked, 2 Frozen. */
+  phase: number;
+  currentEpoch: bigint;
+  schedules: Record<string, Schedule>;
+  epochs: Record<string, EpochFixture>;
+  totalSupply: bigint;
+  stockHeld: bigint;
+  usdgHeld: bigint;
+  markPrice: bigint;
+  /** 0 = market closed (oracle.price() reverts). */
+  livePrice: bigint;
+  paused: boolean;
+  canDeposit: boolean;
+  /** The account's shares and queues. */
+  balance: bigint;
+  account: { depositEpoch: bigint; depositStock: bigint; depositUsdg: bigint; redeemEpoch: bigint; redeemShares: bigint };
+  /** previewAccount: [uncredited shares, claimable stock, claimable usdg]. */
+  preview: [bigint, bigint, bigint];
+  walletUsdg: bigint;
+  walletStock: bigint;
+  usdgAllowance: bigint;
+  stockAllowance: bigint;
+}
+
+export function defaultVault(): VaultState {
+  return {
+    now: VAULT_NOW,
+    phase: 1,
+    currentEpoch: 3n,
+    schedules: { "3": EPOCH3, "4": EPOCH4 },
+    epochs: { "2": { frozenAt: 1792416600n, settledAt: 1792786399n, navPrice: 213n * ONE, navUsdg: 20_000_000_000n, depositStock: 0n, depositUsdg: 0n, income: 150_000_000n } },
+    totalSupply: 100n * ONE,
+    stockHeld: 95n * ONE,
+    usdgHeld: 300_000_000n,
+    markPrice: 213_375n * 10n ** 15n, // 213.375
+    livePrice: 0n,
+    paused: false,
+    canDeposit: true,
+    balance: 5n * ONE,
+    account: { depositEpoch: 0n, depositStock: 0n, depositUsdg: 0n, redeemEpoch: 0n, redeemShares: 0n },
+    preview: [0n, 0n, 0n],
+    walletUsdg: 1_000_000_000n,
+    walletStock: 2n * ONE,
+    usdgAllowance: 0n,
+    stockAllowance: 0n,
+  };
+}
+
+const vaultAbi = [...epochFundAbi, ...vaultRegistryAbi, ...openDepositGateAbi, ...erc20Abi, { type: "function", name: "price", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint256" }] }] as const;
+const ZERO_SCHEDULE: Schedule = { depositCutoff: 0n, tradeStart: 0n, tradeEnd: 0n, expiry: 0n };
+
+function vaultRpc(state: ChainState, call: { to: Address; data: Hex; from?: Address }): unknown {
+  const v = state.vault;
+  const to = call.to.toLowerCase();
+  const { functionName, args } = decodeFunctionData({ abi: vaultAbi, data: call.data });
+  const a = (args ?? []) as unknown as unknown[];
+  const enc = (result: unknown) => encodeFunctionResult({ abi: vaultAbi, functionName, result } as Parameters<typeof encodeFunctionResult>[0]);
+  if (to === VAULT_REGISTRY.toLowerCase()) {
+    if (functionName === "vaults") return enc([VAULT]);
+    if (functionName === "isVault") return enc((a[0] as string).toLowerCase() === VAULT.toLowerCase());
+  }
+  if (to === VAULT_GATE.toLowerCase()) {
+    if (functionName === "banned") return enc(false);
+    if (functionName === "registry") return enc(VAULT_REGISTRY);
+    if (functionName === "coversVault") return enc(true);
+  }
+  if (to === VAULT_ORACLE.toLowerCase()) {
+    if (functionName === "price") {
+      if (v.livePrice === 0n) throw new Error("execution reverted: ClosedMarket()");
+      return enc(v.livePrice);
+    }
+  }
+  if (to === VAULT_USDG.toLowerCase() || to === VAULT_STOCK.toLowerCase()) {
+    const usdg = to === VAULT_USDG.toLowerCase();
+    switch (functionName) {
+      case "symbol":
+        return enc(usdg ? "tUSDG" : "NVDA");
+      case "balanceOf":
+        return enc((a[0] as string).toLowerCase() === VAULT.toLowerCase() ? 0n : usdg ? v.walletUsdg : v.walletStock);
+      case "allowance":
+        return enc(usdg ? v.usdgAllowance : v.stockAllowance);
+      case "approve":
+        state.simulated.push(call.data);
+        return enc(true);
+    }
+  }
+  if (to === VAULT.toLowerCase()) {
+    switch (functionName) {
+      case "name":
+        return enc("Hedgehood Covered Call NVDA");
+      case "symbol":
+        return enc("hhNVDA-CC");
+      case "stock":
+        return enc(VAULT_STOCK);
+      case "usdg":
+        return enc(VAULT_USDG);
+      case "depositGate":
+        return enc(VAULT_GATE);
+      case "oracle":
+        return enc(VAULT_ORACLE);
+      case "paused":
+        return enc(v.paused);
+      case "phase":
+        return enc(v.phase);
+      case "currentEpoch":
+        return enc(v.currentEpoch);
+      case "depositCapUsdg":
+        return enc(100_000_000_000n);
+      case "stockHeld":
+        return enc(v.stockHeld);
+      case "usdgHeld":
+        return enc(v.usdgHeld);
+      case "pendingStock":
+        return enc(0n);
+      case "pendingUsdg":
+        return enc(v.account.depositUsdg);
+      case "reservedStock":
+      case "reservedUsdg":
+        return enc(0n);
+      case "totalSupply":
+        return enc(v.totalSupply);
+      case "markPrice":
+        return enc(v.markPrice);
+      case "epochSchedules": {
+        const s = v.schedules[String(a[0])] ?? ZERO_SCHEDULE;
+        return enc([s.depositCutoff, s.tradeStart, s.tradeEnd, s.expiry, s.depositCutoff ? 650 : 0]);
+      }
+      case "getEpoch": {
+        const e = v.epochs[String(a[0])];
+        const z = { frozenAt: 0n, settledAt: 0n, depositsRefunded: false, navPrice: 0n, navUsdg: 0n, depositStock: 0n, depositUsdg: 0n, depositShares: 0n, redeemShares: 0n, redeemStock: 0n, redeemUsdg: 0n, depositStockLeft: 0n, depositUsdgLeft: 0n, depositSharesLeft: 0n, redeemSharesLeft: 0n, redeemStockLeft: 0n, redeemUsdgLeft: 0n, settlementPrice: 0n, paidStock: 0n, paidUsdg: 0n, fee: 0n, income: 0n };
+        return enc(e ? { ...z, ...e } : z);
+      }
+      case "balanceOf":
+        return enc((a[0] as string).toLowerCase() === VAULT.toLowerCase() ? 0n : v.balance);
+      case "getAccount":
+        return enc(v.account);
+      case "previewAccount":
+        return enc(v.preview);
+      case "canDeposit":
+        return enc(v.canDeposit);
+      case "isPositionManager":
+        return enc(false);
+      case "requestDeposit":
+      case "requestRedeem":
+      case "cancelDeposit":
+      case "cancelRedeem":
+        state.simulated.push(call.data);
+        return "0x";
+      case "claim":
+        state.simulated.push(call.data);
+        return enc([v.preview[1], v.preview[2]]);
+    }
+  }
+  throw new Error(`fake rpc: no vault fixture for ${functionName} on ${call.to}`);
+}
+
+const VAULT_ADDRESSES = new Set([VAULT, VAULT_REGISTRY, VAULT_GATE, VAULT_STOCK, VAULT_USDG, VAULT_ORACLE].map((x) => x.toLowerCase()));
+
+/** The `GET /api/stockyield/funds` row the public API would serve for the fixture fund (chain 46630 for the tests). */
+export function vaultApiFixture(state: ChainState) {
+  const v = state.vault;
+  const sched = (s: Schedule) => ({ depositCutoff: Number(s.depositCutoff), tradeStart: Number(s.tradeStart), tradeEnd: Number(s.tradeEnd), expiry: Number(s.expiry), maxAtmDeviationBps: s.depositCutoff ? 650 : 0 });
+  const last = v.epochs[String(v.currentEpoch - 1n)];
+  return {
+    chainId: 46630,
+    builtAt: Number(v.now),
+    funds: [
+      {
+        chainId: 46630, vault: VAULT, name: "Hedgehood Covered Call NVDA", symbol: "hhNVDA-CC", stock: VAULT_STOCK, stockSymbol: "NVDA", usdg: VAULT_USDG, usdgSymbol: "tUSDG",
+        strategy: { address: "0x4f44c747cc9ec002C6A80310dC451FFb1D1A522F", name: "Covered Call", code: "CC", legs: ["CALL"] }, depositGate: VAULT_GATE, paused: v.paused,
+        phase: ["Collecting", "Locked", "Frozen"][v.phase], effectivePhase: ["Collecting", "Locked", "Frozen"][v.phase], currentEpoch: v.currentEpoch.toString(),
+        schedules: { [String(v.currentEpoch)]: sched(v.schedules[String(v.currentEpoch)] ?? ZERO_SCHEDULE), [String(v.currentEpoch + 1n)]: sched(v.schedules[String(v.currentEpoch + 1n)] ?? ZERO_SCHEDULE) },
+        depositCapUsdg: "100000000000", stockHeld: v.stockHeld.toString(), usdgHeld: v.usdgHeld.toString(), pendingStock: "0", pendingUsdg: v.account.depositUsdg.toString(), reservedStock: "0", reservedUsdg: "0",
+        totalSupply: v.totalSupply.toString(), markPrice: v.markPrice.toString(), price: v.livePrice.toString(), readAt: Number(v.now),
+        epochs: last ? [{ navUsdg: last.navUsdg.toString(), income: last.income.toString(), settledAt: last.settledAt.toString(), navPrice: last.navPrice.toString(), depositStock: last.depositStock.toString(), depositUsdg: last.depositUsdg.toString(), depositsRefunded: false }] : [],
+        stake: 0, feeBps: 2000,
+      },
+    ],
+  };
 }
 
 const abi = [...marketV2Abi, ...orderBookV2Abi, ...erc20Abi];
@@ -36,8 +237,14 @@ const abi = [...marketV2Abi, ...orderBookV2Abi, ...erc20Abi];
 function rpcResult(state: ChainState, method: string, params: unknown[]): unknown {
   if (method === "eth_chainId") return "0xb626";
   if (method === "eth_blockNumber") return "0x10";
+  if (method === "eth_getBlockByNumber") {
+    const ts = "0x" + state.vault.now.toString(16);
+    const h = "0x" + "11".repeat(32);
+    return { number: "0x10", hash: h, parentHash: h, timestamp: ts, nonce: "0x0000000000000000", difficulty: "0x0", gasLimit: "0x1c9c380", gasUsed: "0x0", miner: "0x" + "00".repeat(20), extraData: "0x", logsBloom: "0x" + "00".repeat(256), mixHash: h, receiptsRoot: h, sha3Uncles: h, size: "0x0", stateRoot: h, totalDifficulty: "0x0", transactionsRoot: h, transactions: [], uncles: [], baseFeePerGas: "0x1" };
+  }
   if (method !== "eth_call") throw new Error(`fake rpc: unexpected ${method}`);
   const call = params[0] as { to: Address; data: Hex; from?: Address };
+  if (VAULT_ADDRESSES.has(call.to.toLowerCase())) return vaultRpc(state, call);
   const { functionName, args } = decodeFunctionData({ abi, data: call.data });
   const enc = (result: unknown) => encodeFunctionResult({ abi, functionName, result } as Parameters<typeof encodeFunctionResult>[0]);
   switch (functionName) {
@@ -145,7 +352,7 @@ export interface FakeWorld {
 }
 
 /** One fetch for everything: the RPC node, the maker (`https://rfq.test`) and the indexer (`https://index.test`). */
-export function fakeWorld(opts: { chain?: ChainState; quoteDryRun?: boolean; quoteFails?: Array<{ status: number; body: unknown }>; indexerDown?: boolean } = {}): FakeWorld {
+export function fakeWorld(opts: { chain?: ChainState; quoteDryRun?: boolean; quoteFails?: Array<{ status: number; body: unknown }>; indexerDown?: boolean; vaultApi?: boolean } = {}): FakeWorld {
   const chain = opts.chain ?? defaultChain();
   const backend: FakeWorld["backend"] = [];
   const failures = [...(opts.quoteFails ?? [])];
@@ -167,6 +374,7 @@ export function fakeWorld(opts: { chain?: ChainState; quoteDryRun?: boolean; quo
     backend.push({ url, body });
     const ok = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } });
     const now = Math.floor(Date.now() / 1000);
+    if (url.pathname === "/api/stockyield/funds") return opts.vaultApi ? ok(vaultApiFixture(chain)) : ok({ error: "unavailable" }, 503);
     if (url.pathname === "/v1/rfq") {
       const f = failures.shift();
       if (f) return ok(f.body, f.status);
