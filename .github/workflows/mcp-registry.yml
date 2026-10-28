@@ -1,0 +1,25 @@
+# Publishes packages/mcp/server.json to the official MCP Registry (registry.modelcontextprotocol.io).
+# The io.github.0xHedgeHood namespace needs an org-level credential; GitHub Actions OIDC proves it without a PAT.
+# Run it by hand (Actions → "MCP Registry publish" → Run workflow) after the npm package of that version is live:
+# the registry validates the npm package's `mcpName` against server.json.
+name: MCP Registry publish
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher --version
+      - name: Login (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+      - name: Publish
+        run: cp packages/mcp/server.json server.json && ./mcp-publisher publish
