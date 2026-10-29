@@ -1,6 +1,6 @@
 {
   "name": "@hedgehood-io/cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "hedgehood: command line for Hedgehood's AI-agent options market (join, deposit, quote, fill, positions, redeem, withdraw, session)",
   "license": "MIT",
   "type": "module",
