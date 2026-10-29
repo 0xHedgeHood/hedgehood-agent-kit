@@ -13,8 +13,8 @@ const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e87209
 const OWNER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 const ACCOUNT = "0x3333333333333333333333333333333333333333" as const;
-const BOOK = "0x7288a3D12e15379C3b64988b54Ab4Da759638cf5";
-const MARKET = "0xC289617d613C9865a6595B365DaD88277282e0Ac";
+const BOOK = "0xD33F1302120b41FAb0a58Aa22111a4c079f93B10";
+const MARKET = "0x068639ad7914156Cbcf1adfB30e6Ccb32Db2226F";
 const EXPIRY = 1793390400n;
 const INSTRUMENT = encodeInstrumentId(EXPIRY, 220_000_000n, false);
 
@@ -97,7 +97,7 @@ describe("mcp server", () => {
     expect(markets.expiries[0]).toMatchObject({ strikes: ["210", "220"], perTokenStrikesRaw: ["210162783", "220170535"], uiMultiplier: NVDA_M.toString() });
   });
 
-  it("authorize_session requires maxSpend, maps unlimited to max uint and defaults maxRequirement to 0", async () => {
+  it("authorize_session requires maxSpend, maps unlimited to max uint, defaults maxShortRisk to 0 and refuses maxRequirement", async () => {
     const world = fakeWorld();
     const { client, ctx } = await connect(world.fetch, { HEDGEHOOD_OWNER_KEY: OWNER_KEY });
     const call = (args: Record<string, unknown>) => withGlobalFetch(world.fetch, () => client.callTool({ name: "authorize_session", arguments: args }));
@@ -106,25 +106,47 @@ describe("mcp server", () => {
     expect(text(missing)).toMatch(/maxSpend is required/);
     const args = (data: Hex) => decodeFunctionData({ abi: marketV2Abi, data }).args as readonly unknown[];
     const budget = JSON.parse(text(await call({ maxSpend: "100" })));
-    expect(budget).toMatchObject({ needsConfirm: true, terms: { maxSpend: "100", maxRequirement: "none (0)" } });
+    expect(budget).toMatchObject({ needsConfirm: true, terms: { maxSpend: "100", maxShortRisk: "none (0)" } });
     expect(args(budget.data).slice(2)).toEqual([3n, 0n, 100_000_000n]);
     expect(args(budget.data)[0]).toBe(ctx.session!.address);
-    const open = JSON.parse(text(await call({ maxSpend: "unlimited", maxRequirement: "Unlimited", cancel: false })));
+    const open = JSON.parse(text(await call({ maxSpend: "unlimited", maxShortRisk: "Unlimited", cancel: false })));
     expect(args(open.data).slice(2)).toEqual([1n, UNLIMITED, UNLIMITED]);
-    expect(open.wouldSend).toMatch(/maxRequirement unlimited, maxSpend unlimited/);
-    const none = JSON.parse(text(await call({ maxSpend: "0", maxRequirement: "250" })));
+    expect(open.wouldSend).toMatch(/maxShortRisk unlimited, maxSpend unlimited/);
+    const none = JSON.parse(text(await call({ maxSpend: "0", maxShortRisk: "250" })));
     expect(args(none.data).slice(3)).toEqual([250_000_000n, 0n]);
+    const old = await call({ maxSpend: "100", maxRequirement: "250" });
+    expect(old.isError).toBe(true);
+    expect(text(old)).toMatch(/maxRequirement was removed .*maxShortRisk/);
     const revoke = JSON.parse(text(await call({ revoke: true })));
     expect(revoke.wouldSend).toMatch(/revokeSession/);
   });
 
-  it("positions shows the session's spendLeft, authorizedAt and caps", async () => {
+  it("positions shows the session's riskLeft, spendLeft and authorizedAt", async () => {
     const chain = defaultChain();
-    chain.session = [4_000_000_000n, 1_790_000_000n, 1n, UNLIMITED, 12_500_000n];
+    chain.session = [4_000_000_000n, 1_790_000_000n, 1n, UNLIMITED - 59_500_000n, 12_500_000n];
     const world = fakeWorld({ chain });
     const { client } = await connect(world.fetch);
     const body = JSON.parse(text(await withGlobalFetch(world.fetch, () => client.callTool({ name: "positions", arguments: {} }))));
-    expect(body.session).toMatchObject({ active: true, canTrade: true, canCancel: false, spendLeft: "12.5", maxRequirement: "unlimited", authorizedAt: "1790000000", authorizedAtIso: "2026-09-21T14:13:20.000Z" });
+    expect(body.session).toMatchObject({ active: true, canTrade: true, canCancel: false, riskLeft: "unlimited", spendLeft: "12.5", spendLeftRaw: "12500000", authorizedAt: "1790000000", authorizedAtIso: "2026-09-21T14:13:20.000Z" });
+  });
+
+  it("get_quote and close_position price the session charge; a sell to open over riskLeft is flagged before any fill", async () => {
+    const world = fakeWorld(); // riskLeft 0, spendLeft 40; long 1 call 220, short 0.5 put 210; caps 150.5 / 279.5
+    const { client } = await connect(world.fetch);
+    const run = (name: string, args: Record<string, unknown>) => withGlobalFetch(world.fetch, () => client.callTool({ name, arguments: args }));
+    // selling 3 calls against a long of 1 opens a short of 2 at 59.5 worst case each: 119 > riskLeft 0
+    const sell = JSON.parse(text(await run("get_quote", { instrument: NAME220C, side: "sell", quantity: "3" })));
+    expect(sell.sessionCharge).toMatchObject({ budget: "shortRisk (riskLeft)", charge: "119", left: "none (0)", withinBudget: false, openedShort: "2", maxPayoutPerToken: "59.5" });
+    expect(sell.next).toMatch(/cannot fill this: riskLeft .*maxShortRisk/);
+    // selling the long held is free
+    const sellLong = JSON.parse(text(await run("get_quote", { instrument: NAME220C, side: "sell", quantity: "1" })));
+    expect(sellLong.sessionCharge).toMatchObject({ charge: "0", withinBudget: true });
+    // buying to open draws premium + fee from spendLeft
+    const buy = JSON.parse(text(await run("get_quote", { instrument: NAME220C, side: "buy", quantity: "1" })));
+    expect(buy.sessionCharge).toMatchObject({ budget: "spend (spendLeft)", charge: "1.6884", left: "40", withinBudget: true });
+    // buying back the 0.5 short put: free up to its worst case (210 - 150.5 = 59.5 per token)
+    const close = JSON.parse(text(await run("close_position", { instrument: NAME210P })));
+    expect(close.sessionCharge).toMatchObject({ budget: "spend (spendLeft)", charge: "0", closedShort: "0.5", withinBudget: true });
   });
 
   it("the session path forces balance mode and explains SessionWalletMode / SessionLimit reverts", async () => {
@@ -140,7 +162,7 @@ describe("mcp server", () => {
     const q = JSON.parse(text(await run("get_quote", { instrument: NAME220C, side: "buy", quantity: "1" })));
     const r = await run("fill_quote", { digest: q.digest, confirm: true });
     expect(r.isError).toBe(true);
-    expect(text(r)).toMatch(/reverted SessionLimit: .*spend budget/);
+    expect(text(r)).toMatch(/reverted SessionLimit: this buy leg draws 1\.6884 USDG from the spend budget \(spendLeft, authorized as maxSpend\), 40 left/);
   });
 
   it("fill_quote refuses an unknown digest, a missing confirm, and a quote for another taker", async () => {

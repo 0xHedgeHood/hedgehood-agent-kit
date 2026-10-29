@@ -2,6 +2,41 @@
 
 ## 0.3.0 (unreleased)
 
+**Breaking: session short-risk budget (hedgehood-options PR #58, `contracts/redteam-fixes` @ `ccbab74`).** Market, book
+and (new) `ChainlinkExpirySource` ABIs re-vendored from that commit; selectors and types are unchanged, the meanings are
+not. Needs a market deployed from `ccbab74` (PR #58 deployed); the testnet registry entry still points at the `131c1ae`
+build.
+
+- `authorizeSession(key, expiresAt, scope, maxShortRisk, maxSpend)`: the 4th argument (was `maxRequirement`, a cap on
+  the account's total requirement) is a cumulative short-risk budget. Each sell leg signed or taken by the key charges
+  `ceil(openedShort x maxPayout / 1e18)`, `openedShort = max(0, qty - max(0, positionBefore))`, `maxPayout = capHigh -
+  K` (call) or `K - capLow` (put) per token; selling a long held is free; 0 = the key cannot sell to open; max uint =
+  unlimited. `maxSpend` is now charged on buys as `max(0, paid - floor(closedShort x maxPayout / 1e18))`: buying to
+  open in full, buying back a short free up to its worst case. Both budgets only decrease; `SessionLimit` means the
+  leg needs more than its budget has left (the market no longer reverts it for a raised total requirement).
+- SDK: `AuthorizeSessionOptions.maxShortRisk` (default 0) replaces `maxRequirement` (passing it throws with a pointer);
+  `encodeAuthorizeSession(…, maxShortRisk, maxSpend)`; `SessionInfo.riskLeft` replaces `maxRequirement` (`sessions()`
+  returns `(expiresAt, authorizedAt, scope, riskLeft, spendLeft)`). New `session` module: `maxPayoutPerToken`,
+  `openedShortOf`, `closedShortOf`, `shortRiskCharge`, `spendCharge`, `sessionChargeOf` (with `withinBudget`),
+  `maxPaidUntilExpiry` (the most an ask can cost until `validUntil`), `describeSessionCharge`, `sessionLimitDetail`;
+  `formatSessionCap` moved there and shows what is left of an `UNLIMITED` grant (>= 2^128) as "unlimited".
+  `MarketClient.position(id)`, `maxPayoutPerToken(id)`, `sessionCharge(leg)`; `planClose` returns `sessionCharge` when
+  given a session key; `MarketClient.send(…, { sessionCharge })` names the budget in a `SessionLimit` error.
+- Errors: `SessionLimit` hint explains both budgets; `StockControlsPaused` now also covers unreadable token controls;
+  `InvalidRoundHint`, `OracleUnavailable` and `RoundWalkExhausted` of the settlement source are decoded (incl. the empty
+  hint at an aggregator phase boundary on `settleLate` / `failingAt`).
+- CLI: `--max-short-risk <usdg|unlimited>` (default 0) on `session authorize` and `join`; `--max-requirement` is a hidden
+  alias that errors with the replacement; the printed `cast` command passes `maxShortRisk`. `session status` and
+  `positions` show `riskLeft` and `spendLeft`; `quote`, `fill` and `close` print the leg's session charge and flag a
+  fill that would revert `SessionLimit`.
+- MCP: `authorize_session` takes `maxShortRisk` (default `"0"`) and refuses `maxRequirement`; `positions` shows
+  `riskLeft` / `spendLeft`; `get_quote`, `fill_quote` and `close_position` return `sessionCharge`, and `get_quote`'s
+  `next` says when the session key cannot fill.
+- Docs: skill (budgets, close is free, troubleshooting rows for `SessionLimit`, `StockControlsPaused`,
+  `InvalidRoundHint`), README, package READMEs, `docs/BACKEND_API.md` (the backend's `sessionLimitRaw` preview still
+  models the requirement cap). Tests: SDK 116 (+19), MCP 27 (+1), CLI 22 (+2), incl. call/put charges, partial
+  closes and flips, rounding, CLI flags and status output.
+
 **Breaking: V2 audit fixes (hedgehood-options PR #54, `contracts/audit-fixes-v2` @ `aa47f7f`).** Market and book ABIs
 re-vendored with `scripts/vendor-abis.mjs` from that commit. The live testnet market `0xC289…e0Ac` was built from
 `131c1ae` (before the fixes): session reads and `authorizeSession` from this version only work against a market

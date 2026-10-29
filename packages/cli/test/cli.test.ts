@@ -134,6 +134,7 @@ describe("hedgehood cli", () => {
     const { text, world } = await run(["close", NAME220C]);
     expect(text).toMatch(/close NVDA-20261030-220-C: position \+1 -> sell 1 \(remaining 0\)/);
     expect(text).toMatch(/price\/share 1\.57 .*you receive 1\.56215/);
+    expect(text).toMatch(/session charge: 0 USDG from the short-risk budget \(sells a long the account holds: free\); left none \(0\)\n/);
     expect(text).toMatch(/DRY RUN \(simulation passed\): fillOrderAs/);
     expect(text).toContain("add --send to broadcast");
     expect(world.backend.find((b) => b.url.pathname === "/v1/rfq")!.body).toMatchObject({ instrument: NAME220C, side: "sell", quantity: "1", taker: ACCOUNT });
@@ -142,6 +143,7 @@ describe("hedgehood cli", () => {
     const r = await run(["close", NAME210P, "--qty", "0.2", "--json"]);
     const j = json(r.text);
     expect(j).toMatchObject({ instrument: NAME210P, side: "buy", positionRaw: "-500000000000000000", quantityRaw: "200000000000000000", remainingRaw: "-300000000000000000", dryRun: true, fillable: true });
+    expect(j.sessionCharge).toMatchObject({ budget: "spend", closedShortRaw: "200000000000000000", chargeRaw: "0", leftRaw: "40000000", withinBudget: true });
     expect(String(j.data).startsWith("0x18943a04")).toBe(true);
     expect(r.world.backend.find((b) => b.url.pathname === "/v1/rfq")!.body).toMatchObject({ side: "buy", quantity: "0.2" });
     // oversize --qty is capped at the position
@@ -165,7 +167,7 @@ describe("hedgehood cli", () => {
     await expect(run(["close", NAME220C, "--all"])).rejects.toThrow(/--all takes no instrument/);
   });
 
-  it("session authorize requires --max-spend, maps unlimited to max uint and defaults --max-requirement to 0", async () => {
+  it("session authorize requires --max-spend, maps unlimited to max uint and defaults --max-short-risk to 0", async () => {
     await expect(run(["session", "authorize"])).rejects.toThrow(/--max-spend is required.*Suggested: --max-spend 100/);
     expect(parseCap("unlimited", "--x")).toBe(UNLIMITED);
     expect(parseCap("12.5", "--x")).toBe(12_500_000n);
@@ -174,26 +176,54 @@ describe("hedgehood cli", () => {
     const budget = json((await runAsOwner(["session", "authorize", "--max-spend", "100", "--json"])).text);
     expect(budget.dryRun).toBe(true);
     expect(args(String(budget.data)).slice(2)).toEqual([3n, 0n, 100_000_000n]);
-    const open = await runAsOwner(["session", "authorize", "--max-spend", "unlimited", "--max-requirement", "unlimited", "--no-cancel"]);
-    expect(open.text).toMatch(/DRY RUN .*maxRequirement unlimited, maxSpend unlimited/);
+    const open = await runAsOwner(["session", "authorize", "--max-spend", "unlimited", "--max-short-risk", "unlimited", "--no-cancel"]);
+    expect(open.text).toMatch(/DRY RUN .*maxShortRisk unlimited, maxSpend unlimited/);
     expect(args(open.world.chain.simulated[0]!).slice(2)).toEqual([1n, UNLIMITED, UNLIMITED]);
+    const risk = json((await runAsOwner(["session", "authorize", "--max-spend", "0", "--max-short-risk", "59.5", "--json"])).text);
+    expect(args(String(risk.data)).slice(3)).toEqual([59_500_000n, 0n]);
+    expect(() => parseCap("-1", "--max-short-risk")).toThrow(/--max-short-risk must be a USDG amount/);
     // join with the owner key needs it too; without the owner key it prints the 5-argument cast command
     await expect(runAsOwner(["join"])).rejects.toThrow(/--max-spend is required/);
     const joined = await run(["join"]);
     expect(joined.text).toMatch(/authorizeSession\(address,uint64,uint256,uint256,uint256\)' 0x[0-9a-fA-F]{40} \d+ 3 0 <maxSpendRaw>/);
+    expect(joined.text).toMatch(/maxShortRisk: summed worst-case payout/);
+    expect((await run(["join", "--max-short-risk", "100", "--max-spend", "5"])).text).toMatch(/' 0x[0-9a-fA-F]{40} \d+ 3 100000000 5000000 --rpc-url/);
   });
 
-  it("session status and positions show spendLeft, authorizedAt and the caps", async () => {
+  it("--max-requirement is gone: session authorize and join refuse it with a pointer to --max-short-risk", async () => {
+    await expect(runAsOwner(["session", "authorize", "--max-spend", "100", "--max-requirement", "0"])).rejects.toThrow(/--max-requirement was removed .*--max-short-risk/);
+    await expect(run(["join", "--max-requirement", "unlimited"])).rejects.toThrow(/--max-requirement was removed/);
+    const authorize = buildProgram().commands.find((c) => c.name() === "session")!.commands.find((c) => c.name() === "authorize")!;
+    expect(authorize.helpInformation()).toMatch(/--max-short-risk <usdg\|unlimited>/);
+    expect(authorize.helpInformation()).not.toMatch(/--max-requirement/);
+  });
+
+  it("quote and fill show the session charge of the leg; a sell to open beyond riskLeft is flagged", async () => {
+    // the fixture session: riskLeft 0, spendLeft 40; long 1 call 220 (caps 150.5 / 279.5: worst case 59.5)
+    const sell = await run(["quote", NAME220C, "--side", "sell", "--qty", "2"]);
+    expect(sell.text).toMatch(/session charge: 59\.5 USDG from the short-risk budget \(opens a short of 1 sh \(worst case 59\.5\/token\)\); left none \(0\) -> the fill will revert SessionLimit/);
+    const j = json((await run(["quote", NAME220C, "--side", "buy", "--json"])).text);
+    expect(j.sessionCharge).toMatchObject({ side: "buy", budget: "spend", chargeRaw: "1688400", leftRaw: "40000000", withinBudget: true });
+    const fill = await run(["fill", "--instrument", NAME220C, "--side", "buy"]);
+    expect(fill.text).toMatch(/session charge: 1\.6884 USDG from the spend budget \(buys to open: charged premium \+ fee in full\); left 40\n/);
+    // the market's SessionLimit names the budget the leg draws
+    const w = fakeWorld();
+    w.chain.fillRevert = "SessionLimit";
+    await expect(run(["fill", "--instrument", NAME220C, "--side", "sell", "--qty", "2"], w)).rejects.toThrow(/reverted SessionLimit: this sell leg draws 59\.5 USDG from the short-risk budget \(riskLeft, authorized as maxShortRisk\), none \(0\) left/);
+  });
+
+  it("session status and positions show riskLeft, spendLeft and authorizedAt", async () => {
     const chain = defaultChain();
     chain.session = [4_000_000_000n, 1_790_000_000n, 3n, UNLIMITED, 42_500_000n];
     const { text } = await run(["session", "status"], fakeWorld({ chain }));
-    expect(text).toMatch(/ACTIVE trade=true cancel=true authorized 2026-09-21T14:13:20Z until 2096-10-02T07:06:40Z spendLeft 42\.5 maxRequirement unlimited/);
-    expect(text).toMatch(/balance mode only/);
+    expect(text).toMatch(/ACTIVE trade=true cancel=true authorized 2026-09-21T14:13:20Z until 2096-10-02T07:06:40Z riskLeft unlimited spendLeft 42\.5/);
+    expect(text).toMatch(/balance mode only; shorts it opens come out of riskLeft/);
     const j = json((await run(["session", "status", "--json"], fakeWorld({ chain }))).text);
-    expect(j).toMatchObject({ authorizedAt: "1790000000", spendLeft: "42500000", maxRequirement: UNLIMITED.toString() });
+    expect(j).toMatchObject({ authorizedAt: "1790000000", riskLeft: UNLIMITED.toString(), spendLeft: "42500000" });
+    expect(j).not.toHaveProperty("maxRequirement");
     const spent = defaultChain();
-    spent.session = [4_000_000_000n, 1_790_000_000n, 1n, 0n, 0n];
-    expect((await run(["positions"], fakeWorld({ chain: spent }))).text).toMatch(/spendLeft none \(0\) maxRequirement none \(0\)/);
+    spent.session = [4_000_000_000n, 1_790_000_000n, 1n, 7_250_000n, 0n];
+    expect((await run(["positions"], fakeWorld({ chain: spent }))).text).toMatch(/riskLeft 7\.25 spendLeft none \(0\)/);
   });
 
   it("names, quotes and decodes by the listed per-share strike under NVDA's mainnet uiMultiplier", async () => {

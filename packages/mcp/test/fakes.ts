@@ -8,8 +8,8 @@ import { privateKeyToAccount } from "viem/accounts";
 import { adaptiveCurveIrmAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
 
 export const ACCOUNT = "0x3333333333333333333333333333333333333333" as Address;
-export const BOOK = "0x7288a3D12e15379C3b64988b54Ab4Da759638cf5" as Address;
-export const MARKET = "0xC289617d613C9865a6595B365DaD88277282e0Ac" as Address;
+export const BOOK = "0xD33F1302120b41FAb0a58Aa22111a4c079f93B10" as Address;
+export const MARKET = "0x068639ad7914156Cbcf1adfB30e6Ccb32Db2226F" as Address;
 export const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 export const EXPIRY = 1793390400n; // 2026-10-30 16:00 New York
 export const STRIKES = [210_000_000n, 220_000_000n];
@@ -29,7 +29,7 @@ export interface ChainState {
   simulated: Hex[];
   /** The expiry's snapshotted uiMultiplier; the listed per-share strikes stay 210 / 220, stored per token under it. */
   uiMultiplier: bigint;
-  /** sessions(account, key): [expiresAt, authorizedAt, scope, maxRequirement, spendLeft]. */
+  /** sessions(account, key): [expiresAt, authorizedAt, scope, riskLeft, spendLeft]. */
   session: [bigint, bigint, bigint, bigint, bigint];
   /** A custom error the next simulated fill reverts with (e.g. "SessionLimit"). */
   fillRevert?: string;
@@ -490,6 +490,13 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
       return enc(strikesOf(state));
     case "positions":
       return enc(state.positions);
+    case "position": {
+      // the same fixture as positions(): [call@210, put@210, call@220, put@220] of EXPIRY
+      const id = (args as unknown as unknown[])[1] as bigint;
+      const ids = strikesOf(state).flatMap((k) => [encodeInstrumentId(EXPIRY, k, false), encodeInstrumentId(EXPIRY, k, true)]);
+      const i = ids.indexOf(id);
+      return enc(i < 0 ? 0n : (state.positions[i] ?? 0n));
+    }
     case "protocolFeeBps":
       return enc(50n);
     case "tradingOpen":

@@ -10,11 +10,13 @@ import {
   decodeInstrumentId,
   depositViaGateway,
   describeInstrument,
+  describeSessionCharge,
   encodeInstrumentId,
   expiryOf,
   formatSessionCap,
   instrumentName,
   shareStrikeOf,
+  Side,
   tokenStrikeOf,
   UNIT_MULTIPLIER,
   UNLIMITED,
@@ -37,10 +39,13 @@ import {
   type HistoryEvent,
   type LendStatus,
   type LendingPlan,
+  type MarketClient,
   type OracleStatus,
   type PlanStep,
   type PlanStepResult,
   type PnlView,
+  type PlannedSessionLeg,
+  type SessionCharge,
   type TxRequest,
   type VaultInfo,
   type VaultPlan,
@@ -108,12 +113,12 @@ const out = (cmd: Command, v: unknown, human?: string) => {
 };
 
 /** Simulates, then (with `--send`) broadcasts and waits; returns what to print instead of printing it. */
-async function sendResult(ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined): Promise<{ json: Record<string, unknown>; human: string; failed: boolean }> {
+async function sendResult(ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined, sessionCharge?: SessionCharge): Promise<{ json: Record<string, unknown>; human: string; failed: boolean }> {
   const dryRun = !sendFlag;
   if (who === "owner") requireOwner(ctx);
   else requireSession(ctx);
   const m = ctx.market(who);
-  const r = await m.send(tx, { dryRun });
+  const r = await m.send(tx, { dryRun, sessionCharge });
   if (r.dryRun) {
     return { json: { dryRun: true, from: r.from, to: tx.to, data: tx.data, summary: tx.summary }, human: `DRY RUN (simulation passed): ${tx.summary}\n  from ${r.from}\n  to   ${tx.to}\n  add --send to broadcast`, failed: false };
   }
@@ -125,8 +130,8 @@ async function sendResult(ctx: KitContext, who: "session" | "owner", tx: TxReque
   };
 }
 
-async function send(cmd: Command, ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined) {
-  const r = await sendResult(ctx, who, tx, sendFlag);
+async function send(cmd: Command, ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined, sessionCharge?: SessionCharge) {
+  const r = await sendResult(ctx, who, tx, sendFlag, sessionCharge);
   out(cmd, r.json, r.human);
   if (r.failed) process.exitCode = 1;
 }
@@ -181,12 +186,13 @@ function closePlanHuman(plan: ClosePlan, underlying: string): string {
   return [
     `close ${plan.instrument}: position ${plan.position.quantityRaw > 0n ? "+" : ""}${formatShares(plan.position.quantityRaw)} -> ${plan.side} ${formatShares(plan.quantityRaw)} (remaining ${plan.remainingRaw > 0n ? "+" : ""}${formatShares(plan.remainingRaw)})`,
     quoteHuman(q, underlying, plan.quantityRaw, plan.position.uiMultiplier),
+    ...(plan.sessionCharge ? [`  ${describeSessionCharge(plan.sessionCharge)}`] : []),
   ].join("\n");
 }
 
 function closePlanJson(plan: ClosePlan) {
   const q = plan.quote;
-  return { instrument: plan.instrument, instrumentId: plan.instrumentId, positionRaw: plan.position.quantityRaw, side: plan.side, quantityRaw: plan.quantityRaw, remainingRaw: plan.remainingRaw, digest: q.digest, pricePerShareRaw: q.pricePerShareRaw, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, secondsLeft: q.secondsLeft, fillable: q.fillable, backendDryRun: q.dryRun };
+  return { instrument: plan.instrument, instrumentId: plan.instrumentId, positionRaw: plan.position.quantityRaw, side: plan.side, quantityRaw: plan.quantityRaw, remainingRaw: plan.remainingRaw, digest: q.digest, pricePerShareRaw: q.pricePerShareRaw, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, secondsLeft: q.secondsLeft, fillable: q.fillable, backendDryRun: q.dryRun, sessionCharge: plan.sessionCharge };
 }
 
 /**
@@ -215,15 +221,33 @@ export function parseCap(v: string, flag: string): bigint {
   }
 }
 
-const MAX_SPEND_HELP = "USDG of premium + fees the session key may spend for the account over the session (0 = it cannot buy; unlimited = no cap)";
-const MAX_REQUIREMENT_HELP = "USDG cap on the account's collateral requirement after a session trade (0 = no new requirement, it cannot write options; unlimited = no cap)";
+const MAX_SPEND_HELP = "cumulative USDG of premium + fees the session key may make the account pay as buyer over the session, beyond the worst case of the shorts it buys back (0 = buy to close only; unlimited = no cap)";
+const MAX_SHORT_RISK_HELP = "cumulative USDG worst case of the shorts the session key may open over the session: each sell leg costs ceil(opened short x (capHigh - strike | strike - capLow) / 1e18), selling a long held is free (0 = it cannot sell to open; unlimited = no cap)";
 const MAX_SPEND_MISSING =
-  "--max-spend is required: the most premium + fees this session key may spend for the account over the session. Suggested: --max-spend 100 (or the budget you mean to trade, at most your deposit); --max-spend 0 lets it only sell/close longs; --max-spend unlimited removes the cap (not recommended).";
+  "--max-spend is required: the most premium + fees this session key may spend for the account over the session. Suggested: --max-spend 100 (or the budget you mean to trade, at most your deposit); --max-spend 0 lets it only sell longs and buy back shorts; --max-spend unlimited removes the cap (not recommended).";
+const MAX_REQUIREMENT_GONE =
+  "--max-requirement was removed (hedgehood-options #58): sessions now carry a cumulative short-risk budget instead of a cap on the account's requirement. Use --max-short-risk <usdg|unlimited> (default 0 = the key cannot sell to open; each short it opens costs its worst-case payout, e.g. 1 share of a 220 call with capHigh 279.5 costs 59.5).";
 
-function sessionLine(s: { key: string; active: boolean; canTrade: boolean; canCancel: boolean; expiresAt: bigint; authorizedAt: bigint; spendLeft: bigint; maxRequirement: bigint }): string {
+/** `--max-requirement` stays only to explain its replacement. */
+const maxRequirementAlias = () => new Option("--max-requirement <usdg|unlimited>", "removed: use --max-short-risk").hideHelp();
+
+function sessionLine(s: { key: string; active: boolean; canTrade: boolean; canCancel: boolean; expiresAt: bigint; authorizedAt: bigint; riskLeft: bigint; spendLeft: bigint }): string {
   const at = (t: bigint) => (t === 0n ? "-" : iso(Number(t)));
-  return `session ${s.key} ${s.active ? "ACTIVE" : "inactive"} trade=${s.canTrade} cancel=${s.canCancel} authorized ${at(s.authorizedAt)} until ${at(s.expiresAt)} spendLeft ${formatSessionCap(s.spendLeft)} maxRequirement ${formatSessionCap(s.maxRequirement)}`;
+  return `session ${s.key} ${s.active ? "ACTIVE" : "inactive"} trade=${s.canTrade} cancel=${s.canCancel} authorized ${at(s.authorizedAt)} until ${at(s.expiresAt)} riskLeft ${formatSessionCap(s.riskLeft)} spendLeft ${formatSessionCap(s.spendLeft)}`;
 }
+
+/** The session charge of a leg the configured session key is about to fill; undefined without a session key or when the reads fail. */
+async function sessionChargeFor(ctx: KitContext, m: MarketClient, leg: Omit<PlannedSessionLeg, "key" | "account">): Promise<SessionCharge | undefined> {
+  const key = sessionKeyOf(ctx);
+  if (!key) return undefined;
+  try {
+    return await m.sessionCharge({ ...leg, key, account: ctx.account });
+  } catch {
+    return undefined;
+  }
+}
+
+const chargeLine = (c: SessionCharge | undefined) => (c ? `\n  ${describeSessionCharge(c)}` : "");
 
 function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint, uiMultiplier: bigint = UNIT_MULTIPLIER): string {
   const pays = q.netNowRaw > 0n;
@@ -258,9 +282,11 @@ export function buildProgram(): Command {
     .description("Create a session key (if none), show the addresses, and (with an owner key) authorize it on the market")
     .option("--days <n>", "session validity in days", "30")
     .option("--max-spend <usdg|unlimited>", `${MAX_SPEND_HELP}; required to authorize`)
-    .option("--max-requirement <usdg|unlimited>", MAX_REQUIREMENT_HELP, "0")
+    .option("--max-short-risk <usdg|unlimited>", MAX_SHORT_RISK_HELP, "0")
+    .addOption(maxRequirementAlias())
     .option("--send", "broadcast instead of dry run")
-    .action(async (opts: { days: string; maxSpend?: string; maxRequirement: string; send?: boolean }, cmd: Command) => {
+    .action(async (opts: { days: string; maxSpend?: string; maxShortRisk: string; maxRequirement?: string; send?: boolean }, cmd: Command) => {
+      if (opts.maxRequirement !== undefined) throw new Error(MAX_REQUIREMENT_GONE);
       const g = cmd.optsWithGlobals() as GlobalOpts;
       const file = expand(g.sessionKeyFile ?? process.env.HEDGEHOOD_SESSION_KEY_FILE ?? DEFAULT_SESSION_KEY_FILE);
       let created = false;
@@ -279,15 +305,16 @@ export function buildProgram(): Command {
         `account         ${ctx.account}${ctx.owner ? " (owner key loaded)" : ""}`,
         `chain ${ctx.chainId}  market ${ctx.deployment.market}  book ${ctx.deployment.orderBook}`,
       ];
-      const maxRequirement = parseCap(opts.maxRequirement, "--max-requirement");
+      const maxShortRisk = parseCap(opts.maxShortRisk, "--max-short-risk");
       const maxSpend = opts.maxSpend === undefined ? undefined : parseCap(opts.maxSpend, "--max-spend");
       if (!ctx.owner) {
         lines.push(
           "",
           "Next, from the OWNER wallet (not this machine, if you can): authorize the session key on the market:",
-          `  cast send ${ctx.deployment.market} 'authorizeSession(address,uint64,uint256,uint256,uint256)' ${session.address} ${Math.floor(Date.now() / 1000) + Number(opts.days) * 86400} 3 ${maxRequirement} ${maxSpend ?? "<maxSpendRaw>"} --rpc-url <rpc>`,
-          "  (scope 3 = trade + cancel; then maxRequirement and maxSpend in USDG raw (6 decimals): 0 = none, 115792089237316195423570985008687907853269984665640564039457584007913129639935 = unlimited.",
-          "   maxSpend is the most premium + fees the key may spend over the session, e.g. 100000000 = 100 USDG; maxRequirement 0 = it cannot write options)",
+          `  cast send ${ctx.deployment.market} 'authorizeSession(address,uint64,uint256,uint256,uint256)' ${session.address} ${Math.floor(Date.now() / 1000) + Number(opts.days) * 86400} 3 ${maxShortRisk} ${maxSpend ?? "<maxSpendRaw>"} --rpc-url <rpc>`,
+          "  (scope 3 = trade + cancel; then maxShortRisk and maxSpend, cumulative budgets in USDG raw (6 decimals): 0 = none, 115792089237316195423570985008687907853269984665640564039457584007913129639935 = unlimited.",
+          "   maxSpend: premium + fees the key may pay over the session beyond buying back shorts, e.g. 100000000 = 100 USDG;",
+          "   maxShortRisk: summed worst-case payout of the shorts it may open; 0 = it cannot sell to open)",
           "then deposit USDG: `hedgehood deposit <amount> --x402` or `cast send <usdg> 'approve(address,uint256)' ...; cast send <market> 'deposit(address,uint256)' ...`",
           "",
           "MCP config for Claude Code / Codex:",
@@ -298,7 +325,7 @@ export function buildProgram(): Command {
       }
       if (maxSpend === undefined) throw new Error(MAX_SPEND_MISSING);
       process.stdout.write(lines.join("\n") + "\n");
-      const tx = ctx.market("owner").authorizeSession(session.address, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: true, maxRequirement, maxSpend });
+      const tx = ctx.market("owner").authorizeSession(session.address, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: true, maxShortRisk, maxSpend });
       await send(cmd, ctx, "owner", tx, opts.send);
     });
 
@@ -342,12 +369,13 @@ export function buildProgram(): Command {
       const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
       const file = { order: orderToJson(q.order), signature: q.signature, side: opts.side, quantityRaw: qty.toString(), chainId: ctx.chainId, dryRun: q.dryRun };
       if (opts.out) writeFileSync(opts.out, JSON.stringify(file, null, 2));
-      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable }, quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + (opts.out ? `\n  saved to ${opts.out}` : ""));
+      const charge = await sessionChargeFor(ctx, m, { instrumentId: id, side: opts.side, quantityRaw: qty, order: q.order, protocolFeeBps: q.feeBps });
+      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable, sessionCharge: charge }, quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + chargeLine(charge) + (opts.out ? `\n  saved to ${opts.out}` : ""));
     });
 
   program
     .command("fill")
-    .description("Fill a saved quote file, or quote-and-fill an instrument in one go (session key, always balance mode; a buy is charged to the session's spend budget)")
+    .description("Fill a saved quote file, or quote-and-fill an instrument in one go (session key, always balance mode; a sell that opens a short draws the short-risk budget, a buy the spend budget beyond the shorts it closes)")
     .argument("[quoteFile]")
     .option("--instrument <x>", "quote-and-fill: instrument id or expiry:strike:call|put")
     .option("--side <buy|sell>")
@@ -376,7 +404,9 @@ export function buildProgram(): Command {
         signature = q.signature;
       }
       if (order.taker.toLowerCase() !== ctx.account.toLowerCase()) throw new Error(`quote is addressed to ${order.taker}, not ${ctx.account}`);
-      await send(cmd, ctx, "session", m.fillOrderAs(order, signature, qty, true), opts.send);
+      const charge = await sessionChargeFor(ctx, m, { instrumentId: order.instrumentId, side: order.side === Side.Ask ? "buy" : "sell", quantityRaw: qty, order });
+      if (charge) process.stdout.write(`  ${describeSessionCharge(charge)}\n`);
+      await send(cmd, ctx, "session", m.fillOrderAs(order, signature, qty, true), opts.send, charge);
     });
 
   program
@@ -399,7 +429,7 @@ export function buildProgram(): Command {
         const human = [closePlanHuman(plan, underlying)];
         if (!plan.quote.fillable) throw new Error(`${plan.instrument}: backend dry-run quote (placeholder signature): nothing to fill`);
         if (plan.quote.canFill === false) human.push(`  maker says canFill=false${plan.quote.shortfallRaw > 0n ? ` (short ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}; the fill will likely revert`);
-        const r = await sendResult(ctx, "session", plan.request, opts.send);
+        const r = await sendResult(ctx, "session", plan.request, opts.send, plan.sessionCharge);
         human.push(r.human);
         return { json: { ...closePlanJson(plan), ...r.json }, human: human.join("\n"), failed: r.failed };
       };
@@ -534,21 +564,23 @@ export function buildProgram(): Command {
   const session = program.command("session").description("Session key management (owner key)");
   session
     .command("authorize")
-    .description("authorizeSession(key, expiresAt, scope, maxRequirement, maxSpend); re-authorizing resets the spend budget and voids orders the key signed before")
+    .description("authorizeSession(key, expiresAt, scope, maxShortRisk, maxSpend); re-authorizing resets both budgets and voids orders the key signed before")
     .option("--key <address>", "default: the configured session key")
     .option("--days <n>", "validity", "30")
     .option("--max-spend <usdg|unlimited>", `${MAX_SPEND_HELP}; required, e.g. 100`)
-    .option("--max-requirement <usdg|unlimited>", MAX_REQUIREMENT_HELP, "0")
+    .option("--max-short-risk <usdg|unlimited>", MAX_SHORT_RISK_HELP, "0")
+    .addOption(maxRequirementAlias())
     .option("--no-cancel", "do not grant SCOPE_CANCEL")
     .option("--send")
-    .action(async (opts: { key?: string; days: string; maxSpend?: string; maxRequirement: string; cancel: boolean; send?: boolean }, cmd: Command) => {
+    .action(async (opts: { key?: string; days: string; maxSpend?: string; maxShortRisk: string; maxRequirement?: string; cancel: boolean; send?: boolean }, cmd: Command) => {
+      if (opts.maxRequirement !== undefined) throw new Error(MAX_REQUIREMENT_GONE);
       if (opts.maxSpend === undefined) throw new Error(MAX_SPEND_MISSING);
       const maxSpend = parseCap(opts.maxSpend, "--max-spend");
-      const maxRequirement = parseCap(opts.maxRequirement, "--max-requirement");
+      const maxShortRisk = parseCap(opts.maxShortRisk, "--max-short-risk");
       const ctx = ctxFrom(cmd);
       const key = (opts.key ?? ctx.session?.address) as Address | undefined;
       if (!key) throw new Error("no session key: pass --key or create one with `hedgehood join`");
-      await send(cmd, ctx, "owner", ctx.market("owner").authorizeSession(key, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: opts.cancel, maxRequirement, maxSpend }), opts.send);
+      await send(cmd, ctx, "owner", ctx.market("owner").authorizeSession(key, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: opts.cancel, maxShortRisk, maxSpend }), opts.send);
     });
   session
     .command("revoke")
@@ -566,7 +598,7 @@ export function buildProgram(): Command {
       const key = (opts.key ?? ctx.session?.address) as Address | undefined;
       if (!key) throw new Error("no session key configured");
       const s = await ctx.market("none").session(key, ctx.account);
-      out(cmd, s, `${sessionLine(s)}\n  account ${ctx.account}; a session key fills in balance mode only, buys come out of spendLeft (SessionLimit when exhausted)`);
+      out(cmd, s, `${sessionLine(s)}\n  account ${ctx.account}; a session key fills in balance mode only; shorts it opens come out of riskLeft (their worst case), buys out of spendLeft beyond the shorts they close (SessionLimit when either runs out)`);
     });
 
   program

@@ -17,17 +17,22 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 ## The loop
 
 1. **Keys.** The *owner* wallet holds the funds and signs rarely: `authorizeSession(sessionKey, expiresAt, scope,
-   maxRequirement, maxSpend)` once, deposits, withdrawals. The *session key* lives on the agent's machine
+   maxShortRisk, maxSpend)` once, deposits, withdrawals. The *session key* lives on the agent's machine
    (`HEDGEHOOD_SESSION_KEY_FILE`, chmod 600) and can only trade and cancel for the account; it can never withdraw, change
-   sessions or receive funds. Its reach is bounded on chain:
-   - `maxSpend` (required): the total premium + fees the key may make the account pay over the session; each buy
-     decrements `spendLeft`. `0` = it cannot buy at all; `unlimited` = `type(uint256).max`. Suggest a budget (e.g. 100
-     USDG, at most the deposit) rather than unlimited.
-   - `maxRequirement`: the account's total collateral requirement a session trade may push it to. `0` (the kit's
-     default) = no new requirement, i.e. the key can buy and close but not write options; `unlimited` = no cap.
+   sessions or receive funds. Its reach is bounded on chain by two **cumulative** budgets (USDG; they only go down over
+   the session; `SessionLimit` when a fill needs more than is left):
+   - `maxShortRisk` -> `riskLeft`: the summed worst case of the shorts the key may open. Each sell leg costs
+     `ceil(openedShort x maxPayout / 1e18)`, `openedShort` = shares beyond the long the account holds (selling a long
+     you hold is free), `maxPayout` = `capHigh - strike` (call) or `strike - capLow` (put) per token. Example: caps
+     150.5 / 279.5, selling 1 share of the 220 call from flat costs 59.5. `0` (the kit's default) = the key cannot
+     sell to open; `unlimited` = `type(uint256).max`.
+   - `maxSpend` (required) -> `spendLeft`: premium + fee the key may make the account pay as buyer, less the worst case
+     of the shorts a buy closes (buying back a short at no more than its worst case is free; buying to open is charged
+     in full). `0` = buy to close only. Suggest a budget (e.g. 100 USDG, at most the deposit) rather than unlimited.
    - every leg it signs or takes settles in balance mode (never the account's wallet).
-   It can still sell longs the account holds at the price it accepts: hand it only to an agent trusted with the balance.
-   Re-authorizing (rotate, extend, top up the budget) resets `spendLeft` and voids every order the key signed before.
+   So a key can lose at most `maxShortRisk + maxSpend`, plus the longs it can sell at the price it accepts and the gap
+   between a short's worst case and its value when it buys it back: hand it only to an agent trusted with the balance.
+   Re-authorizing (rotate, extend, top up) resets both budgets and voids every order the key signed before.
 2. **Deposit.** USDG goes into the market balance (`deposit(account, amount)` by the owner wallet, or the x402 gateway:
    tool `deposit_x402`). In balance mode the agent never needs an ERC-20 approval.
 3. **Quote.** `get_quote(instrument, side, quantity)` returns a verified quote: price per share, premium, taker fee
@@ -35,15 +40,18 @@ calls); longs post nothing but the premium, short legs lock their worst case.
    `startTime` and `validUntil`; the contract evaluates the premium at the fill block.
 4. **Fill.** `fill_quote(digest, confirm: true)` simulates (dry run) and, with `dryRun: false`, sends
    `fillOrderAs(account, order, sig, qty, fromBalance = true)` from the session key. The tool returns the tx hash. A
-   session key always fills with `fromBalance = true` (the market reverts `SessionWalletMode` otherwise); a buy's premium
-   + fee comes out of the session's `spendLeft`.
+   session key always fills with `fromBalance = true` (the market reverts `SessionWalletMode` otherwise). `get_quote`,
+   `fill_quote` and `close_position` return `sessionCharge`: the budget the leg draws (`shortRisk` for a sell, `spend` for
+   a buy), the charge, what is left and `withinBudget`; `false` means the fill would revert `SessionLimit`, so do not send.
 5. **Watch.** `positions` is the ACTIVE book: every open position with quantity, average entry price, the desk's mark,
    unrealized P&L and time to expiry. `get_pnl` gives the totals (realized / unrealized / fees / total); `get_history` is
    the PAST: fills, settlements and redeems, newest first.
 6. **Close (optional).** To exit before expiry call `close_position(instrument, quantity?, confirm: true)`. Positions net
    out on chain and the maker quotes both sides, so a close is a fill of the opposite side of the same instrument: a long
    is sold to the bid, a short bought back at the ask, for at most `|position|`. Same session key, same balance mode, same
-   dry run unless `dryRun: false`. Without `confirm` it only prices the exit.
+   dry run unless `dryRun: false`. Without `confirm` it only prices the exit. A close costs nothing from either budget in
+   the normal case (selling a long opens no short; buying back a short is charged only what it pays above its worst
+   case), so a session with `riskLeft` and `spendLeft` at 0 can still exit.
 7. **Settle / redeem.** After expiry the keeper calls `settle(expiry)` and `redeemFor(account, expiry)`; the payoff lands in
    the market balance. The agent may call `redeem` itself. `positions` lists expiries awaiting redemption.
 8. **Withdraw.** Owner key only: `withdraw(amount, to)`.
@@ -51,8 +59,9 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 ## Using the tools well
 
 - Start with `list_markets` (addresses, open expiries, strikes, fee) and `positions` (balance, free collateral, session
-  status: `spendLeft`, `maxRequirement`, `authorizedAt`). If `session.active` is false, stop: the owner must
-  `authorize_session` first. If `spendLeft` is below what a buy costs, the fill reverts `SessionLimit`: ask the owner.
+  status: `riskLeft`, `spendLeft`, `authorizedAt`). If `session.active` is false, stop: the owner must
+  `authorize_session` first. Before filling, read the quote's `sessionCharge`: if `withinBudget` is false the fill
+  reverts `SessionLimit` (a sell to open beyond `riskLeft`, or a buy beyond `spendLeft`): trade smaller or ask the owner.
 - Instruments are named `NVDA-20261030-220-C` (New York date, **listed per-share** strike, C/P). Ids pack `(expiry << 96) |
   (strike << 1) | isPut` with the strike per token: the market stores `round(shareStrike x M / 1e18)`, M being the
   token's `uiMultiplier` snapshotted when the expiry opened. With M = 1 the two are equal; NVDA on mainnet has M =
@@ -194,7 +203,9 @@ shown only as set/missing.
 | symptom | meaning | do |
 |---|---|---|
 | `NotAuthorizedSigner` | session not authorized, expired or revoked for this account, or an order signed before the session was re-authorized | owner runs `authorize_session` (check `HEDGEHOOD_ACCOUNT` is the owner address, not the session address); quote again |
-| `SessionLimit` | the premium + fee exceeds the session's `spendLeft` (0 = it cannot buy), or the fill would push the requirement above `maxRequirement` (0 = no new requirement) | check `positions` -> `session`; smaller size, or the owner re-authorizes with a larger `maxSpend` / `maxRequirement` |
+| `SessionLimit` | a session budget is exhausted: a sell that opens a short costs more worst case than `riskLeft` (0 = cannot sell to open), or a buy costs more than `spendLeft` beyond the shorts it closes (0 = buy to close only) | read `sessionCharge` of the quote and `positions` -> `session`; smaller size, or the owner re-authorizes with a larger `maxShortRisk` / `maxSpend` |
+| `StockControlsPaused` | the stock token's oracle is paused, or its controls cannot be read (a token upgrade broke them) | trading, new expiries and `settle` wait until they read again; the owner fallback (`settleWithPrice`) or `settleLate` settles a stuck expiry |
+| `InvalidRoundHint` | a settlement round hint is wrong, or `settleLate` / `failingAt` needs a hint because the walk back hit a Chainlink phase boundary | pass `hint = abi.encode(stockRoundId, quoteRoundId)` of the rounds in effect at the expiry (keeper / operator task) |
 | `SessionWalletMode` | a session-key leg was sent in wallet mode (`fromBalance = false`) | fill in balance mode (the kit's default; `close_position` forces it for a session key) |
 | `InsufficientCollateral` | balance below premium + fee (buy) or below the new requirement (sell) | `deposit_x402` / owner deposit |
 | `WrongTaker` | quote addressed to another account | your `HEDGEHOOD_ACCOUNT` differs from what `get_quote` sent; fix config, quote again |

@@ -2,7 +2,7 @@
 // Vendors contract ABIs from a `forge build` into packages/sdk/src/abi/. Only the ABI (no bytecode, no metadata) is
 // copied: the contract sources themselves are not part of this repo.
 //
-//   node scripts/vendor-abis.mjs <hedgehood-options/contracts/out> [git commit]            # CashOptionMarketV2 + book
+//   node scripts/vendor-abis.mjs <hedgehood-options/contracts/out> [git commit]            # CashOptionMarketV2, book, settlement source
 //   node scripts/vendor-abis.mjs --vaults <hedgehood-vaults/contracts/out> [git commit]    # EpochFund, VaultRegistry, gates
 //   node scripts/vendor-abis.mjs --lending <hedgehood-vaults root> [git commit]            # Share lending: Morpho Blue,
 //        AdaptiveCurveIrm, ShareRiskOracle, Morpho Vault V2 + its Blue adapter. Blue and the IRM come from the committed
@@ -26,6 +26,7 @@ const sets = {
     targets: [
       ["CashOptionMarketV2.sol/CashOptionMarketV2.json", "marketV2Abi", "cashOptionMarketV2.ts", "CashOptionMarketV2.sol"],
       ["CashOptionOrderBookV2.sol/CashOptionOrderBookV2.json", "orderBookV2Abi", "cashOptionOrderBookV2.ts", "CashOptionOrderBookV2.sol"],
+      ["ChainlinkExpirySource.sol/ChainlinkExpirySource.json", "chainlinkExpirySourceAbi", "chainlinkExpirySource.ts", "ChainlinkExpirySource.sol"],
     ],
   },
   vaults: {

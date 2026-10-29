@@ -21,9 +21,12 @@ Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`
 `withdraw`*, `authorize_session`*, `leaderboard`, `my_record`, `get_agent_record`, `register_agent`*, `decode_instrument`;
 Stock Yield vaults: `list_vaults`, `vault_status`, `vault_deposit`*, `vault_redeem`*, `vault_claim`*, `vault_cancel`*
 share lending: `lend_status`, `lend_deposit`*, `lend_withdraw`*, `borrow_status`, `borrow_supply_collateral`*, `borrow_take`*,
-`borrow_repay`*, `borrow_withdraw_collateral`* (* owner key). `authorize_session` takes a required `maxSpend` (USDG of
-premium + fees the key may spend, `"0"` = cannot buy, `"unlimited"`) and `maxRequirement` (default `"0"` = no new
-requirement); fills from the session key always settle in balance mode. Vault requests queue until the fund's next epoch freeze and are claimed afterwards; a redeem can take up
+`borrow_repay`*, `borrow_withdraw_collateral`* (* owner key). `authorize_session` takes a required `maxSpend` (cumulative
+USDG of premium + fees the key may spend beyond buying back shorts, `"0"` = buy to close only, `"unlimited"`) and
+`maxShortRisk` (cumulative worst case of the shorts it may open, default `"0"` = cannot sell to open); `maxRequirement` is
+refused with a pointer to `maxShortRisk`. Fills from the session key always settle in balance mode; `get_quote`,
+`fill_quote` and `close_position` return the leg's `sessionCharge` (budget, charge, left, `withinBudget`) and
+`positions` shows `riskLeft` / `spendLeft`. Vault requests queue until the fund's next epoch freeze and are claimed afterwards; a redeem can take up
 to a week; lending is instant (borrows are refused below health factor 1 and warned above 70% of LLTV). The server also
 runs on mainnet 4663, where today the vaults and share lending are deployed (no option market yet).
 
