@@ -10,6 +10,8 @@ export * from "./vault.js";
 export * from "./lending.js";
 export * from "./rfq.js";
 export * from "./close.js";
+export * from "./account.js";
+export * from "./funding.js";
 export * from "./pnl.js";
 export * from "./x402.js";
 export * from "./errors.js";

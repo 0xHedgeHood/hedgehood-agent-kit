@@ -1,4 +1,4 @@
-import { getDeployment, getMarket, LendingClient, MarketClient, RfqClient, VaultClient, type LendingDeployment, type MarketDeployment, type VaultDeployment, type VerifiedQuote } from "@hedgehood-io/sdk";
+import { getDeployment, getMarket, LendingClient, MarketClient, readAccount, resolveMarket, RfqClient, VaultClient, type AccountView, type LendingDeployment, type MarketDeployment, type VaultDeployment, type VerifiedQuote } from "@hedgehood-io/sdk";
 import type { Address, Hex } from "viem";
 import { privateKeyToAccount, type LocalAccount } from "viem/accounts";
 import type { KitConfig } from "./config.js";
@@ -21,12 +21,18 @@ export interface KitContext {
   rfq: RfqClient;
   /** A market client signing with the session key (trades, redeemFor) or the owner key (deposit, withdraw, sessions). */
   market: (signer?: "session" | "owner" | "none") => MarketClient;
+  /** Every option market of the chain (one CashOptionMarketV2 per underlying; each keeps its own balance and sessions). */
+  markets: MarketDeployment[];
+  /** A market client for another market of the chain, by ticker or market / book address; undefined = the default market. */
+  marketFor: (ref: string | undefined, signer?: "session" | "owner" | "none") => MarketClient;
+  /** The account across every market (`readAccount`), with the configured trading key's session status. */
+  accountView: (key?: Address) => Promise<AccountView>;
   /** A vault client: reads, or writes signed with the owner key (a session key cannot act on a vault). */
   vault: (signer?: "owner" | "none") => VaultClient;
   /** A lending client: reads, or writes signed with the owner key (it holds the USDG and the fund shares). */
   lending: (signer?: "owner" | "none") => LendingClient;
   /** Quotes returned by get_quote, by digest, so fill_quote can take a digest instead of the whole order. */
-  quotes: Map<Hex, { quote: VerifiedQuote; fetchedAt: number; side: "buy" | "sell"; requestedQuantityRaw: bigint }>;
+  quotes: Map<Hex, { quote: VerifiedQuote; fetchedAt: number; side: "buy" | "sell"; requestedQuantityRaw: bigint; underlying?: string }>;
   fetch?: typeof fetch;
 }
 
@@ -55,10 +61,16 @@ export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; 
     if (!marketDeployment) throw marketError ?? new Error(`no option market on chain ${chainId}`);
     return marketDeployment;
   };
-  const market = (signer: "session" | "owner" | "none" = "session") => {
-    const s = signer === "session" ? session : signer === "owner" ? owner : undefined;
-    return new MarketClient({ chainId, rpcUrl: config.rpcUrl, deployment: requireMarket(), account, signer: s });
+  const signerOf = (signer: "session" | "owner" | "none") => (signer === "session" ? session : signer === "owner" ? owner : undefined);
+  const market = (signer: "session" | "owner" | "none" = "session") => new MarketClient({ chainId, rpcUrl: config.rpcUrl, deployment: requireMarket(), account, signer: signerOf(signer) });
+  const markets = extra.deployment && !dep.markets.some((m) => m.market.toLowerCase() === extra.deployment!.market.toLowerCase()) ? [extra.deployment, ...dep.markets] : dep.markets;
+  const marketFor = (ref: string | undefined, signer: "session" | "owner" | "none" = "session") => {
+    if (ref === undefined || ref.trim() === "") return market(signer);
+    const r = ref.trim().toLowerCase();
+    const deployment = markets.find((m) => m.underlying.toLowerCase() === r || m.market.toLowerCase() === r || m.orderBook.toLowerCase() === r) ?? resolveMarket(chainId, ref);
+    return new MarketClient({ chainId, rpcUrl: config.rpcUrl, deployment, account, signer: signerOf(signer) });
   };
+  const accountView = (key?: Address) => readAccount({ chainId, rpcUrl: config.rpcUrl, account, key: key ?? (session ?? owner)?.address, markets });
   const vault = (signer: "owner" | "none" = "none") => {
     if (!vaults) throw new Error(`no Stock Yield vaults on chain ${chainId}`);
     const opts: ConstructorParameters<typeof VaultClient>[0] = { chainId, rpcUrl: config.rpcUrl, deployment: vaults, account, signer: signer === "owner" ? owner : undefined, apiUrl: config.vaultApiUrl };
@@ -85,6 +97,9 @@ export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; 
     owner,
     rfq,
     market,
+    markets,
+    marketFor,
+    accountView,
     vault,
     lending,
     quotes: new Map(),
@@ -102,4 +117,24 @@ export function requireSession(ctx: KitContext): LocalAccount {
   const s = ctx.session ?? ctx.owner;
   if (!s) throw new Error("no signing key: set HEDGEHOOD_SESSION_KEY_FILE");
   return s;
+}
+
+/**
+ * Who signs a fill or close. `role` "owner" means the signing key IS the account: it may fill in wallet mode (pay from
+ * its wallet, no deposit) or in balance mode with an automatic deposit. `role` "session" is a session key: balance mode
+ * only, and it never moves funds. Default: the session key when configured, else the owner key; `prefer` overrides.
+ */
+export interface TradeSigner {
+  who: "session" | "owner";
+  role: "owner" | "session";
+  signer: LocalAccount;
+}
+
+export function tradeSigner(ctx: KitContext, prefer?: "session" | "owner"): TradeSigner {
+  const pick = prefer ?? (ctx.session ? "session" : "owner");
+  const signer = pick === "owner" ? ctx.owner : ctx.session;
+  if (!signer) throw new Error(pick === "owner" ? "no owner key: set HEDGEHOOD_OWNER_KEY_FILE (or use the session key)" : "no session key: set HEDGEHOOD_SESSION_KEY_FILE");
+  const role = signer.address.toLowerCase() === ctx.account.toLowerCase() ? "owner" : "session";
+  if (pick === "owner" && role !== "owner") throw new Error(`the owner key ${signer.address} is not the trading account ${ctx.account}: it cannot fill for it`);
+  return { who: pick, role, signer };
 }

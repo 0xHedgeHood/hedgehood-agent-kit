@@ -516,6 +516,24 @@ export function getDeployment(chainId: number): ChainDeployment {
   return d;
 }
 
+/** Multicall3 (canonical CREATE2 address; deployed on Robinhood Chain mainnet and testnet). */
+export const MULTICALL3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+/**
+ * A market of a chain by its underlying ticker (`GOOGL`, any case) or by its market or order book address: what a
+ * `--market` flag or a `market` tool argument names.
+ */
+export function resolveMarket(chainId: number, ref: string): MarketDeployment {
+  const r = ref.trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(r)) {
+    const d = getDeployment(chainId);
+    const m = d.markets.find((x) => x.market.toLowerCase() === r.toLowerCase() || x.orderBook.toLowerCase() === r.toLowerCase());
+    if (!m) throw new Error(`${r} is not a listed market or order book on chain ${chainId} (known: ${d.markets.map((x) => x.underlying).join(", ") || "none"})`);
+    return m;
+  }
+  return getMarket(chainId, r);
+}
+
 /** The market for an underlying ticker on a chain, or a clear error. */
 export function getMarket(chainId: number, underlying = "NVDA"): MarketDeployment {
   const d = getDeployment(chainId);
