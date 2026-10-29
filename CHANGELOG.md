@@ -26,8 +26,15 @@ balance, positions and session grant; the kit now reads and trades them like one
 - MCP: `get_account`, `deposit`, `rebalance` (owner, confirm + dryRun), `withdraw` takes `market` and `all`;
   `get_quote`, `get_mark`, `list_instruments`, `positions`, `close_position`, `deposit_x402` take `market` (or the
   instrument name's ticker); `fill_quote` / `close_position` take `signer`, `fromBalance`, `autoDeposit`, `approve`
-  with the same owner / session rules; `list_markets` lists every market. 36 tools.
-- Tests: SDK 127 (+6), MCP 32 (+4), CLI 28 (+4); the shared fakes answer Multicall3 and per-market state.
+  with the same owner / session rules; `list_markets` lists every market. 37 tools including `get_dashboard`.
+- Tests after combining the account and dashboard changes: SDK 131, MCP 33, CLI 30; the shared fakes answer
+  Multicall3 and per-market state.
+
+- User portfolio ASCII dashboard shared by SDK `renderPnlDashboard`, CLI `dashboard` / `pnl --ascii`, and MCP
+  `get_dashboard` (text plus structured data). Shows account-wide totals, active positions, signed snapshot bars,
+  report/mark times and unknown marks without a fabricated equity curve. Dashboard queries need only an address.
+- CLI `markets` alias `list`; `--ascii` tables for markets and positions. Existing JSON commands retain their shapes.
+- Local-build, address-only Claude Code setup and synthetic preview: [terminal guide](docs/TERMINAL.md).
 
 ## 0.3.0 (2026-10-29)
 

@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
+  renderPnlDashboard,
   buildRegistrationFile,
   dataUri,
   decodeInstrumentId,
@@ -649,6 +650,25 @@ export function createServer(ctx: KitContext): McpServer {
       if (!plan.quote.fillable) return json({ ...view, ok: false, fillable: false, note: "the desk runs without a signer key: this quote carries a placeholder signature and cannot be filled; nothing to send" });
       if (plan.quote.canFill === false) view.quote.fundingPreview = { ...view.quote.fundingPreview, note: `maker predicts canFill=false${plan.quote.shortfallRaw > 0n ? ` (shortfall ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}` };
       return fillAs(ctx, args, () => m, plan.quote.order, plan.quote.signature, plan.quantityRaw, view, plan.sessionCharge);
+    },
+  );
+
+  server.registerTool(
+    "get_dashboard",
+    {
+      title: "Account dashboard (ASCII)",
+      description: "Read-only account-wide option portfolio from the indexer: realized/unrealized P&L, fees, active positions and signed ASCII bars. Returns the same display as `hedgehood dashboard`, plus structured raw data. Show the display verbatim in a fenced text block. Bars compare current positions, not historical returns. Missing values stay unknown; no keys or trades are needed.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    },
+    async () => {
+      const p = await ctx.rfq.getPnl(ctx.account);
+      const display = renderPnlDashboard(p, ctx.chainId);
+      const data = { chainId: ctx.chainId, ...p, display };
+      return {
+        content: [{ type: "text" as const, text: "```text\n" + display + "\n```" }, { type: "text" as const, text: JSON.stringify(data) }],
+        structuredContent: data,
+      };
     },
   );
 

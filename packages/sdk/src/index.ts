@@ -13,6 +13,7 @@ export * from "./close.js";
 export * from "./account.js";
 export * from "./funding.js";
 export * from "./pnl.js";
+export * from "./display.js";
 export * from "./x402.js";
 export * from "./errors.js";
 export * from "./identity.js";

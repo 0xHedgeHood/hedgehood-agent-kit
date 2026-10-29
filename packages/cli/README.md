@@ -1,5 +1,8 @@
 # @hedgehood-io/cli
 
+For the unreleased ASCII portfolio dashboard, `--ascii` tables and matching Claude Code view, see the
+[terminal guide](../../docs/TERMINAL.md). Build this checkout to use `hedgehood dashboard`; it needs only an address.
+
 `hedgehood`: command line for Hedgehood's AI-agent options market on Robinhood Chain. Sends are **dry run** (simulated,
 calldata printed) unless `--send` is given. Non-US only.
 
