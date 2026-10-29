@@ -407,6 +407,17 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
         protocolFeeBps: 150,
         note: "tORCL MockStockToken + MockPushFeed fixture; settled in TestUSD (hUSD-test), deployed 2026-10-29 with hedgehood-options contracts/script/testnet/deploy-all.sh; not mainnet configuration",
       },
+      {
+        underlying: "GOOGL",
+        market: "0x8b51467DB7a822c10286059199bd2574Baa19De8",
+        orderBook: "0xAeaD738d9D00Ead829B21b3A28B1235fd727316D",
+        underlyingToken: "0xc9d73d982EB397b157cc143d4d8d094fA2D88c23",
+        settlementToken: "0x850DE815d41F6983Aaf09247f9a465c0aefff04C",
+        source: "0x77db26de1Aa844073e443712eD63DD0A981c7Ca3",
+        deployBlock: 144861450n,
+        protocolFeeBps: 150,
+        note: "tGOOGL MockStockToken + MockPushFeed fixture; settled in TestUSD (hUSD-test), deployed 2026-10-29 with hedgehood-options contracts/script/testnet/deploy-all.sh; not mainnet configuration",
+      },
     ],
     vaults: {
       registry: "0xBeE38aF4Fc4f50A0C04bDdA45Bec6cBABFf476b9",
