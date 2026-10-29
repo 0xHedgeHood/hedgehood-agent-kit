@@ -52,12 +52,21 @@ import {
   type VaultInfo,
   type VaultPlan,
   type VerifiedQuote,
+  sessionFundingRefusal,
+  planDeposit,
+  planFillFunding,
+  planRebalance,
+  planWithdrawAll,
+  type AccountView,
+  type FillFundingPlan,
+  type Order,
+  erc20Abi,
 } from "@hedgehood-io/sdk";
 import { formatUnits } from "viem";
 import type { Address, Chain, Hex } from "viem";
 import type { MarketClient } from "@hedgehood-io/sdk";
 import { z } from "zod";
-import { requireOwner, requireSession, type KitContext } from "./context.js";
+import { requireOwner, requireSession, tradeSigner, type KitContext, type TradeSigner } from "./context.js";
 import { describeConfig } from "./config.js";
 
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "address").transform((s) => s as Address);
@@ -104,13 +113,13 @@ async function instrumentFrom(m: MarketClient, args: { instrument?: string; inst
  * `extra` is merged into every JSON answer (what a close or fill was priced at), never into an error. With the leg's
  * `sessionCharge`, a SessionLimit revert names the budget it draws and what was left.
  */
-async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRequest, confirm: boolean, dryRun: boolean | undefined, extra: Record<string, unknown> = {}, sessionCharge?: SessionCharge) {
+async function sendOrExplain(ctx: KitContext, who: "session" | "owner", tx: TxRequest, confirm: boolean, dryRun: boolean | undefined, extra: Record<string, unknown> = {}, sessionCharge?: SessionCharge, client?: MarketClient) {
   const dry = dryRun ?? ctx.config.dryRunDefault;
   if (!confirm) {
     return json({ ...extra, ok: false, needsConfirm: true, wouldSend: tx.summary, to: tx.to, data: tx.data, dryRun: dry, hint: "call again with confirm: true" });
   }
   const signer = who === "owner" ? requireOwner(ctx) : requireSession(ctx);
-  const m = ctx.market(who);
+  const m = client ?? ctx.market(who);
   try {
     const r = await m.send(tx, { dryRun: dry, sessionCharge });
     if (r.dryRun) return json({ ...extra, ok: true, dryRun: true, simulated: true, from: signer.address, to: tx.to, data: tx.data, summary: tx.summary, hint: "simulation passed; call again with dryRun: false to broadcast" });
@@ -213,6 +222,143 @@ function sessionView(s: Awaited<ReturnType<MarketClient["session"]>>) {
   };
 }
 
+const marketField = z.string().min(1).optional().describe("Market: underlying ticker (GOOGL) or market address. Default: the instrument name's ticker, else HEDGEHOOD_UNDERLYING");
+
+/** The market a call names (`market`, else the instrument name's ticker when listed, else the default market). */
+function pickMarket(ctx: KitContext, args: { market?: string; instrument?: string }, signer: "session" | "owner" | "none" = "none"): MarketClient {
+  if (args.market) return ctx.marketFor(args.market, signer);
+  if (args.instrument) {
+    const t = args.instrument.split("-")[0]!.toUpperCase();
+    if (ctx.markets.some((m) => m.underlying.toUpperCase() === t)) return ctx.marketFor(t, signer);
+  }
+  return ctx.market(signer);
+}
+
+/** The listed market an order belongs to (its `market` field), else the default market. */
+function marketOfOrder(ctx: KitContext, market: Address, signer: "session" | "owner" | "none"): MarketClient {
+  return ctx.markets.some((m) => m.market.toLowerCase() === market.toLowerCase()) ? ctx.marketFor(market, signer) : ctx.market(signer);
+}
+
+/** An ERC-20 allowance for display: "unlimited" from 2^128 up, else USDG. */
+const allowanceText = (raw: bigint) => (raw >= 1n << 128n ? "unlimited" : formatUsdg(raw));
+
+export function accountViewJson(v: AccountView) {
+  return {
+    chainId: v.chainId,
+    account: v.account,
+    key: v.key,
+    keyRole: v.keyRole,
+    asOf: v.asOf,
+    wallet: v.wallet.map((w) => ({ token: w.token, balance: formatUsdg(w.balanceRaw), balanceRaw: w.balanceRaw, error: w.error })),
+    totals: { collateral: formatUsdg(v.totals.collateralRaw), locked: formatUsdg(v.totals.requirementRaw), free: formatUsdg(v.totals.freeCollateralRaw), openPositions: v.totals.openPositions, expiredPositions: v.totals.expiredPositions },
+    tradable: v.tradable,
+    failed: v.failed,
+    markets: v.markets.map((m) => ({
+      underlying: m.underlying,
+      market: m.market,
+      error: m.error,
+      collateral: formatUsdg(m.collateralRaw),
+      locked: formatUsdg(m.requirementRaw),
+      free: formatUsdg(m.freeCollateralRaw),
+      walletAllowance: allowanceText(m.allowanceRaw),
+      openPositions: m.openPositions,
+      expiredPositions: m.expiredPositions,
+      session: m.session ? { active: m.session.active, canTrade: m.session.canTrade, expiresAt: m.session.expiresAt, riskLeft: formatSessionCap(m.session.riskLeft), spendLeft: formatSessionCap(m.session.spendLeft) } : undefined,
+      canTradeFromBalance: m.canTradeFromBalance,
+    })),
+  };
+}
+
+function fundingView(p: FillFundingPlan) {
+  return {
+    market: p.underlying,
+    mode: p.mode,
+    side: p.side,
+    paysUpTo: p.side === "buy" ? formatUsdg(p.paysUpToRaw) : undefined,
+    receivesAtLeast: p.side === "sell" ? formatUsdg(p.receivesAtLeastRaw) : undefined,
+    walletPullUpTo: p.mode === "wallet" ? formatUsdg(p.walletPullUpToRaw) : undefined,
+    balanceShortfall: p.mode === "balance" ? formatUsdg(p.balanceShortfallRaw) : undefined,
+    deposit: p.depositRaw > 0n ? formatUsdg(p.depositRaw) : undefined,
+    approve: p.approveRaw > 0n ? allowanceText(p.approveRaw) : undefined,
+    marketBalance: formatUsdg(p.collateralRaw),
+    requirementAfter: formatUsdg(p.requirementAfterRaw),
+    wallet: formatUsdg(p.walletUsdgRaw),
+    walletAllowance: allowanceText(p.allowanceRaw),
+    summary: p.summary,
+    problems: p.problems.length ? p.problems : undefined,
+  };
+}
+
+/**
+ * Runs a plan of market steps (approve / deposit / withdraw / fill) from the market client's signer behind the usual
+ * confirm + dryRun gates; a dry run simulates what can run alone and returns every unsigned transaction.
+ */
+async function marketPlanOrExplain(ctx: KitContext, m: MarketClient, plan: { steps: PlanStep[]; summary: string }, view: Record<string, unknown>, confirm: boolean, dryRun: boolean | undefined, sessionCharge?: SessionCharge) {
+  const dry = dryRun ?? ctx.config.dryRunDefault;
+  if (!confirm) return json({ ...view, ok: false, needsConfirm: true, wouldSend: plan.summary, steps: plan.steps.map((s) => ({ kind: s.kind, to: s.to, data: s.data, summary: s.summary })), dryRun: dry, hint: "call again with confirm: true" });
+  if (!m.signer) return fail("no signing key configured");
+  try {
+    const results = await m.sendPlan(plan, { dryRun: dry, sessionCharge });
+    if (dry) {
+      return json({ ...view, ok: true, dryRun: true, from: m.signer.address, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated })), hint: `simulation passed${results.some((r) => !r.simulated) ? " (a step after an earlier one is not simulated until that one is mined)" : ""}; call again with dryRun: false to broadcast` });
+    }
+    const ok = results.length === plan.steps.length && results.every((r) => r.status === "success");
+    return json({ ...view, ok, dryRun: false, from: m.signer.address, steps: results.map((r) => ({ kind: r.kind, txHash: r.hash, status: r.status, blockNumber: r.blockNumber, summary: r.request.summary, explorer: `${m.chain.blockExplorers?.default.url}/tx/${r.hash}` })) });
+  } catch (e) {
+    return fail(`${plan.summary} failed: ${errorText(e)}`);
+  }
+}
+
+/**
+ * Fills (or closes) from the resolved signer: a session key in balance mode only (refused with the owner's fix when the
+ * market balance is short); the account's own key in wallet mode by default (approve if needed, then fill), or balance
+ * mode with `fromBalance`, depositing the shortfall first with `autoDeposit`.
+ */
+async function fillAs(
+  ctx: KitContext,
+  opts: { signer?: "session" | "owner"; fromBalance?: boolean; autoDeposit?: boolean; approve?: "exact" | "max"; confirm: boolean; dryRun?: boolean },
+  marketOf: (who: "session" | "owner") => MarketClient,
+  order: Order,
+  signature: Hex,
+  quantityRaw: bigint,
+  view: Record<string, unknown>,
+  sessionCharge?: SessionCharge,
+) {
+  let ts: TradeSigner;
+  try {
+    ts = tradeSigner(ctx, opts.signer);
+  } catch (e) {
+    return fail(errorText(e));
+  }
+  const m = marketOf(ts.who);
+  if (ts.role === "session") {
+    if (opts.autoDeposit) return fail("autoDeposit needs the account's own key: a session key never deposits from the owner's wallet. The owner deposits (deposit tool) or rebalances (rebalance tool) into this market, then the key fills.");
+    const note = opts.fromBalance === false ? "fromBalance: false ignored: a session key always settles in balance mode (the market reverts SessionWalletMode on a session leg in wallet mode)" : undefined;
+    const short = await sessionFundingRefusal({ market: m, order, signature, quantityRaw, accountView: () => ctx.accountView(m.signer?.address) });
+    if (short) return fail(`refused: ${short.message}`);
+    const tx = m.fillOrderAs(order, signature, quantityRaw, true);
+    return sendOrExplain(ctx, ts.who, tx, opts.confirm, opts.dryRun, { ...view, market: m.deployment.underlying, mode: "balance", ...(note ? { note } : {}), ...(sessionCharge ? { sessionCharge: sessionChargeView(sessionCharge) } : {}) }, sessionCharge, m);
+  }
+  const mode = opts.autoDeposit || opts.fromBalance === true ? "balance" : "wallet";
+  let plan: FillFundingPlan;
+  try {
+    plan = await planFillFunding({ market: m, order, signature, quantityRaw, mode, autoDeposit: opts.autoDeposit, approve: opts.approve });
+  } catch (e) {
+    return fail(`fill failed: ${errorText(e)}`);
+  }
+  const funding = fundingView(plan);
+  if (plan.problems.length) {
+    const fix = plan.mode === "balance" && plan.balanceShortfallRaw > 0n && !opts.autoDeposit ? "; pass autoDeposit: true to deposit the shortfall first, or omit fromBalance to pay from the wallet" : "";
+    return fail(`fill refused: ${plan.problems.join("; ")}${fix}`);
+  }
+  return marketPlanOrExplain(ctx, m, { steps: plan.steps, summary: plan.summary }, { ...view, market: m.deployment.underlying, funding }, opts.confirm, opts.dryRun);
+}
+
+const signerField = z.enum(["session", "owner"]).optional().describe("Who signs: the session key (default when configured; balance mode only) or the owner key (the account itself: wallet mode by default)");
+const fromBalanceField = z.boolean().optional().describe("Account's own key: true settles inside this market's deposited balance; default false = WALLET mode (premium, fee and any collateral pulled from the wallet, no deposit needed; approves the market first if the allowance is short). A session key always uses balance mode");
+const autoDepositField = z.boolean().optional().describe("Account's own key, balance mode: deposit the market balance's shortfall first (approve + deposit + fill)");
+const approveField = z.enum(["exact", "max"]).optional().describe("When an approval is needed: exact (default, just what this fill can pull) or max (unlimited)");
+
 export function createServer(ctx: KitContext): McpServer {
   const server = new McpServer({ name: "hedgehood-options", version: "0.3.0" });
   const underlying = ctx.marketDeployment?.underlying ?? "NVDA";
@@ -246,6 +392,8 @@ export function createServer(ctx: KitContext): McpServer {
         uiMultiplier: mult,
         expiries: infos.map((i) => ({ expiry: i.expiry, date: new Date(Number(i.expiry) * 1000).toISOString(), tradingOpen: i.tradingOpen, settled: i.settled, uiMultiplier: i.uiMultiplier, anchor: formatUsdg(i.anchor), capLow: formatUsdg(i.capLow), capHigh: formatUsdg(i.capHigh), strikes: i.shareStrikes.map(formatStrike), perTokenStrikesRaw: i.uiMultiplier === UNIT_MULTIPLIER ? undefined : i.strikes })),
         backend,
+        allMarkets: ctx.markets.map((x) => ({ underlying: x.underlying, market: x.market, orderBook: x.orderBook })),
+        note: "each market keeps its own balance, positions and session keys; get_account shows the account in all of them, and get_quote / fill_quote / close_position take `market` (or the instrument name's ticker)",
         config: describeConfig(ctx.config),
       });
     },
@@ -256,10 +404,11 @@ export function createServer(ctx: KitContext): McpServer {
     {
       title: "List instruments",
       description: "Calls and puts of one expiry (or all open expiries): instrument names and ids, listed per-share strikes (and the per-token raw strike in the id when the expiry's uiMultiplier is not 1), whether trading is open, and whether the backend quotes them. Read-only.",
-      inputSchema: { expiry: uintString.optional().describe("Unix seconds of the expiry; omit for every open expiry") },
+      inputSchema: { expiry: uintString.optional().describe("Unix seconds of the expiry; omit for every open expiry"), market: marketField },
     },
-    async ({ expiry }) => {
-      const m = ctx.market("none");
+    async ({ expiry, market }) => {
+      const m = pickMarket(ctx, { market });
+      const underlying = m.deployment.underlying;
       const expiries = expiry ? [BigInt(expiry)] : await m.openedExpiries();
       const out = [];
       for (const e of expiries) {
@@ -293,10 +442,11 @@ export function createServer(ctx: KitContext): McpServer {
     {
       title: "Get mark",
       description: "The desk's indicative bid / ask / mid per share (USDG), delta, iv and whether it is executable right now; not a firm price. Use get_quote for one.",
-      inputSchema: instrumentFields,
+      inputSchema: { ...instrumentFields, market: marketField },
     },
     async (args) => {
-      const m = ctx.market("none");
+      const m = pickMarket(ctx, args);
+      const underlying = m.deployment.underlying;
       const id = await instrumentFrom(m, args);
       const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
       const mark = await ctx.rfq.mark({ instrumentId: id, underlying, uiMultiplier });
@@ -308,15 +458,17 @@ export function createServer(ctx: KitContext): McpServer {
     "get_quote",
     {
       title: "Get firm quote (RFQ)",
-      description: "Asks the maker for a firm, signed quote addressed to your account, verifies the signature, taker and expiry locally, and returns price, fee, time left and a digest to pass to fill_quote. Quotes decay and expire in seconds. Read-only (nothing is sent).",
+      description: "Asks the maker for a firm, signed quote addressed to your account, verifies the signature, taker and expiry locally, and returns price, fee, time left and a digest to pass to fill_quote. Any market of the chain: `market`, or the instrument name's ticker. Quotes decay and expire in seconds. Read-only (nothing is sent).",
       inputSchema: {
         ...instrumentFields,
+        market: marketField,
         side: z.enum(["buy", "sell"]).describe("buy = you buy the option (pay premium); sell = you write it (receive premium, post collateral)"),
         quantity: decimalAmount.describe("Shares, e.g. \"1\" or \"0.5\""),
       },
     },
     async (args) => {
-      const m = ctx.market("none");
+      const m = pickMarket(ctx, args);
+      const underlying = m.deployment.underlying;
       const id = await instrumentFrom(m, args);
       const quantityRaw = parseShares(args.quantity);
       const fee = await m.protocolFeeBps();
@@ -324,8 +476,8 @@ export function createServer(ctx: KitContext): McpServer {
       const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
       const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: args.side, quantityRaw, taker: ctx.account, sessionKey, underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: fee });
       const digest = q.digest;
-      ctx.quotes.set(digest, { quote: q, fetchedAt: Date.now(), side: args.side, requestedQuantityRaw: quantityRaw });
-      const view = quoteView(q, underlying, args.side, quantityRaw, uiMultiplier);
+      ctx.quotes.set(digest, { quote: q, fetchedAt: Date.now(), side: args.side, requestedQuantityRaw: quantityRaw, underlying });
+      const view = { market: underlying, ...quoteView(q, underlying, args.side, quantityRaw, uiMultiplier) };
       let requirementAfter: string | undefined;
       try {
         requirementAfter = formatUsdg(await m.requirementIfTraded(id, args.side === "buy" ? quantityRaw : -quantityRaw));
@@ -342,20 +494,25 @@ export function createServer(ctx: KitContext): McpServer {
     "fill_quote",
     {
       title: "Fill a quote",
-      description: "Takes a quote from get_quote for your account via fillOrderAs from the session key, always in balance mode (premium, fee and collateral settle from your deposited USDG; no approvals). A sell that opens a short draws the session's short-risk budget (riskLeft) by its worst case, a buy the spend budget (spendLeft) beyond the shorts it closes; the answer carries `sessionCharge`. SessionLimit means the leg needs more than its budget has left, SessionWalletMode that a session leg was not in balance mode. Opens or adds to a position; to exit an existing position before expiry use close_position instead. dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash when sent.",
+      description: "Takes a quote from get_quote for your account via fillOrderAs, in the quote's market. From a SESSION KEY: always balance mode (premium, fee and collateral settle from that market's deposited balance; no approvals); when that balance is short the fill is refused with the shortfall, the markets where the account has free balance and the owner's fix (deposit or rebalance). A sell that opens a short draws the session's short-risk budget (riskLeft) by its worst case, a buy the spend budget (spendLeft) beyond the shorts it closes; the answer carries `sessionCharge`. From the ACCOUNT'S OWN KEY (signer: owner): WALLET mode by default, no deposit needed: premium, fee and any collateral are pulled from the wallet, with an approve of the market first when the allowance is short (`steps` lists every tx); fromBalance: true uses the market balance, autoDeposit: true deposits its shortfall first. SessionLimit means the leg needs more than its budget has left, SessionWalletMode that a session leg was not in balance mode. Opens or adds to a position; to exit before expiry use close_position. dryRun (default true) simulates only. Requires confirm: true. Reports the tx hash(es) when sent.",
       inputSchema: {
         digest: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional().describe("Digest returned by get_quote"),
         order: z.record(z.unknown()).optional().describe("Alternatively the order JSON from get_quote"),
         signature: z.string().regex(/^0x[0-9a-fA-F]+$/).optional(),
         quantity: decimalAmount.optional().describe("Shares to fill; default: the quoted quantity"),
+        signer: signerField,
+        fromBalance: fromBalanceField,
+        autoDeposit: autoDepositField,
+        approve: approveField,
         confirm: confirmField,
         dryRun: dryRunField,
       },
     },
     async (args) => {
-      let order;
+      let order: Order;
       let signature: Hex;
       let quantityRaw: bigint;
+      let quotedIn: string | undefined;
       if (args.digest) {
         const cached = ctx.quotes.get(args.digest as Hex);
         if (!cached) return fail("unknown digest; call get_quote again (quotes expire in seconds)");
@@ -363,6 +520,7 @@ export function createServer(ctx: KitContext): McpServer {
         order = cached.quote.order;
         signature = cached.quote.signature;
         quantityRaw = args.quantity ? parseShares(args.quantity) : cached.requestedQuantityRaw;
+        quotedIn = cached.underlying;
       } else if (args.order && args.signature) {
         order = orderFromJson(args.order);
         signature = args.signature as Hex;
@@ -373,10 +531,9 @@ export function createServer(ctx: KitContext): McpServer {
       const now = Math.floor(Date.now() / 1000);
       if (BigInt(now) >= order.validUntil) return fail(`quote expired at ${order.validUntil} (now ${now}); call get_quote again`);
       if (order.taker.toLowerCase() !== ctx.account.toLowerCase()) return fail(`quote is addressed to ${order.taker}, not your account ${ctx.account}`);
-      const m = ctx.market("session");
-      const tx = m.fillOrderAs(order, signature, quantityRaw, true);
-      const charge = await sessionChargeFor(ctx, m, { instrumentId: order.instrumentId, side: order.side === Side.Ask ? "buy" : "sell", quantityRaw, order });
-      return sendOrExplain(ctx, "session", tx, args.confirm, args.dryRun, charge ? { sessionCharge: sessionChargeView(charge) } : {}, charge);
+      const marketOf = (who: "session" | "owner") => (quotedIn ? ctx.marketFor(quotedIn, who) : marketOfOrder(ctx, order.market, who));
+      const charge = await sessionChargeFor(ctx, marketOf("session"), { instrumentId: order.instrumentId, side: order.side === Side.Ask ? "buy" : "sell", quantityRaw, order });
+      return fillAs(ctx, args, marketOf, order, signature, quantityRaw, {}, charge);
     },
   );
 
@@ -385,9 +542,9 @@ export function createServer(ctx: KitContext): McpServer {
     {
       title: "Deposit USDG via x402",
       description: "Funds your market balance through the x402 deposit gateway: signs an EIP-3009 USDG transfer from the paying key's wallet (owner key if set, else session key) and the gateway calls market.deposit(account, amount). dryRun (default true) fetches the 402 and shows what would be signed. Requires confirm: true.",
-      inputSchema: { amount: decimalAmount.describe("USDG, e.g. \"25\""), confirm: confirmField, dryRun: dryRunField },
+      inputSchema: { amount: decimalAmount.describe("USDG, e.g. \"25\""), market: marketField, confirm: confirmField, dryRun: dryRunField },
     },
-    async ({ amount, confirm, dryRun }) => {
+    async ({ amount, market, confirm, dryRun }) => {
       const amountRaw = parseUsdg(amount);
       const cap = parseUsdg(ctx.config.maxDepositUsdg);
       if (amountRaw > cap) return fail(`amount ${amount} exceeds HEDGEHOOD_MAX_DEPOSIT ${ctx.config.maxDepositUsdg} USDG`);
@@ -396,7 +553,7 @@ export function createServer(ctx: KitContext): McpServer {
       const dry = dryRun ?? ctx.config.dryRunDefault;
       if (!confirm) return json({ ok: false, needsConfirm: true, wouldDo: `pay ${amount} USDG from ${payer.address} to the gateway, credited to ${ctx.account}`, dryRun: dry });
       try {
-        const r = await depositViaGateway({ account: ctx.account, market: ctx.deployment.market, amountRaw }, { signer: payer, chainId: ctx.chainId, gatewayUrl: ctx.config.gatewayUrl, fetch: ctx.fetch, dryRun: dry, maxAmountRaw: cap });
+        const r = await depositViaGateway({ account: ctx.account, market: ctx.marketFor(market, "none").market, amountRaw }, { signer: payer, chainId: ctx.chainId, gatewayUrl: ctx.config.gatewayUrl, fetch: ctx.fetch, dryRun: dry, maxAmountRaw: cap });
         return json({
           ok: true,
           dryRun: r.dryRun,
@@ -419,11 +576,12 @@ export function createServer(ctx: KitContext): McpServer {
     "positions",
     {
       title: "Positions and balances (active)",
-      description: "Your ACTIVE book: market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument with average entry price, the desk's mark, unrealized P&L and time to expiry (when the indexer answers), plus the session's authority (expiry, authorizedAt, riskLeft = worst case of the shorts it may still open, spendLeft = premium + fees it may still pay beyond buying back shorts). Past activity is get_history; totals are get_pnl; to exit a position before expiry call close_position. Read-only.",
-      inputSchema: {},
+      description: "Your ACTIVE book in one market (`market`, default HEDGEHOOD_UNDERLYING; get_account shows every market at once): market balance (collateral, locked requirement, free), wallet USDG, every open position by instrument with average entry price, the desk's mark, unrealized P&L and time to expiry (when the indexer answers), plus the session's authority (expiry, authorizedAt, riskLeft = worst case of the shorts it may still open, spendLeft = premium + fees it may still pay beyond buying back shorts). Past activity is get_history; totals are get_pnl; to exit a position before expiry call close_position. Read-only.",
+      inputSchema: { market: marketField },
     },
-    async () => {
-      const m = ctx.market("none");
+    async ({ market }) => {
+      const m = pickMarket(ctx, { market });
+      const underlying = m.deployment.underlying;
       const [snap, pnl] = await Promise.all([m.snapshot(ctx.account), ctx.rfq.getPnl(ctx.account).catch(() => undefined)]);
       const settledPending: string[] = [];
       for (const e of snap.expiries) {
@@ -435,6 +593,7 @@ export function createServer(ctx: KitContext): McpServer {
       const now = Math.floor(Date.now() / 1000);
       return json({
         account: ctx.account,
+        market: underlying,
         collateral: formatUsdg(snap.collateralRaw),
         requirement: formatUsdg(snap.requirementRaw),
         freeCollateral: formatUsdg(snap.freeCollateralRaw),
@@ -455,34 +614,42 @@ export function createServer(ctx: KitContext): McpServer {
     "close_position",
     {
       title: "Close a position (before expiry)",
-      description: "Exits an open position before expiry. Positions net out on chain and the maker quotes both sides, so this reads your signed position in the instrument, asks for a firm quote on the OPPOSITE side (a long is sold to the bid, a short is bought back at the ask) for min(|position|, quantity), verifies it and fills it via fillOrderAs from the session key in balance mode, exactly like fill_quote. A close is normally free of the session budgets (selling a long held opens no short; buying back a short is charged only above its worst case); `sessionCharge` says what it draws and whether it fits. Without confirm it only prices the close. dryRun (default true) simulates only; dryRun: false broadcasts and reports the tx hash. Requires confirm: true.",
+      description: "Exits an open position before expiry, in any market (`market`, or the instrument name's ticker). Positions net out on chain and the maker quotes both sides, so this reads your signed position in the instrument, asks for a firm quote on the OPPOSITE side (a long is sold to the bid, a short is bought back at the ask) for min(|position|, quantity), verifies it and fills it via fillOrderAs exactly like fill_quote: from a session key in balance mode (refused with the owner's fix when that market's balance cannot pay), from the account's own key (signer: owner) in wallet mode by default (fromBalance: true for the market balance, autoDeposit: true to deposit its shortfall first). A close is normally free of the session budgets (selling a long held opens no short; buying back a short is charged only above its worst case); `sessionCharge` says what it draws and whether it fits. Without confirm it only prices the close. dryRun (default true) simulates only; dryRun: false broadcasts and reports the tx hash. Requires confirm: true.",
       inputSchema: {
         ...instrumentFields,
+        market: marketField,
         quantity: decimalAmount.optional().describe("Shares to close; default and maximum: the whole position"),
-        fromBalance: z.boolean().default(true).describe("Settle inside the deposited balance (default). A session key always settles in balance mode (the market reverts SessionWalletMode otherwise), so false is ignored for it; false (wallet mode) only applies when the signing key is the account itself"),
+        signer: signerField,
+        fromBalance: fromBalanceField,
+        autoDeposit: autoDepositField,
+        approve: approveField,
         confirm: confirmField,
         dryRun: dryRunField,
       },
     },
     async (args) => {
-      const m = ctx.market("session");
+      let ts: TradeSigner;
+      try {
+        ts = tradeSigner(ctx, args.signer);
+      } catch (e) {
+        return fail(errorText(e));
+      }
+      const m = pickMarket(ctx, args, ts.who);
+      const u = m.deployment.underlying;
+      const fromBalance = ts.role === "owner" ? !!(args.autoDeposit || args.fromBalance === true) : true;
       let plan: ClosePlan;
-      // a session key cannot fill in wallet mode (SessionWalletMode): force balance mode and say so
-      const forced = !args.fromBalance && m.signsAsSession;
-      const fromBalance = forced ? true : args.fromBalance;
       try {
         const instrumentId = await instrumentFrom(m, args);
-        const sessionKey = ctx.session && ctx.session.address.toLowerCase() !== ctx.account.toLowerCase() ? ctx.session.address : undefined;
+        const sessionKey = ts.role === "session" ? ts.signer.address : undefined;
         plan = await planClose({ market: m, rfq: ctx.rfq, instrumentId, quantityRaw: args.quantity ? parseShares(args.quantity) : undefined, fromBalance, sessionKey, protocolFeeBps: await m.protocolFeeBps() });
       } catch (e) {
         return fail(`close failed: ${errorText(e)}`);
       }
-      ctx.quotes.set(plan.quote.digest, { quote: plan.quote, fetchedAt: Date.now(), side: plan.side, requestedQuantityRaw: plan.quantityRaw });
-      const view: ReturnType<typeof closeView> & { fromBalance: boolean; note?: string; sessionCharge?: ReturnType<typeof sessionChargeView> } = { ...closeView(plan, underlying), fromBalance, sessionCharge: sessionChargeView(plan.sessionCharge) };
-      if (forced) view.note = "fromBalance: false ignored: a session key always settles in balance mode (the market reverts SessionWalletMode on a session leg in wallet mode)";
+      ctx.quotes.set(plan.quote.digest, { quote: plan.quote, fetchedAt: Date.now(), side: plan.side, requestedQuantityRaw: plan.quantityRaw, underlying: u });
+      const view: ReturnType<typeof closeView> & { fromBalance: boolean; sessionCharge?: ReturnType<typeof sessionChargeView> } = { ...closeView(plan, u), fromBalance, sessionCharge: sessionChargeView(plan.sessionCharge) };
       if (!plan.quote.fillable) return json({ ...view, ok: false, fillable: false, note: "the desk runs without a signer key: this quote carries a placeholder signature and cannot be filled; nothing to send" });
       if (plan.quote.canFill === false) view.quote.fundingPreview = { ...view.quote.fundingPreview, note: `maker predicts canFill=false${plan.quote.shortfallRaw > 0n ? ` (shortfall ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}` };
-      return sendOrExplain(ctx, "session", plan.request, args.confirm, args.dryRun, view, plan.sessionCharge);
+      return fillAs(ctx, args, () => m, plan.quote.order, plan.quote.signature, plan.quantityRaw, view, plan.sessionCharge);
     },
   );
 
@@ -554,16 +721,89 @@ export function createServer(ctx: KitContext): McpServer {
   );
 
   server.registerTool(
+    "get_account",
+    {
+      title: "Account across every market",
+      description: "One view of your account in EVERY option market of the chain (each market keeps its own balance, positions and session keys): wallet USDG; per market the collateral, locked requirement, free balance, the wallet's allowance to that market, open positions and the configured key's session; totals; `tradable` = the markets where the configured key can fill from the balance right now (a live session and free balance; the account's own key can also fill in wallet mode in any market). A market whose reads fail is marked (`error`, `failed`) instead of failing the view. Moving balance: deposit, withdraw (all: true), rebalance (owner key). Read-only.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        const v = await ctx.accountView();
+        const hint = v.keyRole === "session"
+          ? v.tradable.length ? `the session key can fill from the balance in: ${v.tradable.join(", ")}` : "the session key cannot fill anywhere yet: it needs a live session and free balance in the same market (owner: authorize_session, deposit or rebalance)"
+          : v.keyRole === "owner" ? "the account's own key fills in wallet mode in any market (no deposit; approves the market first), or from the balance where it is free" : "no key configured: read-only";
+        return json({ ...accountViewJson(v), hint });
+      } catch (e) {
+        return fail(`get_account failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "deposit",
+    {
+      title: "Deposit USDG into a market (owner key)",
+      description: "Credits the account's balance in one market from the owner wallet: approve (only when the allowance is short; exact amount by default, approve: max for unlimited), then deposit(account, amount). Balances are per market: a session key can only fill from the balance of the market it trades. dryRun default true. Requires confirm: true.",
+      inputSchema: { market: marketField, amount: decimalAmount.describe("USDG, e.g. \"25\""), approve: approveField, confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ market, amount, approve, confirm, dryRun }) => {
+      try {
+        const owner = requireOwner(ctx);
+        const m = ctx.marketFor(market, "owner");
+        const [allowanceRaw, walletRaw] = await Promise.all([m.usdgAllowance(owner.address), m.publicClient.readContract({ address: m.usdg, abi: erc20Abi, functionName: "balanceOf", args: [owner.address] })]);
+        const plan = planDeposit({ market: m.deployment, account: ctx.account, amountRaw: parseUsdg(amount), allowanceRaw, walletRaw, approve });
+        return marketPlanOrExplain(ctx, m, plan, { market: m.deployment.underlying, account: ctx.account, wallet: formatUsdg(walletRaw) }, confirm, dryRun);
+      } catch (e) {
+        return fail(`deposit failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
     "withdraw",
     {
       title: "Withdraw USDG (owner key only)",
-      description: "Moves free collateral from the market to a wallet. Only the account owner can withdraw; a session key cannot. dryRun default true. Requires confirm: true.",
-      inputSchema: { amount: decimalAmount, to: address.optional().describe("Recipient; default: the owner address"), confirm: confirmField, dryRun: dryRunField },
+      description: "Moves free collateral from a market (`market`, default HEDGEHOOD_UNDERLYING) to a wallet; all: true withdraws every market's free balance, one transaction per market. Only the account owner can withdraw; a session key cannot. dryRun default true. Requires confirm: true.",
+      inputSchema: { amount: decimalAmount.optional().describe("USDG; omit with all: true"), market: marketField, all: z.boolean().optional().describe("Every market's free balance back to the wallet"), to: address.optional().describe("Recipient; default: the owner address"), confirm: confirmField, dryRun: dryRunField },
     },
-    async ({ amount, to, confirm, dryRun }) => {
-      const owner = requireOwner(ctx);
-      const m = ctx.market("owner");
-      return sendOrExplain(ctx, "owner", m.withdraw(parseUsdg(amount), to ?? owner.address), confirm, dryRun);
+    async ({ amount, market, all, to, confirm, dryRun }) => {
+      try {
+        const owner = requireOwner(ctx);
+        if (all) {
+          if (amount || market) return fail("all: true takes no amount or market");
+          if (owner.address.toLowerCase() !== ctx.account.toLowerCase()) return fail(`the owner key ${owner.address} is not the account ${ctx.account}; withdraw takes the caller's own balance`);
+          const v = await ctx.accountView(owner.address);
+          const plan = planWithdrawAll(v, to ?? owner.address);
+          if (!plan.steps.length) return json({ ok: false, nothing: true, summary: plan.summary, totals: accountViewJson(v).totals });
+          return marketPlanOrExplain(ctx, ctx.marketFor(plan.steps[0]!.underlying, "owner"), plan, { markets: plan.steps.map((st) => ({ market: st.underlying, amount: formatUsdg(st.amountRaw) })), failed: v.failed }, confirm, dryRun);
+        }
+        if (!amount) return fail("give amount (USDG), or all: true");
+        const m = ctx.marketFor(market, "owner");
+        return sendOrExplain(ctx, "owner", m.withdraw(parseUsdg(amount), to ?? owner.address), confirm, dryRun, { market: m.deployment.underlying }, undefined, m);
+      } catch (e) {
+        return fail(`withdraw failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "rebalance",
+    {
+      title: "Move balance between markets (owner key)",
+      description: "Moves free balance from one market to another: withdraw(amount) from `from` to the owner wallet, approve `to` when its allowance is short, deposit(account, amount) into `to`. Use it when a session key's market lacks balance that another market holds free (get_account shows where). Owner key only. dryRun default true (the deposit after a withdraw or approve is not simulated until those are mined). Requires confirm: true.",
+      inputSchema: { from: z.string().min(1).describe("Market to take free balance from (ticker or address)"), to: z.string().min(1).describe("Market to fund"), amount: decimalAmount.describe("USDG"), approve: approveField, confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ from, to, amount, approve, confirm, dryRun }) => {
+      try {
+        const owner = requireOwner(ctx);
+        if (owner.address.toLowerCase() !== ctx.account.toLowerCase()) return fail(`the owner key ${owner.address} is not the account ${ctx.account}; withdraw takes the caller's own balance`);
+        const v = await ctx.accountView(owner.address);
+        const plan = planRebalance(v, { from, to, amountRaw: parseUsdg(amount), approve });
+        return marketPlanOrExplain(ctx, ctx.marketFor(from, "owner"), plan, { from: plan.steps[0]!.underlying, to: plan.steps[plan.steps.length - 1]!.underlying, amount }, confirm, dryRun);
+      } catch (e) {
+        return fail(`rebalance failed: ${errorText(e)}`);
+      }
     },
   );
 

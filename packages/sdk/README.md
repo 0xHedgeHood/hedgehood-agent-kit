@@ -38,7 +38,11 @@ USDG preset adapted from `@priors/x402`), `identity` (ERC-8004), `vault` (`Vault
 `claim`, dry run by default), `send` (`sendTxRequest`), `session` (session budget charges: `shortRiskCharge`,
 `spendCharge`, `sessionChargeOf`, `maxPaidUntilExpiry`, `formatSessionCap`; `MarketClient.sessionCharge` reads the
 position, caps and `riskLeft` / `spendLeft` and says whether a leg fits before it is sent; `planClose` carries it),
-`errors` (`decodeMarketError`, `MarketRevertError`: market / book / settlement source custom errors such as
+`account` (one account across every market: `readAccount` reads collateral, locked, free, allowance, positions and the
+key's session of each market in parallel via Multicall3, marking a market whose reads fail; `fundingAdvice`,
+`planDeposit`, `planWithdrawAll`, `planRebalance`), `funding` (`planFillFunding`: wallet mode for the account's own key,
+balance mode with an optional deposit of the shortfall, the approve / deposit / fill steps; `sessionFundingRefusal`),
+`MarketClient.sendPlan` (runs those plans, dry run by default), `errors` (`decodeMarketError`, `MarketRevertError`: market / book / settlement source custom errors such as
 `SessionLimit`, `SessionWalletMode`, `StockControlsPaused` and `InvalidRoundHint` with what to do), `units`. ABIs:
 `marketV2Abi`, `orderBookV2Abi`, `chainlinkExpirySourceAbi`, `erc20Abi`,
 `identityRegistryAbi`, `epochFundAbi`, `vaultRegistryAbi`, `openDepositGateAbi`, `stakeThresholdGateAbi`.

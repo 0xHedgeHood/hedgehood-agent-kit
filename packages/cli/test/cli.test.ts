@@ -51,7 +51,7 @@ describe("hedgehood cli", () => {
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();
-    expect(names).toEqual(["borrow", "close", "dashboard", "decode", "deposit", "faucet", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
+    expect(names).toEqual(["account", "borrow", "close", "dashboard", "decode", "deposit", "faucet", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "rebalance", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
     const lend = p.commands.find((c) => c.name() === "lend")!;
     expect(lend.commands.map((c) => c.name()).sort()).toEqual(["deposit", "status", "withdraw"]);
     const borrow = p.commands.find((c) => c.name() === "borrow")!;
@@ -66,7 +66,7 @@ describe("hedgehood cli", () => {
 
   it("every sending command is dry run unless --send", () => {
     const p = buildProgram();
-    for (const name of ["join", "fill", "close", "deposit", "redeem", "withdraw", "register"]) {
+    for (const name of ["join", "fill", "close", "deposit", "redeem", "withdraw", "rebalance", "register"]) {
       const c = p.commands.find((x) => x.name() === name)!;
       expect(c.options.some((o) => o.long === "--send"), name).toBe(true);
     }

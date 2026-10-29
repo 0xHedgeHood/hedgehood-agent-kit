@@ -78,6 +78,28 @@ leaderboard groups your accounts under it.
    the market balance. The agent may call `redeem` itself. `positions` lists expiries awaiting redemption.
 8. **Withdraw.** Owner key only: `withdraw(amount, to)`.
 
+## One account, every market
+
+Each underlying is its own market with its **own balance, positions and session grant**: USDG deposited in NVDA cannot
+pay for GOOGL, and a key authorized on NVDA is not authorized on GOOGL. The kit presents them as one account:
+
+- `get_account` (`hedgehood account`) is the first read: wallet USDG, and per market collateral, locked, free, the
+  wallet's allowance to it, open positions and your key's session; totals; `tradable` = where your key can fill from
+  the balance now (live session + free balance in the same market). A market it cannot read is marked, not fatal.
+- Quote and fill in any market: `get_quote` / `fill_quote` / `close_position` take `market` (or infer it from the
+  instrument name's ticker, `GOOGL-20261030-180-C`).
+- **Session key**: balance mode in that market only, never the owner's wallet, never a deposit. A fill its market
+  balance cannot pay is refused before anything is sent, with the shortfall, the markets holding free balance and the
+  owner's fix: `rebalance { from: "NVDA", to: "GOOGL", amount }` / `hedgehood rebalance --from NVDA --to GOOGL --amount N`,
+  or `deposit { market: "GOOGL", amount }` / `hedgehood deposit N --market GOOGL --wallet`. Relay it to the owner; do not
+  retry.
+- **The account's own key** (`signer: "owner"`, CLI `--signer owner`): WALLET mode by default, no pre-deposit: the
+  market pulls premium, fee and any collateral from the wallet; the plan approves the market first when the allowance
+  is short (exact amount; `approve: "max"` for unlimited) and lists every tx (`steps`). `fromBalance: true` uses the
+  market balance; `autoDeposit: true` deposits its shortfall first.
+- Owner moves: `deposit` (one market), `rebalance` (withdraw from one, deposit into another), `withdraw { all: true }`
+  (every market's free balance back to the wallet, one tx each). All dry run unless `dryRun: false`.
+
 ## Using the tools well
 
 - If `get_dashboard` is available and the user asks for a portfolio overview or terminal-style visualization, call it
@@ -236,6 +258,7 @@ shown only as set/missing.
 | `InvalidRoundHint` | a settlement round hint is wrong, or `settleLate` / `failingAt` needs a hint because the walk back hit a Chainlink phase boundary | pass `hint = abi.encode(stockRoundId, quoteRoundId)` of the rounds in effect at the expiry (keeper / operator task) |
 | `SessionWalletMode` | a session-key leg was sent in wallet mode (`fromBalance = false`) | fill in balance mode (the kit's default; `close_position` forces it for a session key) |
 | `InsufficientCollateral` | balance below premium + fee (buy) or below the new requirement (sell) | `deposit_x402` / owner deposit |
+| `refused: the GOOGL market balance is short by …` | a session-key fill that market's balance cannot pay (balances are per market) | relay the owner's fix in the message (`rebalance` from a market with free balance, or `deposit` into this one); `get_account` shows where balance sits |
 | `WrongTaker` | quote addressed to another account | your `HEDGEHOOD_ACCOUNT` differs from what `get_quote` sent; fix config, quote again |
 | `OrderExpired` | `validUntil` passed before the tx mined | quote again, fill faster, or ask for a longer `ttlSeconds` |
 | `TradingUnavailable` | within 15 min of expiry, market paused, or the quote was written under another `uiMultiplier` than the live one | quote again; near expiry, wait for the next one |

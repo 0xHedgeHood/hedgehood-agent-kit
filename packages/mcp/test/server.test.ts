@@ -54,8 +54,8 @@ describe("mcp server", () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["authorize_session", "borrow_repay", "borrow_status", "borrow_supply_collateral", "borrow_take", "borrow_withdraw_collateral", "close_position", "decode_instrument", "deposit_x402", "faucet", "fill_quote", "get_agent_record", "get_dashboard", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "lend_deposit", "lend_status", "lend_withdraw", "list_instruments", "list_markets", "list_vaults", "my_record", "positions", "redeem", "register_agent", "vault_cancel", "vault_claim", "vault_deposit", "vault_redeem", "vault_status", "withdraw"]);
-    for (const w of ["faucet", "fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent", "vault_deposit", "vault_redeem", "vault_claim", "vault_cancel", "lend_deposit", "lend_withdraw", "borrow_supply_collateral", "borrow_take", "borrow_repay", "borrow_withdraw_collateral"]) {
+    expect(names).toEqual(["authorize_session", "borrow_repay", "borrow_status", "borrow_supply_collateral", "borrow_take", "borrow_withdraw_collateral", "close_position", "decode_instrument", "deposit", "deposit_x402", "faucet", "fill_quote", "get_account", "get_agent_record", "get_dashboard", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "lend_deposit", "lend_status", "lend_withdraw", "list_instruments", "list_markets", "list_vaults", "my_record", "positions", "rebalance", "redeem", "register_agent", "vault_cancel", "vault_claim", "vault_deposit", "vault_redeem", "vault_status", "withdraw"]);
+    for (const w of ["faucet", "fill_quote", "close_position", "deposit", "deposit_x402", "rebalance", "redeem", "withdraw", "authorize_session", "register_agent", "vault_deposit", "vault_redeem", "vault_claim", "vault_cancel", "lend_deposit", "lend_withdraw", "borrow_supply_collateral", "borrow_take", "borrow_repay", "borrow_withdraw_collateral"]) {
       const t = tools.find((x) => x.name === w)!;
       const props = (t.inputSchema as { properties: Record<string, unknown> }).properties;
       expect(props.confirm, w).toBeDefined();
@@ -166,7 +166,9 @@ describe("mcp server", () => {
   });
 
   it("fill_quote refuses an unknown digest, a missing confirm, and a quote for another taker", async () => {
-    const { client, ctx } = await connect();
+    const world = fakeWorld();
+    const { client: c, ctx } = await connect(world.fetch);
+    const client = { callTool: (a: Parameters<Client["callTool"]>[0]) => withGlobalFetch(world.fetch, () => c.callTool(a)) };
     const r1 = await client.callTool({ name: "fill_quote", arguments: { digest: "0x" + "11".repeat(32) } });
     expect(r1.isError).toBe(true);
     expect(text(r1)).toMatch(/unknown digest/);

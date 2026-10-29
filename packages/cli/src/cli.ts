@@ -54,9 +54,18 @@ import {
   type VaultInfo,
   type VaultPlan,
   type VerifiedQuote,
+  erc20Abi,
+  planDeposit,
+  planFillFunding,
+  planRebalance,
+  planWithdrawAll,
+  sessionFundingRefusal,
+  type AccountView,
+  type FillFundingPlan,
+  type Order,
 } from "@hedgehood-io/sdk";
 import { formatUnits } from "viem";
-import { createContext, loadConfig, requireOwner, requireSession, type KitContext } from "@hedgehood-io/mcp";
+import { createContext, loadConfig, requireOwner, requireSession, tradeSigner, type KitContext } from "@hedgehood-io/mcp";
 
 const DEFAULT_SESSION_KEY_FILE = "~/.hedgehood/session.key";
 
@@ -126,11 +135,11 @@ const out = (cmd: Command, v: unknown, human?: string) => {
 };
 
 /** Simulates, then (with `--send`) broadcasts and waits; returns what to print instead of printing it. */
-async function sendResult(ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined, sessionCharge?: SessionCharge): Promise<{ json: Record<string, unknown>; human: string; failed: boolean }> {
+async function sendResult(ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined, sessionCharge?: SessionCharge, client?: MarketClient): Promise<{ json: Record<string, unknown>; human: string; failed: boolean }> {
   const dryRun = !sendFlag;
   if (who === "owner") requireOwner(ctx);
   else requireSession(ctx);
-  const m = ctx.market(who);
+  const m = client ?? ctx.market(who);
   const r = await m.send(tx, { dryRun, sessionCharge });
   if (r.dryRun) {
     return { json: { dryRun: true, from: r.from, to: tx.to, data: tx.data, summary: tx.summary }, human: `DRY RUN (simulation passed): ${tx.summary}\n  from ${r.from}\n  to   ${tx.to}\n  add --send to broadcast`, failed: false };
@@ -143,8 +152,8 @@ async function sendResult(ctx: KitContext, who: "session" | "owner", tx: TxReque
   };
 }
 
-async function send(cmd: Command, ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined, sessionCharge?: SessionCharge) {
-  const r = await sendResult(ctx, who, tx, sendFlag, sessionCharge);
+async function send(cmd: Command, ctx: KitContext, who: "session" | "owner", tx: TxRequest, sendFlag: boolean | undefined, sessionCharge?: SessionCharge, client?: MarketClient) {
+  const r = await sendResult(ctx, who, tx, sendFlag, sessionCharge, client);
   out(cmd, r.json, r.human);
   if (r.failed) process.exitCode = 1;
 }
@@ -212,15 +221,74 @@ function closePlanJson(plan: ClosePlan) {
  * "<instrumentId>", "NVDA-20261030-220-C" (backend name, listed per-share strike) or "<expiry>:<strike>:<call|put>"
  * (per-share strike, mapped to the per-token strike under the expiry's uiMultiplier).
  */
-async function instrumentArg(ctx: KitContext, v: string): Promise<bigint> {
+async function instrumentArg(market: MarketClient, v: string): Promise<bigint> {
   if (/^\d+$/.test(v)) return BigInt(v);
   const m = /^(\d+):(\d+(?:\.\d+)?):(call|put|c|p)$/i.exec(v);
-  const market = ctx.market("none");
   if (m) {
     const expiry = BigInt(m[1]!);
     return encodeInstrumentId(expiry, tokenStrikeOf(parseUsdg(m[2]!), await market.expiryMultiplier(expiry)), /^p/i.test(m[3]!));
   }
   return market.resolveInstrumentName(v);
+}
+
+/** The market an instrument name's ticker names (NVDA-20261030-220-C -> NVDA) when listed, else the default (--underlying). */
+function marketOfInstrument(ctx: KitContext, v: string | undefined, who: "session" | "owner" | "none"): MarketClient {
+  const t = v && /^[A-Za-z]{1,8}-\d{8}-/.test(v) ? v.split("-")[0]!.toUpperCase() : undefined;
+  return t && ctx.markets.some((x) => x.underlying.toUpperCase() === t) ? ctx.marketFor(t, who) : ctx.market(who);
+}
+
+/** The listed market of an order (its `market` field), else the default market. */
+function marketOfOrder(ctx: KitContext, market: Address, who: "session" | "owner" | "none"): MarketClient {
+  return ctx.markets.some((x) => x.market.toLowerCase() === market.toLowerCase()) ? ctx.marketFor(market, who) : ctx.market(who);
+}
+
+const allowanceText = (raw: bigint) => (raw >= 1n << 128n ? "unlimited" : formatUsdg(raw));
+
+function fundingLines(p: FillFundingPlan): string {
+  const parts = [`  funding: ${p.summary}`];
+  parts.push(`  ${p.underlying} balance ${formatUsdg(p.collateralRaw)}, requirement after ${formatUsdg(p.requirementAfterRaw)}; wallet ${formatUsdg(p.walletUsdgRaw)}, allowance to the market ${allowanceText(p.allowanceRaw)}`);
+  return parts.join("\n");
+}
+
+function fundingJson(p: FillFundingPlan) {
+  return { market: p.underlying, mode: p.mode, side: p.side, paysUpToRaw: p.paysUpToRaw, receivesAtLeastRaw: p.receivesAtLeastRaw, walletPullUpToRaw: p.walletPullUpToRaw, balanceShortfallRaw: p.balanceShortfallRaw, depositRaw: p.depositRaw, approveRaw: p.approveRaw, collateralRaw: p.collateralRaw, requirementAfterRaw: p.requirementAfterRaw, walletUsdgRaw: p.walletUsdgRaw, allowanceRaw: p.allowanceRaw };
+}
+
+interface FillOpts {
+  signer?: "session" | "owner";
+  fromBalance?: boolean;
+  autoDeposit?: boolean;
+  approve?: string;
+  send?: boolean;
+}
+
+function approveOpt(v: string | undefined): "exact" | "max" | undefined {
+  if (v === undefined) return undefined;
+  if (v !== "exact" && v !== "max") throw new Error(`--approve must be exact or max, got ${v}`);
+  return v;
+}
+
+/**
+ * Fills from the resolved signer. A session key: balance mode only, refused before anything is sent when that market's
+ * balance cannot pay (naming the shortfall, the free balance elsewhere and the owner's fix). The account's own key:
+ * wallet mode by default (approve when short, then fill), or --from-balance (with --auto-deposit: deposit the shortfall
+ * first). Returns what to print.
+ */
+async function fillFrom(ctx: KitContext, opts: FillOpts, m: MarketClient, who: "session" | "owner", role: "owner" | "session", order: Order, signature: Hex, qty: bigint, sessionCharge?: SessionCharge): Promise<{ json: Record<string, unknown>; human: string; failed: boolean }> {
+  if (role === "session") {
+    if (opts.autoDeposit) throw new Error("--auto-deposit needs the account's own key: a session key never deposits from the owner's wallet. The owner deposits (`hedgehood deposit <usdg> --market <id> --wallet`) or rebalances, then the key fills.");
+    const refusal = await sessionFundingRefusal({ market: m, order, signature, quantityRaw: qty, accountView: () => ctx.accountView(m.signer?.address) });
+    if (refusal) throw new Error(`refused: ${refusal.message}`);
+    const r = await sendResult(ctx, who, m.fillOrderAs(order, signature, qty, true), opts.send, sessionCharge, m);
+    return { ...r, json: { market: m.deployment.underlying, mode: "balance", ...r.json } };
+  }
+  const mode = opts.autoDeposit || opts.fromBalance ? "balance" : "wallet";
+  const plan = await planFillFunding({ market: m, order, signature, quantityRaw: qty, mode, autoDeposit: opts.autoDeposit, approve: approveOpt(opts.approve) });
+  if (plan.problems.length) {
+    const hint = plan.mode === "balance" && plan.balanceShortfallRaw > 0n && !opts.autoDeposit ? "; add --auto-deposit to deposit the shortfall first, or drop --from-balance to pay from the wallet" : "";
+    throw new Error(`fill refused: ${plan.problems.join("; ")}${hint}`);
+  }
+  return stepsResult(m, { steps: plan.steps, summary: plan.summary }, [fundingLines(plan)], { funding: fundingJson(plan) }, opts.send);
 }
 
 /** "unlimited" -> type(uint256).max, else USDG -> raw. */
@@ -380,74 +448,90 @@ export function buildProgram(): Command {
     .option("--out <file>", "save the signed quote JSON for `fill <file>`")
     .action(async (instrument: string, opts: { side: "buy" | "sell"; qty: string; out?: string }, cmd: Command) => {
       const ctx = ctxFrom(cmd);
-      const m = ctx.market("none");
-      const id = await instrumentArg(ctx, instrument);
+      const m = marketOfInstrument(ctx, instrument, "none");
+      const id = await instrumentArg(m, instrument);
       const qty = parseShares(opts.qty);
       const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
-      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
-      const file = { order: orderToJson(q.order), signature: q.signature, side: opts.side, quantityRaw: qty.toString(), chainId: ctx.chainId, dryRun: q.dryRun };
+      const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: m.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+      const file = { order: orderToJson(q.order), signature: q.signature, side: opts.side, quantityRaw: qty.toString(), chainId: ctx.chainId, market: m.deployment.underlying, dryRun: q.dryRun };
       if (opts.out) writeFileSync(opts.out, JSON.stringify(file, null, 2));
       const charge = await sessionChargeFor(ctx, m, { instrumentId: id, side: opts.side, quantityRaw: qty, order: q.order, protocolFeeBps: q.feeBps });
-      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable, sessionCharge: charge }, quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + chargeLine(charge) + (opts.out ? `\n  saved to ${opts.out}` : ""));
+      out(cmd, { ...file, digest: q.digest, instrument: q.instrument, premiumNowRaw: q.premiumNowRaw, feeNowRaw: q.feeNowRaw, netNowRaw: q.netNowRaw, canFill: q.canFill, shortfallRaw: q.shortfallRaw, funding: q.funding, secondsLeft: q.secondsLeft, fillable: q.fillable, sessionCharge: charge }, quoteHuman(q, m.deployment.underlying, qty, uiMultiplier) + chargeLine(charge) + (opts.out ? `\n  saved to ${opts.out}` : ""));
     });
 
-  program
-    .command("fill")
-    .description("Fill a saved quote file, or quote-and-fill an instrument in one go (session key, always balance mode; a sell that opens a short draws the short-risk budget, a buy the spend budget beyond the shorts it closes)")
-    .argument("[quoteFile]")
-    .option("--instrument <x>", "quote-and-fill: instrument id or expiry:strike:call|put")
-    .option("--side <buy|sell>")
-    .option("--qty <shares>", "quantity in shares (default: the quoted quantity)")
-    .option("--send", "broadcast instead of dry run")
-    .action(async (quoteFile: string | undefined, opts: { instrument?: string; side?: "buy" | "sell"; qty?: string; send?: boolean }, cmd: Command) => {
+  const tradeOptions = (c: Command) =>
+    c
+      .addOption(new Option("--signer <session|owner>", "who signs: the session key (default when configured; balance mode only) or the owner key (the account itself)").choices(["session", "owner"]))
+      .option("--from-balance", "owner key: settle inside this market's deposited balance (default for the owner: WALLET mode, paying from the wallet with no deposit)")
+      .option("--auto-deposit", "owner key, balance mode: deposit this market's shortfall first (approve + deposit + fill)")
+      .option("--approve <exact|max>", "when an approval is needed: exact (default, what this fill can pull) or max (unlimited)")
+      .option("--send", "broadcast instead of dry run");
+
+  tradeOptions(
+    program
+      .command("fill")
+      .description("Fill a saved quote file, or quote-and-fill an instrument in one go, in the quote's market. Session key: always balance mode (that market's deposited balance; refused with the owner's fix when it is short). Owner key (the account itself): wallet mode by default, approve if needed then fill, no deposit; --from-balance [--auto-deposit] for balance mode. A session sell that opens a short draws the short-risk budget, a buy the spend budget beyond the shorts it closes")
+      .argument("[quoteFile]")
+      .option("--instrument <x>", "quote-and-fill: NVDA-20261030-220-C, an instrument id or expiry:strike:call|put (an id uses --underlying)")
+      .option("--side <buy|sell>")
+      .option("--qty <shares>", "quantity in shares (default: the quoted quantity)"),
+  ).action(async (quoteFile: string | undefined, opts: FillOpts & { instrument?: string; side?: "buy" | "sell"; qty?: string }, cmd: Command) => {
       const ctx = ctxFrom(cmd);
-      const m = ctx.market("session");
-      let order, signature: Hex, qty: bigint;
+      const ts = tradeSigner(ctx, opts.signer);
+      // --json prints one object: the quote and charge lines are for humans
+      const say = (line: string) => ((cmd.optsWithGlobals() as GlobalOpts).json ? undefined : process.stdout.write(line + "\n"));
+      let m: MarketClient;
+      let order: Order, signature: Hex, qty: bigint;
       if (quoteFile) {
         const f = JSON.parse(readFileSync(quoteFile, "utf8")) as { order: Record<string, unknown>; signature: Hex; quantityRaw?: string; dryRun?: boolean };
         if (f.dryRun) throw new Error("this quote is a backend dry-run placeholder (no signer key on the desk); it cannot be filled");
         order = orderFromJson(f.order);
         signature = f.signature;
         qty = opts.qty ? parseShares(opts.qty) : BigInt(f.quantityRaw ?? order.quantityRaw.toString());
+        m = marketOfOrder(ctx, order.market, ts.who);
       } else {
         if (!opts.instrument || !opts.side) throw new Error("give a quote file, or --instrument and --side");
+        m = marketOfInstrument(ctx, opts.instrument, ts.who);
         qty = parseShares(opts.qty ?? "1");
-        const id = await instrumentArg(ctx, opts.instrument);
+        const id = await instrumentArg(m, opts.instrument);
         const uiMultiplier = await m.expiryMultiplier(expiryOf(id));
-        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: sessionKeyOf(ctx), underlying: ctx.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
-        process.stdout.write(quoteHuman(q, ctx.deployment.underlying, qty, uiMultiplier) + "\n");
+        const q = await ctx.rfq.getQuote({ chainId: ctx.chainId, market: m.market, instrumentId: id, side: opts.side, quantityRaw: qty, taker: ctx.account, sessionKey: ts.role === "session" ? ts.signer.address : undefined, underlying: m.deployment.underlying, uiMultiplier }, { orderBook: m.orderBook, protocolFeeBps: await m.protocolFeeBps() });
+        say(quoteHuman(q, m.deployment.underlying, qty, uiMultiplier));
         if (!q.fillable) throw new Error("backend dry-run quote (placeholder signature): nothing to fill");
-        if (q.canFill === false) process.stdout.write(`  maker says canFill=false${q.shortfallRaw > 0n ? ` (short ${formatUsdg(q.shortfallRaw)} USDG)` : ""}; the fill will likely revert\n`);
+        if (q.canFill === false) say(`  maker says canFill=false${q.shortfallRaw > 0n ? ` (short ${formatUsdg(q.shortfallRaw)} USDG)` : ""}; the fill will likely revert`);
         order = q.order;
         signature = q.signature;
       }
       if (order.taker.toLowerCase() !== ctx.account.toLowerCase()) throw new Error(`quote is addressed to ${order.taker}, not ${ctx.account}`);
-      const charge = await sessionChargeFor(ctx, m, { instrumentId: order.instrumentId, side: order.side === Side.Ask ? "buy" : "sell", quantityRaw: qty, order });
-      if (charge) process.stdout.write(`  ${describeSessionCharge(charge)}\n`);
-      await send(cmd, ctx, "session", m.fillOrderAs(order, signature, qty, true), opts.send, charge);
+      const charge = ts.role === "session" ? await sessionChargeFor(ctx, m, { instrumentId: order.instrumentId, side: order.side === Side.Ask ? "buy" : "sell", quantityRaw: qty, order }) : undefined;
+      if (charge) say(`  ${describeSessionCharge(charge)}`);
+      const r = await fillFrom(ctx, opts, m, ts.who, ts.role, order, signature, qty, charge);
+      out(cmd, r.json, r.human);
+      if (r.failed) process.exitCode = 1;
     });
 
-  program
-    .command("close")
-    .description("Close an open position before expiry: quotes the opposite side of the same instrument and fills it (session key, balance mode). --all closes every open position")
-    .argument("[instrument]", "NVDA-20261030-220-C, an id, or expiry:strike:call|put")
-    .option("--all", "close every open position of the account")
-    .option("--qty <shares>", "shares to close (default and maximum: the whole position)")
-    .option("--send", "broadcast instead of dry run")
-    .action(async (instrument: string | undefined, opts: { all?: boolean; qty?: string; send?: boolean }, cmd: Command) => {
+  tradeOptions(
+    program
+      .command("close")
+      .description("Close an open position before expiry: quotes the opposite side of the same instrument and fills it like `fill` (session key: balance mode; owner key: wallet mode unless --from-balance). --all closes every open position of the market (--underlying)")
+      .argument("[instrument]", "NVDA-20261030-220-C, an id, or expiry:strike:call|put")
+      .option("--all", "close every open position of the account in this market")
+      .option("--qty <shares>", "shares to close (default and maximum: the whole position)"),
+  ).action(async (instrument: string | undefined, opts: FillOpts & { all?: boolean; qty?: string }, cmd: Command) => {
       const ctx = ctxFrom(cmd);
-      requireSession(ctx);
-      const m = ctx.market("session");
-      const underlying = ctx.deployment.underlying;
+      const ts = tradeSigner(ctx, opts.signer);
+      const m = marketOfInstrument(ctx, instrument, ts.who);
+      const underlying = m.deployment.underlying;
       const fee = await m.protocolFeeBps();
-      const sessionKey = sessionKeyOf(ctx);
+      const sessionKey = ts.role === "session" ? ts.signer.address : undefined;
+      const fromBalance = ts.role === "session" || !!opts.fromBalance || !!opts.autoDeposit;
       const g = cmd.optsWithGlobals() as GlobalOpts;
       const closeOne = async (instrumentId: bigint, quantityRaw?: bigint) => {
-        const plan = await planClose({ market: m, rfq: ctx.rfq, instrumentId, quantityRaw, sessionKey, protocolFeeBps: fee });
+        const plan = await planClose({ market: m, rfq: ctx.rfq, instrumentId, quantityRaw, sessionKey, protocolFeeBps: fee, fromBalance });
         const human = [closePlanHuman(plan, underlying)];
         if (!plan.quote.fillable) throw new Error(`${plan.instrument}: backend dry-run quote (placeholder signature): nothing to fill`);
         if (plan.quote.canFill === false) human.push(`  maker says canFill=false${plan.quote.shortfallRaw > 0n ? ` (short ${formatUsdg(plan.quote.shortfallRaw)} USDG)` : ""}; the fill will likely revert`);
-        const r = await sendResult(ctx, "session", plan.request, opts.send, plan.sessionCharge);
+        const r = await fillFrom(ctx, opts, m, ts.who, ts.role, plan.quote.order, plan.quote.signature, plan.quantityRaw, plan.sessionCharge);
         human.push(r.human);
         return { json: { ...closePlanJson(plan), ...r.json }, human: human.join("\n"), failed: r.failed };
       };
@@ -470,14 +554,25 @@ export function buildProgram(): Command {
             process.exitCode = 1;
           }
         }
-        out(cmd, { account: ctx.account, dryRun: !opts.send, closed: results }, human.length ? human.join("\n\n") : "no open positions to close");
+        out(cmd, { account: ctx.account, market: underlying, dryRun: !opts.send, closed: results }, human.length ? human.join("\n\n") : `no open positions to close in ${underlying}`);
         return;
       }
       if (!instrument) throw new Error("give an instrument, or --all");
-      const r = await closeOne(await instrumentArg(ctx, instrument), opts.qty ? parseShares(opts.qty) : undefined);
+      const r = await closeOne(await instrumentArg(m, instrument), opts.qty ? parseShares(opts.qty) : undefined);
       if (g.json) out(cmd, r.json);
       else process.stdout.write(r.human + "\n");
       if (r.failed) process.exitCode = 1;
+    });
+
+  program
+    .command("account")
+    .description("One view of the account across EVERY market of the chain: wallet USDG, and per market the collateral, locked, free balance, wallet allowance, open positions and the configured key's session; totals; and where the key can fill from the balance now")
+    .option("--key <address>", "show this session key's status instead of the configured key's (no private key needed)")
+    .action(async (opts: { key?: string }, cmd: Command) => {
+      const ctx = ctxFrom(cmd, true);
+      if (opts.key && !/^0x[0-9a-fA-F]{40}$/.test(opts.key)) throw new Error("--key must be an address");
+      const v = await ctx.accountView(opts.key as Address | undefined);
+      out(cmd, v, accountHuman(v));
     });
 
   program
@@ -545,24 +640,27 @@ export function buildProgram(): Command {
 
   program
     .command("deposit")
-    .description("Deposit USDG into the market balance: --x402 through the gateway (default), or --wallet approve+deposit from the owner wallet")
+    .description("Deposit USDG into one market's balance (--market, default --underlying): --x402 through the gateway (default), or --wallet approve+deposit from the owner wallet. Balances are per market: a session key fills from the balance of the market it trades only")
     .argument("<amount>", "USDG")
+    .option("--market <id>", "market to credit: ticker (GOOGL) or market address")
     .option("--x402", "pay through the x402 deposit gateway (default)")
     .option("--wallet", "approve + deposit directly from the owner wallet")
+    .option("--approve <exact|max>", "--wallet, when the allowance is short: approve exactly the amount (default) or unlimited")
     .option("--send", "broadcast instead of dry run")
-    .action(async (amount: string, opts: { x402?: boolean; wallet?: boolean; send?: boolean }, cmd: Command) => {
+    .action(async (amount: string, opts: { market?: string; x402?: boolean; wallet?: boolean; approve?: string; send?: boolean }, cmd: Command) => {
       const ctx = ctxFrom(cmd);
       const amountRaw = parseUsdg(amount);
       if (opts.wallet) {
         const owner = requireOwner(ctx);
-        const m = ctx.market("owner");
-        const allowance = await m.usdgAllowance(owner.address);
-        if (allowance < amountRaw) await send(cmd, ctx, "owner", m.approveUsdg(amountRaw), opts.send);
-        await send(cmd, ctx, "owner", m.deposit(amountRaw, ctx.account), opts.send);
+        const m = ctx.marketFor(opts.market, "owner");
+        const [allowanceRaw, walletRaw] = await Promise.all([m.usdgAllowance(owner.address), m.publicClient.readContract({ address: m.usdg, abi: erc20Abi, functionName: "balanceOf", args: [owner.address] })]);
+        const plan = planDeposit({ market: m.deployment, account: ctx.account, amountRaw, allowanceRaw, walletRaw, approve: approveOpt(opts.approve) });
+        await runSteps(cmd, m, plan, [plan.summary], { market: m.deployment.underlying, account: ctx.account }, opts.send);
         return;
       }
       const payer = ctx.owner ?? requireSession(ctx);
-      const r = await depositViaGateway({ account: ctx.account, market: ctx.deployment.market, amountRaw }, { signer: payer, chainId: ctx.chainId, gatewayUrl: ctx.config.gatewayUrl, dryRun: !opts.send, maxAmountRaw: parseUsdg(ctx.config.maxDepositUsdg) });
+      const target = ctx.marketFor(opts.market, "none").deployment;
+      const r = await depositViaGateway({ account: ctx.account, market: target.market, amountRaw }, { signer: payer, chainId: ctx.chainId, gatewayUrl: ctx.config.gatewayUrl, dryRun: !opts.send, maxAmountRaw: parseUsdg(ctx.config.maxDepositUsdg) });
       out(cmd, r, r.dryRun ? `DRY RUN: gateway asks ${formatUsdg(BigInt(r.requirement!.amount))} USDG from ${payer.address} to ${r.requirement!.payTo} (fee ${formatUsdg(BigInt(r.instructions!.fee.raw))}); add --send to pay` : `paid; gateway deposit status ${r.deposit?.status}${r.depositTxHash ? ` tx ${r.depositTxHash}` : ""}  settlement ${JSON.stringify(r.settlement)}`);
     });
 
@@ -578,14 +676,48 @@ export function buildProgram(): Command {
 
   program
     .command("withdraw")
-    .description("Withdraw free collateral (owner key only)")
-    .argument("<amount>", "USDG")
+    .description("Withdraw free collateral (owner key only): an amount from one market (--market, default --underlying), or --all: every market's free balance, one tx per market")
+    .argument("[amount]", "USDG")
+    .option("--market <id>", "ticker (GOOGL) or market address")
+    .option("--all", "every market's free balance back to the wallet")
     .option("--to <address>")
     .option("--send")
-    .action(async (amount: string, opts: { to?: string; send?: boolean }, cmd: Command) => {
+    .action(async (amount: string | undefined, opts: { market?: string; all?: boolean; to?: string; send?: boolean }, cmd: Command) => {
       const ctx = ctxFrom(cmd);
       const owner = requireOwner(ctx);
-      await send(cmd, ctx, "owner", ctx.market("owner").withdraw(parseUsdg(amount), (opts.to ?? owner.address) as Address), opts.send);
+      const to = (opts.to ?? owner.address) as Address;
+      if (opts.all) {
+        if (amount || opts.market) throw new Error("--all takes no amount or --market");
+        ownerIsAccount(ctx);
+        const v = await ctx.accountView(owner.address);
+        const plan = planWithdrawAll(v, to);
+        if (!plan.steps.length) {
+          out(cmd, { account: ctx.account, summary: plan.summary, steps: [] }, plan.summary);
+          return;
+        }
+        await runSteps(cmd, ctx.marketFor(plan.steps[0]!.underlying, "owner"), plan, [plan.summary], { account: ctx.account, failed: v.failed }, opts.send);
+        return;
+      }
+      if (!amount) throw new Error("give an amount, or --all");
+      const m = ctx.marketFor(opts.market, "owner");
+      await send(cmd, ctx, "owner", m.withdraw(parseUsdg(amount), to), opts.send, undefined, m);
+    });
+
+  program
+    .command("rebalance")
+    .description("Move free balance between two markets of the account (owner key): withdraw from --from to the wallet, approve --to if short, deposit into --to. Dry run unless --send")
+    .requiredOption("--from <market>", "ticker or market address to take free balance from")
+    .requiredOption("--to <market>", "ticker or market address to fund")
+    .requiredOption("--amount <usdg>", "USDG to move")
+    .option("--approve <exact|max>", "when the allowance of --to is short: approve exactly the amount (default) or unlimited")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (opts: { from: string; to: string; amount: string; approve?: string; send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      const owner = requireOwner(ctx);
+      ownerIsAccount(ctx);
+      const v = await ctx.accountView(owner.address);
+      const plan = planRebalance(v, { from: opts.from, to: opts.to, amountRaw: parseUsdg(opts.amount), approve: approveOpt(opts.approve) });
+      await runSteps(cmd, ctx.marketFor(opts.from, "owner"), plan, [plan.summary], { account: ctx.account, from: plan.steps[0]!.underlying, to: plan.steps[plan.steps.length - 1]!.underlying }, opts.send);
     });
 
   const session = program.command("session").description("Session key management (owner key)");
@@ -742,18 +874,60 @@ function vaultStatusHuman(v: VaultInfo): string {
   ].join("\n");
 }
 
-/** Runs a plan of owner-key steps (vault or lending): dry run unless --send; prints every step. */
-async function runSteps(cmd: Command, client: { sendPlan: (p: never, o: { dryRun: boolean }) => Promise<PlanStepResult[]>; chain: { blockExplorers?: { default: { url: string } } } }, plan: { steps: PlanStep[]; summary: string }, header: string[], jsonHead: Record<string, unknown>, sendFlag: boolean | undefined) {
+type StepClient = { sendPlan: (p: never, o: { dryRun: boolean }) => Promise<PlanStepResult[]>; chain: { blockExplorers?: { default: { url: string } } } };
+
+/** Runs a plan of steps (dry run unless --send) and returns what to print: every transaction, in send order. */
+async function stepsResult(client: StepClient, plan: { steps: PlanStep[]; summary: string }, header: string[], jsonHead: Record<string, unknown>, sendFlag: boolean | undefined): Promise<{ json: Record<string, unknown>; human: string; failed: boolean }> {
   const results = await client.sendPlan(plan as never, { dryRun: !sendFlag });
   const lines = [...header];
-  for (const r of results) {
-    if (r.dryRun) lines.push(`DRY RUN${r.simulated ? " (simulation passed)" : " (not simulated: needs the approval above mined first)"}: ${r.request.summary}\n  from ${r.from}\n  to   ${r.request.to}\n  data ${r.request.data}`);
+  const n = results.length;
+  if (n > 1 && results.some((r) => r.dryRun)) lines.push(`${n} transactions would be sent, in this order:`);
+  results.forEach((r, i) => {
+    const at = n > 1 ? `[${i + 1}/${n}] ` : "";
+    const after = results.slice(0, i).some((x) => x.kind === "approve") ? "the approval above" : "the step above";
+    if (r.dryRun) lines.push(`${at}DRY RUN ${r.simulated ? "(simulation passed)" : `(not simulated: needs ${after} mined first)`}: ${r.request.summary}\n  from ${r.from}\n  to   ${r.request.to}\n  data ${r.request.data}`);
     else lines.push(`${r.status === "success" ? "OK" : "REVERTED"} ${r.request.summary}\n  tx ${r.hash}\n  ${client.chain.blockExplorers?.default.url}/tx/${r.hash}`);
-  }
+  });
   if (results.some((r) => r.dryRun)) lines.push("  add --send to broadcast");
   const failed = !results.every((r) => r.dryRun || r.status === "success") || results.length !== plan.steps.length;
-  out(cmd, { ...jsonHead, summary: plan.summary, dryRun: !sendFlag, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated, txHash: r.hash, status: r.status, blockNumber: r.blockNumber })) }, lines.join("\n"));
-  if (failed) process.exitCode = 1;
+  return { json: { ...jsonHead, summary: plan.summary, dryRun: !sendFlag, steps: results.map((r) => ({ kind: r.kind, to: r.request.to, data: r.request.data, summary: r.request.summary, simulated: r.simulated, txHash: r.hash, status: r.status, blockNumber: r.blockNumber })) }, human: lines.join("\n"), failed };
+}
+
+/** Runs a plan of owner-key steps (vault, lending, deposit, withdraw --all, rebalance): dry run unless --send; prints every step. */
+async function runSteps(cmd: Command, client: StepClient, plan: { steps: PlanStep[]; summary: string }, header: string[], jsonHead: Record<string, unknown>, sendFlag: boolean | undefined) {
+  const r = await stepsResult(client, plan, header, jsonHead, sendFlag);
+  out(cmd, r.json, r.human);
+  if (r.failed) process.exitCode = 1;
+}
+
+/** withdraw takes the caller's own balance, so --all and rebalance need the owner key to be the account. */
+function ownerIsAccount(ctx: KitContext) {
+  const owner = requireOwner(ctx);
+  if (owner.address.toLowerCase() !== ctx.account.toLowerCase()) throw new Error(`the owner key ${owner.address} is not the account ${ctx.account}; withdraw takes the caller's own balance`);
+}
+
+function accountHuman(v: AccountView): string {
+  const role = v.keyRole === "session" ? `session key ${v.key}` : v.keyRole === "owner" ? `the account's own key` : "no key (read-only)";
+  const rows = v.markets.map((m) => [
+    m.underlying,
+    m.error ? "ERROR" : formatUsdg(m.collateralRaw),
+    m.error ? "-" : formatUsdg(m.requirementRaw),
+    m.error ? "-" : formatUsdg(m.freeCollateralRaw),
+    m.error ? "-" : `${m.openPositions}${m.expiredPositions ? ` (+${m.expiredPositions} expired)` : ""}`,
+    m.error ? "-" : allowanceText(m.allowanceRaw),
+    v.keyRole === "session" ? (m.session ? (m.session.active && m.session.canTrade ? `active, spend ${formatSessionCap(m.session.spendLeft)}` : m.session.expiresAt === 0n ? "none" : "inactive") : "-") : v.keyRole === "owner" ? "own key" : "-",
+    m.canTradeFromBalance ? "yes" : "no",
+  ]);
+  const lines = [
+    `account ${v.account} on chain ${v.chainId}; key: ${role}`,
+    `wallet ${v.wallet.map((w) => `${w.error ? "? (read failed)" : formatUsdg(w.balanceRaw)} USDG (${w.token})`).join(", ") || "-"}`,
+    table(["market", "collateral", "locked", "free", "positions", "allowance", "session", "fills from balance"], rows),
+    `total collateral ${formatUsdg(v.totals.collateralRaw)}  locked ${formatUsdg(v.totals.requirementRaw)}  free ${formatUsdg(v.totals.freeCollateralRaw)}  open positions ${v.totals.openPositions}${v.totals.expiredPositions ? `  expired (to redeem) ${v.totals.expiredPositions}` : ""}`,
+  ];
+  if (v.keyRole === "session") lines.push(v.tradable.length ? `the session key can fill from the balance in: ${v.tradable.join(", ")} (balances are per market; owner moves them with \`hedgehood rebalance\` / \`hedgehood deposit --market\`)` : "the session key cannot fill anywhere yet: it needs a live session and free balance in the same market");
+  else if (v.keyRole === "owner") lines.push(`the account's own key fills in wallet mode in every market (no deposit; it approves the market first), or from the balance where free${v.tradable.length ? `: ${v.tradable.join(", ")}` : ""}`);
+  if (v.failed.length) lines.push(`not read: ${v.markets.filter((m) => m.error).map((m) => `${m.underlying} (${m.error})`).join("; ")}`);
+  return lines.join("\n");
 }
 
 /** Runs a vault plan from the owner key: dry run unless --send; prints every step. */

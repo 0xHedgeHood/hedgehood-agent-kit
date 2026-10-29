@@ -3,9 +3,9 @@
  * quoting both sides of every instrument, and an indexer with /v1/pnl and /v1/history rows. Everything goes through one
  * `fetch` so no network is touched.
  */
-import { decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionResult, type Address, type Hex } from "viem";
+import { decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionResult, multicall3Abi, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { adaptiveCurveIrmAbi, testUsdAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
+import { adaptiveCurveIrmAbi, getDeployment, MULTICALL3, testUsdAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
 
 export const ACCOUNT = "0x3333333333333333333333333333333333333333" as Address;
 export const BOOK = "0xCEa2be1ecC16D347bE1A4fEA589e21de0Ad7E6C3" as Address;
@@ -39,6 +39,65 @@ export interface ChainState {
   lending: LendingState;
   /** The testnet TestUSD faucet: deployed (has code), the wallet's balance and next draw time, the faucet() calls simulated. */
   faucet: { deployed: boolean; balanceRaw: bigint; nextFaucetAt: bigint; calls: Hex[] };
+  /** The wallet's TestUSD allowance to a market without its own `markets` entry. */
+  allowanceRaw?: bigint;
+  /** requirementIfTraded(account, id, delta) of the fixture market (default 0). */
+  requirementAfterRaw?: bigint;
+  /** Per-market overrides by lower-case market address (the other testnet markets). */
+  markets?: Record<string, MarketOverride>;
+  /** Markets without an override: "same" (default) answer as the fixture market, "empty" hold nothing. */
+  otherMarkets?: "same" | "empty";
+}
+
+/** One market's account state in the fake; `fail` makes every read of that market revert. */
+export interface MarketOverride {
+  collateralRaw?: bigint;
+  requirementRaw?: bigint;
+  /** positions(account, expiry), the same for every expiry in `expiries`. */
+  positions?: bigint[];
+  expiries?: bigint[];
+  session?: [bigint, bigint, bigint, bigint, bigint];
+  allowanceRaw?: bigint;
+  requirementAfterRaw?: bigint;
+  fail?: string;
+}
+
+type MarketFixture = Required<Omit<MarketOverride, "fail">>;
+const EMPTY_MARKET: MarketFixture = { collateralRaw: 0n, requirementRaw: 0n, positions: [0n, 0n, 0n, 0n], expiries: [], session: [0n, 0n, 0n, 0n, 0n], allowanceRaw: 0n, requirementAfterRaw: 0n };
+
+/** The account state the fake market at `to` answers with. */
+export function marketState(state: ChainState, to: string): MarketFixture {
+  const o = state.markets?.[to.toLowerCase()];
+  if (o?.fail) throw new Error(`execution reverted: ${o.fail}`);
+  const fixture = to.toLowerCase() === MARKET.toLowerCase() || (state.otherMarkets ?? "same") === "same";
+  const base: MarketFixture = fixture
+    ? { collateralRaw: state.collateralRaw, requirementRaw: state.requirementRaw, positions: state.positions, expiries: [EXPIRY], session: state.session, allowanceRaw: state.allowanceRaw ?? 0n, requirementAfterRaw: state.requirementAfterRaw ?? 0n }
+    : EMPTY_MARKET;
+  return { ...base, ...(o ?? {}) };
+}
+
+/** Testnet market addresses (chains.ts 46630), for per-market overrides. */
+export const AMD_MARKET = "0xc5C2FB4392ad74b664218517a28e17d407252ffc" as Address;
+export const GOOGL_MARKET = "0x8b51467DB7a822c10286059199bd2574Baa19De8" as Address;
+export const GOOGL_BOOK = "0xAeaD738d9D00Ead829B21b3A28B1235fd727316D" as Address;
+export const TSLA_MARKET = "0xcCD70a4fa22185860124a1f66FB2993B3a9ef80f" as Address;
+
+/**
+ * One account across the testnet markets: 250 in NVDA (10 locked, 2 open positions), 30 free in AMD, nothing in GOOGL,
+ * TSLA unreadable; the session key is live in NVDA, expired in AMD, absent elsewhere; the wallet holds 500 TestUSD.
+ */
+export function multiMarketChain(): ChainState {
+  const c = defaultChain();
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  c.collateralRaw = 250_000_000n;
+  c.requirementRaw = 10_000_000n;
+  c.otherMarkets = "empty";
+  c.faucet.balanceRaw = 500_000_000n;
+  c.markets = {
+    [AMD_MARKET.toLowerCase()]: { collateralRaw: 30_000_000n, expiries: [], session: [now - 60n, now - 86400n, 3n, 0n, 5_000_000n] },
+    [TSLA_MARKET.toLowerCase()]: { fail: "boom" },
+  };
+  return c;
 }
 
 /** TestUSD on 46630 (the kit's chains.ts faucet.token, the CREATE2 address pinned by DeployTestUSD.EXPECTED). */
@@ -52,6 +111,13 @@ function faucetRpc(state: ChainState, call: { to: Address; data: Hex }): Hex {
       return enc(state.faucet.balanceRaw);
     case "nextFaucetAt":
       return enc(state.faucet.nextFaucetAt);
+    case "allowance": {
+      const { args } = decodeFunctionData({ abi: testUsdAbi, data: call.data });
+      return enc(marketState(state, String((args as unknown as unknown[])[1])).allowanceRaw);
+    }
+    case "approve":
+      state.simulated.push(call.data);
+      return enc(true);
     case "faucet":
       state.faucet.calls.push(call.data);
       if (state.faucet.nextFaucetAt > state.vault.now) throw new Error("execution reverted: FaucetCooldown");
@@ -490,22 +556,37 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
   if (method === "eth_getCode") return String(params[0]).toLowerCase() === TEST_USD.toLowerCase() && !state.faucet.deployed ? "0x" : "0x6080";
   if (method !== "eth_call") throw new Error(`fake rpc: unexpected ${method}`);
   const call = params[0] as { to: Address; data: Hex; from?: Address };
+  if (call.to.toLowerCase() === MULTICALL3.toLowerCase()) return multicallRpc(state, call);
   if (call.to.toLowerCase() === TEST_USD.toLowerCase()) return faucetRpc(state, call);
   if (LENDING_ADDRESSES.has(call.to.toLowerCase())) return lendingRpc(state, call);
   if (VAULT_ADDRESSES.has(call.to.toLowerCase())) return vaultRpc(state, call);
   const { functionName, args } = decodeFunctionData({ abi, data: call.data });
   const enc = (result: unknown) => encodeFunctionResult({ abi, functionName, result } as Parameters<typeof encodeFunctionResult>[0]);
+  const a = (args ?? []) as unknown as unknown[];
+  const mk = () => marketState(state, call.to);
   switch (functionName) {
     case "collateral":
-      return enc(state.collateralRaw);
+      return enc(mk().collateralRaw);
     case "requirement":
-      return enc(state.requirementRaw);
+      return enc(mk().requirementRaw);
     case "freeCollateral":
-      return enc(state.collateralRaw - state.requirementRaw);
+      return enc(mk().collateralRaw - mk().requirementRaw);
     case "balanceOf":
       return enc(0n);
     case "accountExpiries":
-      return enc([EXPIRY]);
+      return enc(mk().expiries);
+    case "deposit": {
+      state.simulated.push(call.data);
+      const amount = a[1] as bigint;
+      if (mk().allowanceRaw < amount || state.faucet.balanceRaw < amount) throw new Error("execution reverted: ERC20InsufficientAllowance");
+      return "0x";
+    }
+    case "withdraw": {
+      state.simulated.push(call.data);
+      const m = mk();
+      if ((a[0] as bigint) > m.collateralRaw - m.requirementRaw) throw new RevertWith("InsufficientCollateral");
+      return "0x";
+    }
     case "openedExpiryCount":
       return enc(1n);
     case "openedExpiries":
@@ -513,26 +594,26 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
     case "strikesOf":
       return enc(strikesOf(state));
     case "positions":
-      return enc(state.positions);
+      return enc(mk().positions);
     case "position": {
       // the same fixture as positions(): [call@210, put@210, call@220, put@220] of EXPIRY
       const id = (args as unknown as unknown[])[1] as bigint;
       const ids = strikesOf(state).flatMap((k) => [encodeInstrumentId(EXPIRY, k, false), encodeInstrumentId(EXPIRY, k, true)]);
       const i = ids.indexOf(id);
-      return enc(i < 0 ? 0n : (state.positions[i] ?? 0n));
+      return enc(i < 0 ? 0n : (mk().positions[i] ?? 0n));
     }
     case "protocolFeeBps":
       return enc(50n);
     case "tradingOpen":
       return enc(true);
     case "requirementIfTraded":
-      return enc(0n);
+      return enc(mk().requirementAfterRaw);
     case "uiMultiplier":
       return enc(ONE);
     case "expiryInfo":
       return enc({ openedAt: 1792785600n, settled: false, settledByOwner: false, uiMultiplier: state.uiMultiplier, anchor: 215_000_000n, capLow: 150_500_000n, capHigh: 279_500_000n, settlementPrice: 0n, rawSettlementPrice: 0n, strikes: strikesOf(state) });
     case "sessions":
-      return enc(state.session);
+      return enc(mk().session);
     case "authorizeSession":
     case "revokeSession":
       state.simulated.push(call.data);
@@ -549,6 +630,22 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
     default:
       throw new Error(`fake rpc: no fixture for ${functionName}(${(args as unknown as unknown[] | undefined)?.join(", ") ?? ""})`);
   }
+}
+
+/** Multicall3 `aggregate3`: each sub-call answered by the same fixtures; a failing sub-call fails the batch unless allowFailure. */
+function multicallRpc(state: ChainState, call: { to: Address; data: Hex; from?: Address }): Hex {
+  const { functionName, args } = decodeFunctionData({ abi: multicall3Abi, data: call.data });
+  if (functionName !== "aggregate3") throw new Error(`fake rpc: multicall ${functionName} not supported`);
+  const calls = (args as unknown as [ReadonlyArray<{ target: Address; allowFailure: boolean; callData: Hex }>])[0];
+  const result = calls.map((c) => {
+    try {
+      return { success: true, returnData: rpcResult(state, "eth_call", [{ to: c.target, data: c.callData, from: call.from }]) as Hex };
+    } catch (e) {
+      if (!c.allowFailure) throw new Error(`execution reverted: Multicall3: call failed (${e instanceof Error ? e.message : String(e)})`);
+      return { success: false, returnData: (e instanceof RevertWith ? e.data : "0x") as Hex };
+    }
+  });
+  return encodeFunctionResult({ abi: multicall3Abi, functionName: "aggregate3", result });
 }
 
 /** A JSON-RPC revert carrying a market custom error's data. */
@@ -573,19 +670,23 @@ export async function makerQuote(body: { instrument: string; side: "buy" | "sell
   const side = body.side === "buy" ? Side.Ask : Side.Bid;
   const perShare = body.side === "buy" ? 1_680_000n : 1_570_000n; // NVDA-20261030-220-C live 2026-10-28: buy 1.68 / sell 1.57
   const premium = (perShare * quantityRaw) / ONE;
+  // the market of the name's ticker (NVDA-... is the fixture market)
+  const dep = getDeployment(46630).markets.find((m) => m.underlying === body.instrument.split("-")[0]!.toUpperCase());
+  const market = dep?.market ?? MARKET;
+  const book = dep?.orderBook ?? BOOK;
   const order: Order = {
-    maker: maker.address, signer: maker.address, taker: body.taker, chainId: 46630n, settlement: BOOK, market: MARKET, instrumentId, side, quantityRaw, minFillRaw: 0n,
+    maker: maker.address, signer: maker.address, taker: body.taker, chainId: 46630n, settlement: book, market, instrumentId, side, quantityRaw, minFillRaw: 0n,
     premiumStartRaw: premium, premiumEndRaw: premium, startTime: BigInt(now - 1), validUntil: BigInt(now + 20), stockMultiplier: ONE, nonce: BigInt(now), fromBalance: true,
   };
   const signature = opts.dryRun ? (("0x" + "ab".repeat(65)) as Hex) : await signOrder(maker, order);
   return {
     quote: orderToJson(order), signature, digest: orderDigest(order), validUntil: order.validUntil.toString(), startTime: order.startTime.toString(), ttl: 20,
-    instrument: body.instrument, instrumentId: instrumentId.toString(), market: MARKET, book: BOOK, marketId: "nvda-testnet", version: 2, taker: body.taker,
+    instrument: body.instrument, instrumentId: instrumentId.toString(), market, book, marketId: "nvda-testnet", version: 2, taker: body.taker,
     takerSide: body.side, makerSide: side, quantityRaw: quantityRaw.toString(), markPrice: 1.625, price: { start: Number(perShare) / 1e6, end: Number(perShare) / 1e6, unit: "USDG per share" },
     premiumStartRaw: premium.toString(), premiumEndRaw: premium.toString(), fee: { bps: 50, startRaw: "0", endRaw: "0" }, decay: { model: "linear", bpsPerMin: 0, encodedInOrder: true },
-    signing: { maker: maker.address, signer: maker.address, kind: "owner", domain: { name: "CashOptionOrderBook", version: "2", chainId: 46630, verifyingContract: BOOK } },
+    signing: { maker: maker.address, signer: maker.address, kind: "owner", domain: { name: "CashOptionOrderBook", version: "2", chainId: 46630, verifyingContract: book } },
     funding: { makerFromBalance: true, takerDefault: "balance", canFill: true, preview: { canFill: true, mode: "balance" } },
-    fill: { to: BOOK, chainId: 46630, quantityRaw: quantityRaw.toString(), default: "fillOrderAs", fillOrderAs: encodeFillOrderAs(BOOK, body.taker, order, signature, quantityRaw, true).data, fillOrderAsWallet: null, fillOrder: "0x" },
+    fill: { to: book, chainId: 46630, quantityRaw: quantityRaw.toString(), default: "fillOrderAs", fillOrderAs: encodeFillOrderAs(book, body.taker, order, signature, quantityRaw, true).data, fillOrderAsWallet: null, fillOrder: "0x" },
     dryRun: opts.dryRun ?? false,
   };
 }

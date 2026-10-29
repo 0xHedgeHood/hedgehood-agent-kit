@@ -28,7 +28,7 @@ import { chains, getDeployment, getMarket, type MarketDeployment } from "./chain
 import { decodeMarketError, MarketRevertError } from "./errors.js";
 import { decodeInstrumentId, encodeInstrumentId, expiryDateNY, expiryOf, instrumentNameOf, parseInstrumentName, resolveInstrumentName, shareStrikeOf, UNIT_MULTIPLIER } from "./instrument.js";
 import { orderToTuple, SCOPE_CANCEL, SCOPE_TRADE, type Order } from "./order.js";
-import { sendTxRequest, type SendResult } from "./send.js";
+import { sendTxRequest, type PlanStep, type PlanStepResult, type SendResult } from "./send.js";
 import { maxPaidUntilExpiry, maxPayoutPerToken, sessionChargeOf, sessionLimitDetail, type SessionCharge } from "./session.js";
 
 export interface MarketClientOptions {
@@ -385,6 +385,31 @@ export class MarketClient {
       if (decoded) throw new MarketRevertError(request.summary, decoded, e);
       throw e;
     }
+  }
+
+  /**
+   * Runs a plan of steps from the configured signer (approve, deposit, withdraw, fill: `planFillFunding`, `planDeposit`,
+   * `planRebalance`, `planWithdrawAll`; steps may target other markets of the chain). A dry run (default) simulates every
+   * step that can be simulated on its own and returns the unsigned transactions; otherwise it sends them in order,
+   * waits for each receipt and stops at the first revert. Errors decode as in `send`; `sessionCharge` applies to the
+   * `fill` step.
+   */
+  async sendPlan<S extends PlanStep>(plan: { steps: S[] }, opts: { dryRun?: boolean; sessionCharge?: SessionCharge } = {}): Promise<Array<PlanStepResult<S["kind"]>>> {
+    const dryRun = opts.dryRun ?? true;
+    const out: Array<PlanStepResult<S["kind"]>> = [];
+    for (const step of plan.steps) {
+      const kind = step.kind as S["kind"];
+      const sessionCharge = step.kind === "fill" ? opts.sessionCharge : undefined;
+      if (dryRun) {
+        out.push({ ...(await this.send(step, { dryRun: true, simulate: step.simulate, sessionCharge })), kind });
+        continue;
+      }
+      const r = await this.send(step, { dryRun: false, sessionCharge });
+      const receipt = await this.waitForReceipt(r.hash!);
+      out.push({ ...r, kind, status: receipt.status, blockNumber: receipt.blockNumber });
+      if (receipt.status !== "success") break;
+    }
+    return out;
   }
 
   async waitForReceipt(hash: Hash) {

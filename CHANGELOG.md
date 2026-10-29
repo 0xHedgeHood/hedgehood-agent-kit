@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+**One wallet, all markets (no contract change).** Each `CashOptionMarketV2` (one per underlying) keeps its own
+balance, positions and session grant; the kit now reads and trades them like one account.
+
+- SDK `account`: `readAccount` reads every market of the chain in parallel (one Multicall3 batch per market,
+  JSON-RPC batched): collateral, locked, free, the wallet's allowance to the market, open / expired positions and the
+  configured key's session; the wallet balance; totals; `tradable` (live session + free balance). A market whose reads
+  fail is marked (`error`, `failed`) instead of failing the view. `fundingAdvice` names a market's shortfall, the free
+  balance elsewhere and the owner's command; `planDeposit`, `planWithdrawAll`, `planRebalance`. `resolveMarket(chainId,
+  ticker|address)`, `MULTICALL3`.
+- SDK `funding`: `planFillFunding` for wallet mode (`fromBalance = false`, the account's own key: the market pulls
+  premium, fee and any collateral shortfall from the wallet; approve exactly what the fill can pull, or max) and balance
+  mode (optionally deposit the shortfall first), as ordered approve / deposit / fill steps with `problems`;
+  `minReceivedUntilExpiry`; `sessionFundingRefusal`. `MarketClient.sendPlan` runs such plans (dry run by default,
+  errors decoded per step).
+- CLI: `hedgehood account [--key]`; `withdraw --all` (one tx per market) and `withdraw --market`; `rebalance --from
+  --to --amount`; `deposit --market [--approve exact|max]`. `fill` / `close` trade in the quote's market (instrument
+  ticker or quote file) and take `--signer session|owner`, `--from-balance`, `--auto-deposit`, `--approve`. The account's
+  own key now fills in **wallet mode by default** (also in self-custody, where the session key is the account); the dry
+  run lists every transaction. A session key stays balance-only and is refused, before anything is sent, when its
+  market's balance is short, with the shortfall, the free balance elsewhere and `hedgehood rebalance …` / `hedgehood
+  deposit … --market X --wallet`. `fill --json` prints a single object.
+- MCP: `get_account`, `deposit`, `rebalance` (owner, confirm + dryRun), `withdraw` takes `market` and `all`;
+  `get_quote`, `get_mark`, `list_instruments`, `positions`, `close_position`, `deposit_x402` take `market` (or the
+  instrument name's ticker); `fill_quote` / `close_position` take `signer`, `fromBalance`, `autoDeposit`, `approve`
+  with the same owner / session rules; `list_markets` lists every market. 37 tools including `get_dashboard`.
+- Tests after combining the account and dashboard changes: SDK 131, MCP 33, CLI 30; the shared fakes answer
+  Multicall3 and per-market state.
+
 - User portfolio ASCII dashboard shared by SDK `renderPnlDashboard`, CLI `dashboard` / `pnl --ascii`, and MCP
   `get_dashboard` (text plus structured data). Shows account-wide totals, active positions, signed snapshot bars,
   report/mark times and unknown marks without a fabricated equity curve. Dashboard queries need only an address.

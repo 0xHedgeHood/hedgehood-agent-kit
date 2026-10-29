@@ -16,9 +16,12 @@ hedgehood pnl [--json]                       # positions marked at mid + realize
 hedgehood history [--limit n] [--since <iso|unix>] [--json]   # fills, settlements, redeems, newest first
 hedgehood close <instrument> [--qty <shares>] [--send]        # exit before expiry: fills the opposite side
 hedgehood close --all [--send]               # flatten every open position
-hedgehood deposit 100 --x402 [--send]        # or --wallet (owner key: approve + deposit)
+hedgehood account [--key 0x..] [--json]      # the account in EVERY market: collateral, locked, free, allowance, positions, session
+hedgehood deposit 100 [--market GOOGL] --x402 [--send]   # or --wallet (owner key: approve if short + deposit)
 hedgehood redeem <expiry> [--send]
-hedgehood withdraw 50 [--to 0x..] [--send]   # owner key
+hedgehood withdraw 50 [--market GOOGL] [--to 0x..] [--send]   # owner key
+hedgehood withdraw --all [--send]            # owner key: every market's free balance, one tx per market
+hedgehood rebalance --from NVDA --to GOOGL --amount 25 [--send]   # owner key: withdraw, approve if short, deposit
 hedgehood session authorize --max-spend 100 [--max-short-risk 0|<usdg>|unlimited] [--send]   # owner key; --max-spend required
 hedgehood session status                     # expiry, authorizedAt, riskLeft, spendLeft
 hedgehood session revoke <key> [--send]
@@ -35,8 +38,13 @@ hedgehood --mainnet vault cancel deposit|redeem --vault hhNVDA-CC [--send]
 ```
 
 Instruments: a backend name (`NVDA-20261030-220-C`), a packed id, or `expiry:strike:call|put`; strikes are the listed
-per-share strikes (mapped to the per-token strike in the id with the expiry's `uiMultiplier`). A session key fills in
-balance mode only, within two cumulative budgets: a sell that opens a short draws `riskLeft` (`--max-short-risk`, default
+per-share strikes (mapped to the per-token strike in the id with the expiry's `uiMultiplier`). Markets are separate (each
+has its own balance and session grant): `fill` / `close` trade in the quote's market (the instrument name's ticker, a
+quote file's `market`, else `--underlying`). `--signer session|owner` picks the key (default: the session key when
+configured). The account's own key fills in **wallet mode** by default (approve the market if the allowance is short,
+then fill; nothing to deposit; `--approve max` for unlimited), or `--from-balance [--auto-deposit]`. A session key fills in
+balance mode only (a fill its market's balance cannot pay is refused with the owner's `rebalance` / `deposit --market`
+command), within two cumulative budgets: a sell that opens a short draws `riskLeft` (`--max-short-risk`, default
 0 = it cannot sell to open) by the short's worst case, a buy draws `spendLeft` (`--max-spend`) by premium + fee beyond
 the worst case of the shorts it closes. `quote`, `fill` and `close` print the leg's `session charge` and say when it
 would revert `SessionLimit`. `--max-requirement` was removed and errors with a pointer to `--max-short-risk`. Vaults: an address, a

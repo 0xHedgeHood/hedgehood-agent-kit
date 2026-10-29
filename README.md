@@ -16,9 +16,9 @@ RFQ maker and filled on chain with a **session key that can never withdraw**.
 
 | package | what | install |
 |---|---|---|
-| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, P&L and history readers, x402 USDG payer, ERC-8004 helpers, `VaultClient` for the Stock Yield vaults, `LendingClient` for share lending (lend USDG / borrow against fund shares) | `pnpm add @hedgehood-io/sdk viem` |
-| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 32 tools (18 market + 6 vault + 8 lending), every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
-| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw`, `session authorize\|revoke\|status`, `vaults`, `vault status\|deposit\|redeem\|claim\|cancel`, `lend status\|deposit\|withdraw`, `borrow status\|collateral\|take\|repay\|withdraw-collateral` | `npx @hedgehood-io/cli --help` |
+| [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, one-account view and funding plans across markets (`readAccount`, `planFillFunding`, `planRebalance`), P&L and history readers, x402 USDG payer, ERC-8004 helpers, `VaultClient` for the Stock Yield vaults, `LendingClient` for share lending (lend USDG / borrow against fund shares) | `pnpm add @hedgehood-io/sdk viem` |
+| [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 37 tools (23 market + 6 vault + 8 lending), every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
+| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `account`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw [--all]`, `rebalance`, `session authorize\|revoke\|status`, `vaults`, `vault status\|deposit\|redeem\|claim\|cancel`, `lend status\|deposit\|withdraw`, `borrow status\|collateral\|take\|repay\|withdraw-collateral` | `npx @hedgehood-io/cli --help` |
 | [`skills/hedgehood-options`](skills/hedgehood-options/SKILL.md) | the skill an agent reads: market model, the loop, the Stock Yield vaults, share lending, key hygiene, troubleshooting | `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` |
 | [`examples/`](examples) | a 30-line "agent buys a weekly call" script and an MCP config snippet | `pnpm tsx examples/buy-weekly-call.ts` |
 
@@ -54,6 +54,29 @@ hedgehood close --all --send                        # flatten every open positio
 Positions are signed and net out on chain, and the maker quotes both sides of every instrument, so closing is a fill of
 the opposite side of the same instrument (a long is sold to the bid, a short bought back at the ask). `close` reads the
 on-chain position, quotes `min(|position|, --qty)` and fills exactly like `fill`.
+
+### One wallet, all markets
+
+Each underlying is its own `CashOptionMarketV2` with its own balance, positions and session keys: 250 deposited in NVDA
+cannot pay for a GOOGL trade. The kit makes them behave like one account without contract changes:
+
+```sh
+hedgehood account            # wallet + every market: collateral, locked, free, allowance, positions, session; totals;
+                             # the markets where the configured key can fill from the balance now
+# the account's own key: no pre-deposit. WALLET mode by default: premium, fee and any collateral are pulled from the
+# wallet; the dry run lists every tx (approve the market when the allowance is short, exact amount; --approve max)
+hedgehood --owner-key-file ~/.hedgehood/owner.key fill --signer owner --instrument GOOGL-20261030-180-C --side buy
+hedgehood ... fill --signer owner --from-balance --auto-deposit ...   # balance mode: approve + deposit the shortfall + fill
+# a session key fills from that market's balance only; a shortfall is refused before anything is sent, naming the
+# market, the shortfall, where free balance sits and the owner's fix:
+hedgehood ... rebalance --from NVDA --to GOOGL --amount 12.5 --send   # withdraw, approve if short, deposit
+hedgehood ... deposit 12.5 --market GOOGL --wallet --send
+hedgehood ... withdraw --all                                          # every market's free balance, one tx per market
+```
+
+`--signer owner` is only needed when a session key is configured too (it is the default signer). MCP: `get_account`,
+`deposit`, `withdraw { all: true }`, `rebalance`; `get_quote` / `fill_quote` / `close_position` take `market` (or the
+instrument name's ticker) and `signer`, `fromBalance`, `autoDeposit`, `approve`.
 
 Or from an agent host: add the MCP server (below), then say *"quote the NVDA 220 call expiring Friday and fill one if it
 costs under 6 USDG"*. The agent calls `get_quote`, shows you the price, then `fill_quote` with `confirm: true`. Later,
@@ -139,14 +162,15 @@ oracle migration (new market id) needs no kit release; `--market <id>` / `market
   hosts that want a URL: `npx -y @hedgehood-io/mcp --http 7402` serves `http://127.0.0.1:7402/mcp` (localhost only; it signs).
 - `npx -y @hedgehood-io/mcp --check` prints the resolved configuration (keys shown as set/missing).
 
-Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `deposit_x402`,
+Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `get_account` (every
+market at once), `deposit` (owner wallet into one market), `rebalance` (between markets, owner key), `deposit_x402`,
 `positions` (active: open positions with avg price, mark, unrealized P&L, time to expiry), `get_pnl`, `get_history`
-(past: fills, settlements, redeems), `redeem`, `withdraw` (owner key), `authorize_session` (owner key), `leaderboard`,
+(past: fills, settlements, redeems), `redeem`, `withdraw` (owner key; `all: true` for every market), `authorize_session` (owner key), `leaderboard`,
 `my_record`, `get_agent_record`, `register_agent` (ERC-8004, owner key), `faucet` (testnet TestUSD), `decode_instrument`; Stock Yield vaults:
 `list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel` (owner key); share lending:
 `lend_status`, `lend_deposit`, `lend_withdraw`, `borrow_status`, `borrow_supply_collateral`, `borrow_take`, `borrow_repay`,
 `borrow_withdraw_collateral` (owner key). Write tools
-(`fill_quote`, `close_position`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`, `faucet`,
+(`fill_quote`, `close_position`, `deposit`, `deposit_x402`, `rebalance`, `redeem`, `withdraw`, `authorize_session`, `register_agent`, `faucet`,
 `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel`, `lend_deposit`, `lend_withdraw`, `borrow_*` except
 `borrow_status`) do nothing without `confirm: true`; with it they simulate
 and return the unsigned transaction(s) unless `dryRun: false`, and then report the tx hash(es).
@@ -170,10 +194,15 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
   their worst case. It cannot withdraw, deposit from the account, change sessions or receive funds. Re-authorizing resets
   both budgets and voids every order the key signed before; `revokeSession` is immediate and voids every unfilled order
   the key signed.
-- **Balance mode.** Fills settle premium, fee and collateral inside the deposited balance (`fillOrderAs(..., fromBalance =
-  true)`): no ERC-20 approvals, nothing is ever pulled from a wallet; a shortfall reverts. A session key can only fill
-  this way (the market reverts `SessionWalletMode` on a session leg in wallet mode), and the kit refuses or forces
-  `fromBalance = false` from a session key before anything is sent.
+- **Balance mode for session keys.** A session key's fills settle premium, fee and collateral inside that market's
+  deposited balance (`fillOrderAs(..., fromBalance = true)`): no ERC-20 approvals, nothing is pulled from a wallet; a
+  shortfall reverts. The market reverts `SessionWalletMode` on a session leg in wallet mode, so an agent's key can never
+  pull from the owner's wallet; the kit forces balance mode for it, never deposits for it, and refuses a fill its market
+  balance cannot pay (with the owner's deposit / rebalance command) before anything is sent.
+- **Wallet mode for the owner.** When the signing key is the account itself, `fill` / `close` default to
+  `fromBalance = false`: the market pulls premium, fee and any collateral shortfall from the wallet against the wallet's
+  allowance to that market. The kit approves only what the fill can pull (`--approve max` / `approve: "max"` for
+  unlimited) and shows every transaction in the dry run.
 - **Listed strikes.** Names (`NVDA-20261030-220-C`) carry the listed per-share strike; the id packs the per-token strike
   the market stores, `round(shareStrike x uiMultiplier / 1e18)` with the multiplier the expiry snapshotted (NVDA mainnet
   1.000775…: 220 is stored as 220.170535). The kit maps between the two with the expiry's `uiMultiplier`.
