@@ -3,8 +3,10 @@ import { identityRegistryAbi } from "./abi/identityRegistry.js";
 import { chains, getDeployment } from "./chains.js";
 import type { TxRequest } from "./calldata.js";
 
-/** ERC-8004 Identity Registry on Robinhood Chain mainnet. */
+/** ERC-8004 Identity Registry on Robinhood Chain mainnet (the reference deployment's mainnet vanity proxy). */
 export const IDENTITY_REGISTRY_4663: Address = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
+/** ERC-8004 Identity Registry on Robinhood Chain testnet (the reference deployment's testnet vanity proxy, same implementation). */
+export const IDENTITY_REGISTRY_46630: Address = "0x8004A818BFB912233c491871b3d84c89A494BD9e";
 
 export function identityRegistryFor(chainId: number): Address {
   const addr = getDeployment(chainId).identityRegistry;

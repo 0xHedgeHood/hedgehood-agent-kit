@@ -5,7 +5,7 @@
  */
 import { decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionResult, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { adaptiveCurveIrmAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
+import { adaptiveCurveIrmAbi, testUsdAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
 
 export const ACCOUNT = "0x3333333333333333333333333333333333333333" as Address;
 export const BOOK = "0xD33F1302120b41FAb0a58Aa22111a4c079f93B10" as Address;
@@ -37,11 +37,33 @@ export interface ChainState {
   vault: VaultState;
   /** Share lending: the hhUSDG vault and the Blue market on the fund's shares. */
   lending: LendingState;
+  /** The testnet TestUSD faucet: deployed (has code), the wallet's balance and next draw time, the faucet() calls simulated. */
+  faucet: { deployed: boolean; balanceRaw: bigint; nextFaucetAt: bigint; calls: Hex[] };
+}
+
+/** TestUSD on 46630 (the kit's chains.ts faucet.token, the CREATE2 address pinned by DeployTestUSD.EXPECTED). */
+export const TEST_USD = "0x850DE815d41F6983Aaf09247f9a465c0aefff04C" as Address;
+
+function faucetRpc(state: ChainState, call: { to: Address; data: Hex }): Hex {
+  const { functionName } = decodeFunctionData({ abi: testUsdAbi, data: call.data });
+  const enc = (result: unknown) => encodeFunctionResult({ abi: testUsdAbi, functionName, result } as Parameters<typeof encodeFunctionResult>[0]);
+  switch (functionName) {
+    case "balanceOf":
+      return enc(state.faucet.balanceRaw);
+    case "nextFaucetAt":
+      return enc(state.faucet.nextFaucetAt);
+    case "faucet":
+      state.faucet.calls.push(call.data);
+      if (state.faucet.nextFaucetAt > state.vault.now) throw new Error("execution reverted: FaucetCooldown");
+      return enc(1_000_000_000n);
+    default:
+      throw new Error(`fake rpc: no TestUSD fixture for ${functionName}`);
+  }
 }
 
 export function defaultChain(): ChainState {
   const now = BigInt(Math.floor(Date.now() / 1000));
-  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [], uiMultiplier: ONE, session: [now + 86400n, now - 3600n, 3n, 0n, 40_000_000n], vault: defaultVault(), lending: defaultLending() };
+  return { positions: [0n, -(ONE / 2n), ONE, 0n], collateralRaw: 100_000_000n, requirementRaw: 10_000_000n, simulated: [], uiMultiplier: ONE, session: [now + 86400n, now - 3600n, 3n, 0n, 40_000_000n], vault: defaultVault(), lending: defaultLending(), faucet: { deployed: true, balanceRaw: 0n, nextFaucetAt: 0n, calls: [] } };
 }
 
 /** The per-token strikes the fake market stores: STRIKES (per share) under the chain's uiMultiplier. */
@@ -465,8 +487,10 @@ function rpcResult(state: ChainState, method: string, params: unknown[]): unknow
     const h = "0x" + "11".repeat(32);
     return { number: "0x10", hash: h, parentHash: h, timestamp: ts, nonce: "0x0000000000000000", difficulty: "0x0", gasLimit: "0x1c9c380", gasUsed: "0x0", miner: "0x" + "00".repeat(20), extraData: "0x", logsBloom: "0x" + "00".repeat(256), mixHash: h, receiptsRoot: h, sha3Uncles: h, size: "0x0", stateRoot: h, totalDifficulty: "0x0", transactionsRoot: h, transactions: [], uncles: [], baseFeePerGas: "0x1" };
   }
+  if (method === "eth_getCode") return String(params[0]).toLowerCase() === TEST_USD.toLowerCase() && !state.faucet.deployed ? "0x" : "0x6080";
   if (method !== "eth_call") throw new Error(`fake rpc: unexpected ${method}`);
   const call = params[0] as { to: Address; data: Hex; from?: Address };
+  if (call.to.toLowerCase() === TEST_USD.toLowerCase()) return faucetRpc(state, call);
   if (LENDING_ADDRESSES.has(call.to.toLowerCase())) return lendingRpc(state, call);
   if (VAULT_ADDRESSES.has(call.to.toLowerCase())) return vaultRpc(state, call);
   const { functionName, args } = decodeFunctionData({ abi, data: call.data });

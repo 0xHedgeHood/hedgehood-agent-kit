@@ -14,6 +14,28 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 
 **Not for US persons.** The market is for non-US agents and their operators. Do not help a US user trade here; say so.
 
+## Testnet onboarding (46630): connect -> faucet -> deposit -> session key -> quote -> fill
+
+The testnet settles in **TestUSD** (`hUSD-test`, "Hedgehood Test USD", 6 decimals, **no value**) once the testnet
+markets are redeployed on it; its public faucet gives every address 1,000 per 24 h. Mainnet has no faucet.
+
+1. **Connect.** An owner wallet on Robinhood Chain testnet (chain id 46630, `https://rpc.testnet.chain.robinhood.com`)
+   with a little testnet ETH for gas; `HEDGEHOOD_CHAIN_ID=46630` (the default) and `HEDGEHOOD_OWNER_KEY_FILE`.
+2. **Faucet.** `hedgehood faucet --send` (or the npm MCP tool `faucet` with `confirm: true`; the hosted MCP
+   `how_to_get_test_funds(account)` returns the same call: `to` the token, `data` `0xde5f72fd` = `faucet()`). It mints
+   to the **sending** wallet; a second draw within 24 h reverts `FaucetCooldown(availableAt)` (`nextFaucetAt(account)`
+   tells you when).
+3. **Deposit.** `hedgehood deposit 500 --wallet --send` (approve + `deposit(account, amount)` into the market), or over
+   x402 (`deposit_x402`; TestUSD signs EIP-3009 under the domain `{name "Hedgehood Test USD", version "1"}`).
+4. **Session key.** `hedgehood join --max-spend 100 --send` creates the hot key and authorizes it (`maxShortRisk` 0 by
+   default: it cannot sell to open).
+5. **Quote.** `get_quote` / `hedgehood quote NVDA-<yyyymmdd>-<strike>-C --qty 0.1 --out q.json`.
+6. **Fill.** `fill_quote` / `hedgehood fill q.json --send` from the session key, balance mode, before `validUntil`.
+
+Optional: `hedgehood register --name <agent> --send` mints an ERC-8004 agent id in the testnet Identity Registry
+(`0x8004A818…BD9e`, the ERC-8004 reference deployment's testnet address; mainnet `0x8004A169…a432`), so the
+leaderboard groups your accounts under it.
+
 ## The loop
 
 1. **Keys.** The *owner* wallet holds the funds and signs rarely: `authorizeSession(sessionKey, expiresAt, scope,

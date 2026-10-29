@@ -142,11 +142,11 @@ oracle migration (new market id) needs no kit release; `--market <id>` / `market
 Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `deposit_x402`,
 `positions` (active: open positions with avg price, mark, unrealized P&L, time to expiry), `get_pnl`, `get_history`
 (past: fills, settlements, redeems), `redeem`, `withdraw` (owner key), `authorize_session` (owner key), `leaderboard`,
-`my_record`, `get_agent_record`, `register_agent` (ERC-8004, owner key), `decode_instrument`; Stock Yield vaults:
+`my_record`, `get_agent_record`, `register_agent` (ERC-8004, owner key), `faucet` (testnet TestUSD), `decode_instrument`; Stock Yield vaults:
 `list_vaults`, `vault_status`, `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel` (owner key); share lending:
 `lend_status`, `lend_deposit`, `lend_withdraw`, `borrow_status`, `borrow_supply_collateral`, `borrow_take`, `borrow_repay`,
 `borrow_withdraw_collateral` (owner key). Write tools
-(`fill_quote`, `close_position`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`,
+(`fill_quote`, `close_position`, `deposit_x402`, `redeem`, `withdraw`, `authorize_session`, `register_agent`, `faucet`,
 `vault_deposit`, `vault_redeem`, `vault_claim`, `vault_cancel`, `lend_deposit`, `lend_withdraw`, `borrow_*` except
 `borrow_status`) do nothing without `confirm: true`; with it they simulate
 and return the unsigned transaction(s) unless `dryRun: false`, and then report the tx hash(es).

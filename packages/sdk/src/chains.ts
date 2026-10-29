@@ -57,6 +57,8 @@ export interface ChainDeployment {
   usdgEip712: { name: string; version: string };
   /** ERC-8004 Identity Registry, when deployed on this chain. */
   identityRegistry?: Address;
+  /** Testnet only: the public test-token faucet (TestUSD `faucet()`), when deployed. */
+  faucet?: FaucetDeployment;
   /** Hedgehood agent-market backend hosts (the same hosts serve both chains; the chain id selects the deployment). */
   api: BackendHosts;
   markets: MarketDeployment[];
@@ -64,6 +66,22 @@ export interface ChainDeployment {
   vaults?: VaultDeployment;
   /** Share lending (a Morpho Blue market on fund shares + the USDG lending vault) on this chain, when deployed. */
   lending?: LendingDeployment;
+}
+
+/**
+ * TestUSD ("Hedgehood Test USD", hUSD-test): the testnet settlement token with NO value. `faucet()` mints `amountRaw`
+ * to the caller once per `cooldownS` per address; `nextFaucetAt(account)` is 0 or the time of the next draw; the owner
+ * mints the desk's collateral. EIP-2612 permit and EIP-3009 transferWithAuthorization under the EIP-712 domain
+ * {name "Hedgehood Test USD", version "1"}. Source: hedgehood-options contracts/src/mocks/TestUSD.sol, deployed with
+ * CREATE2 (contracts/script/testnet/DeployTestUSD.s.sol), so the address is fixed before the broadcast.
+ */
+export interface FaucetDeployment {
+  token: Address;
+  symbol: string;
+  amountRaw: bigint;
+  cooldownS: number;
+  eip712: { name: string; version: string };
+  note?: string;
 }
 
 /** One Morpho Blue market; its id is `keccak256(abi.encode(loanToken, collateralToken, oracle, irm, lltv))`. */
@@ -166,7 +184,18 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
     // tUSDG is a test token; assumed to expose the same EIP-3009 surface and domain name as mainnet USDG. If the
     // gateway's 402 names another domain in `extra`, the payer signs on that one (see x402.ts).
     usdgEip712: { name: "Global Dollar", version: "1" },
-    identityRegistry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432", // in the backend's testnet registry; not verified to exist on 46630
+    // ERC-8004 reference deployment, testnet address (erc-8004/erc-8004-contracts TESTNET_ADDRESSES): live on 46630, proxy ->
+    // IdentityRegistryUpgradeable 0x7274…9c02 (getVersion 2.0.0, owner 0x5472…2603), read 2026-10-28. The mainnet address
+    // 0x8004A169… is the reference's MAINNET vanity proxy and has no code on 46630.
+    identityRegistry: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    faucet: {
+      token: "0x850DE815d41F6983Aaf09247f9a465c0aefff04C",
+      symbol: "hUSD-test",
+      amountRaw: 1_000_000_000n,
+      cooldownS: 86_400,
+      eip712: { name: "Hedgehood Test USD", version: "1" },
+      note: "TestUSD, CREATE2 address pinned by hedgehood-options DeployTestUSD.EXPECTED; the settlement token of the testnet markets once they are redeployed on it (until then they settle in tUSDG)",
+    },
     api: HEDGEHOOD_API,
     markets: [
       {

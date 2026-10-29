@@ -21,6 +21,8 @@ import {
   UNIT_MULTIPLIER,
   UNLIMITED,
   encodeRegisterAgent,
+  drawFaucet,
+  getFaucet,
   formatShares,
   formatSignedUsdg,
   formatStrike,
@@ -602,8 +604,39 @@ export function buildProgram(): Command {
     });
 
   program
+    .command("faucet")
+    .description("TESTNET: draw test USD (TestUSD hUSD-test, no value) from its public faucet into your wallet: faucet() mints 1,000 to the sender once per 24 h. Mainnet refuses")
+    .option("--send", "broadcast instead of dry run")
+    .action(async (opts: { send?: boolean }, cmd: Command) => {
+      const ctx = ctxFrom(cmd);
+      const f = getFaucet(ctx.chainId);
+      const signer = ctx.owner ?? requireSession(ctx);
+      const d = await drawFaucet(ctx.chainId, signer, { rpcUrl: ctx.config.rpcUrl, dryRun: !opts.send });
+      const s = d.before;
+      const lines = [
+        `${f.symbol} ${f.token} (testnet, no value)  wallet ${signer.address}${ctx.owner ? " (owner key)" : " (session key: deposit(account, amount) is permissionless, so it can still fund the account)"}`,
+        `balance ${formatUsdg(s.balanceRaw)} ${f.symbol}; next draw ${s.nextFaucetAt === 0n ? "now (never drew)" : new Date(Number(s.nextFaucetAt) * 1000).toISOString()}`,
+      ];
+      const settles = ctx.marketDeployment?.settlementToken;
+      if (settles && settles.toLowerCase() !== f.token.toLowerCase()) lines.push(`note: the ${ctx.marketDeployment!.underlying} market in this kit settles in ${settles}, not ${f.symbol}; update the kit once the testnet markets move to ${f.symbol}`);
+      if (d.refused) {
+        out(cmd, { ...s, refused: d.refused }, [...lines, `refused: ${d.refused}`].join("\n"));
+        process.exitCode = 1;
+        return;
+      }
+      if (d.send?.dryRun) {
+        out(cmd, { dryRun: true, from: d.send.from, to: d.request.to, data: d.request.data, summary: d.request.summary },
+          [...lines, `DRY RUN (simulation passed): ${d.request.summary}`, `  to ${d.request.to} data ${d.request.data}`, "  add --send to broadcast", "then: hedgehood deposit <amount> --wallet --send"].join("\n"));
+        return;
+      }
+      out(cmd, { txHash: d.send?.hash, status: d.status, balanceRaw: d.after?.balanceRaw, nextFaucetAt: d.after?.nextFaucetAt },
+        [...lines, `${d.status === "success" ? "OK" : "REVERTED"} ${d.request.summary}`, `  tx ${d.send?.hash}`, `  balance now ${formatUsdg(d.after?.balanceRaw ?? 0n)} ${f.symbol}; then: hedgehood deposit <amount> --wallet --send`].join("\n"));
+      if (d.status !== "success") process.exitCode = 1;
+    });
+
+  program
     .command("register")
-    .description("Register an ERC-8004 agent id (mainnet only; optional)")
+    .description("Register an ERC-8004 agent id in the chain's Identity Registry (optional; the market does not require it)")
     .requiredOption("--name <name>")
     .option("--description <text>")
     .option("--uri <url>", "hosted registration file; default inline data: URI")

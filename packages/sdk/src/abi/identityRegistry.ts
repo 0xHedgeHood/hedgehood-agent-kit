@@ -1,8 +1,9 @@
 /**
  * ERC-8004 Identity Registry, minimal surface (ERC-721 agent ids with a URI). Taken from the ERC-8004 draft
- * reference interface (`register(string agentURI)` returns the new agentId and emits `Registered`). The deployed
- * registry on Robinhood Chain (0x8004A169FB4a3325136EB29fA0ceB6D2e539a432) was not introspected while writing
- * this kit: verify the selector set against the explorer before relying on anything beyond `register(string)`.
+ * reference interface (`register(string agentURI)` returns the new agentId and emits `Registered`). Checked
+ * 2026-10-28 against erc-8004/erc-8004-contracts b9e466c IdentityRegistryUpgradeable.sol (getVersion 2.0.0): the
+ * proxies on Robinhood Chain mainnet (0x8004A169…a432) and testnet (0x8004A818…BD9e) both point at implementation
+ * 0x7274…9c02, and register / tokenURI / ownerOf / Registered round-tripped on an anvil fork of 46630.
  */
 export const identityRegistryAbi = [
   { type: "function", name: "register", stateMutability: "nonpayable", inputs: [{ name: "agentURI", type: "string" }], outputs: [{ name: "agentId", type: "uint256" }] },

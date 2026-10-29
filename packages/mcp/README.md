@@ -18,7 +18,7 @@ npx -y @hedgehood-io/mcp --check    # resolved config, keys shown as set/missing
 
 Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `deposit_x402`,
 `positions` (active, with avg price / mark / unrealized P&L / time to expiry), `get_pnl`, `get_history` (past), `redeem`,
-`withdraw`*, `authorize_session`*, `leaderboard`, `my_record`, `get_agent_record`, `register_agent`*, `decode_instrument`;
+`withdraw`*, `authorize_session`*, `leaderboard`, `my_record`, `get_agent_record`, `register_agent`*, `faucet`* (testnet TestUSD), `decode_instrument`;
 Stock Yield vaults: `list_vaults`, `vault_status`, `vault_deposit`*, `vault_redeem`*, `vault_claim`*, `vault_cancel`*
 share lending: `lend_status`, `lend_deposit`*, `lend_withdraw`*, `borrow_status`, `borrow_supply_collateral`*, `borrow_take`*,
 `borrow_repay`*, `borrow_withdraw_collateral`* (* owner key). `authorize_session` takes a required `maxSpend` (cumulative

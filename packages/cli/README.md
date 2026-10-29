@@ -19,7 +19,8 @@ hedgehood withdraw 50 [--to 0x..] [--send]   # owner key
 hedgehood session authorize --max-spend 100 [--max-short-risk 0|<usdg>|unlimited] [--send]   # owner key; --max-spend required
 hedgehood session status                     # expiry, authorizedAt, riskLeft, spendLeft
 hedgehood session revoke <key> [--send]
-hedgehood register --name "my-agent"         # ERC-8004, mainnet, owner key
+hedgehood register --name "my-agent"         # ERC-8004 (the chain's registry), owner key
+hedgehood faucet --send                      # testnet: 1,000 hUSD-test (no value) per 24 h to the sending wallet
 
 # Stock Yield vaults (owner key; requests queue until the next epoch freeze, a redeem can take up to a week)
 hedgehood --mainnet vaults                                   # NAV/share, epoch state, next freeze, cap, last week's yield

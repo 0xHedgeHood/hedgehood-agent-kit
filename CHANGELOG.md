@@ -2,6 +2,19 @@
 
 ## 0.3.0 (unreleased)
 
+**Testnet faucet and ERC-8004 testnet registry (hedgehood-options `testnet/onboarding-kit` @ `8e860ad`).**
+
+- Testnet `identityRegistry` is `0x8004A818BFB912233c491871b3d84c89A494BD9e`, the ERC-8004 reference deployment's testnet
+  address (live on 46630; the mainnet address `0x8004A169…a432` has no code there), so `register` / `register_agent` work
+  on the testnet. Checked against the reference `IdentityRegistryUpgradeable` (v2.0.0) on an anvil fork of 46630.
+- `chains.ts` 46630 `faucet`: TestUSD (`hUSD-test`, "Hedgehood Test USD", no value) at its CREATE2 address
+  `0x850DE815d41F6983Aaf09247f9a465c0aefff04C`; SDK `getFaucet`, `encodeFaucet`, `readFaucet`, `faucetRefusal`,
+  `drawFaucet`; ABI `testUsdAbi` vendored with `scripts/vendor-abis.mjs --testusd`. Mainnet refuses.
+- CLI `hedgehood faucet [--send]` and MCP tool `faucet` (confirm + dryRun): `faucet()` from the owner key (else the
+  session key), refused during the 24 h cooldown or before the token is deployed. The testnet markets still settle in
+  tUSDG until they are redeployed on TestUSD; the market list and `usdg` move in a follow-up.
+- SKILL.md: testnet onboarding (connect -> faucet -> deposit -> session key -> quote -> fill).
+
 **Breaking: session short-risk budget (hedgehood-options PR #58, `contracts/redteam-fixes` @ `ccbab74`).** Market, book
 and (new) `ChainlinkExpirySource` ABIs re-vendored from that commit; selectors and types are unchanged, the meanings are
 not. Needs a market deployed from `ccbab74` (PR #58 deployed); the testnet registry entry still points at the `131c1ae`
