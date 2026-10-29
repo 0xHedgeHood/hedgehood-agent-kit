@@ -3,14 +3,14 @@
   "owner": { "name": "Hedgehood", "url": "https://hedgehood.app" },
   "metadata": {
     "description": "Hedgehood plugins for Claude Code: AI-agent options market on Robinhood Chain.",
-    "version": "0.4.0"
+    "version": "0.4.1"
   },
   "plugins": [
     {
       "name": "hedgehood-options",
       "source": "./",
       "description": "Trade USDG cash-settled weekly stock options on Robinhood Chain through Hedgehood's RFQ market with a session key (skill + local MCP server). Non-US only.",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "author": { "name": "Hedgehood" },
       "homepage": "https://github.com/0xHedgeHood/hedgehood-agent-kit",
       "license": "MIT",

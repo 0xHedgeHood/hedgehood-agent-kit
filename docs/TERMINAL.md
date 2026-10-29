@@ -1,13 +1,13 @@
 # User portfolio in a terminal or Claude Code
 
 `hedgehood dashboard` and the local MCP tool `get_dashboard` use the same ASCII renderer: account-wide P&L,
-active option positions, and signed bars comparing unrealized P&L by position. The next release adds a summary card
+active option positions, and signed bars comparing unrealized P&L by position. Version 0.4.1 adds a summary card
 and realized P&L bars for closed / settled positions, so a flat account still shows its results. No terminal colour support is needed.
 Claude Code can show the returned display in a fenced `text` block. This is the user's on-chain portfolio; it does
 not include the market maker's brokerage account.
 
-These commands require version 0.4.0 or later. Until 0.4.0 is published to npm, build this checkout to try them;
-older npm releases do not include `dashboard` or `get_dashboard`. No release or deployment is required to test the local build.
+The basic dashboard requires version 0.4.0 or later; portfolio cards and closed-position charts require 0.4.1.
+Run `npx -y @hedgehood-io/cli@0.4.1 --testnet --account <address> dashboard`, or build this checkout as below.
 
 ## Terminal
 
@@ -26,8 +26,7 @@ node packages/cli/dist/bin.js --testnet dashboard --json
 ```
 
 Replace the placeholder with the owner's public address. `dashboard` deliberately ignores trading-key settings;
-it only reads `/v1/pnl`. The other commands keep their existing account/key configuration behaviour. Once released,
-the installed executable is `hedgehood`. `list` is an alias for `markets`, which lists expiries and strikes for the
+it only reads `/v1/pnl`. The other commands keep their existing account/key configuration behaviour. The installed executable is `hedgehood`. `list` is an alias for `markets`, which lists expiries and strikes for the
 selected underlying (`--underlying NVDA`); the dashboard covers all markets in the account's indexer response.
 
 `--json` returns structured values with their original precision and takes precedence over ASCII formatting.
@@ -70,7 +69,7 @@ TypeScript MCP server; the separately deployed Python hosted MCP has not been ch
 - Totals come from the indexer. Fees are shown separately and are not subtracted again by the renderer.
 - A missing open-position mark produces `N/A` and an incomplete total, even if an older backend supplies a partial
   numeric total. Raw JSON remains the original backend response; inspect its nulls and note before using totals.
-- Closed and settled rows are excluded from the active table. In the next release they also have their own realized
+- Closed and settled rows are excluded from the active table. In 0.4.1 they also have their own realized
   P&L chart; older indexers without per-position realized values show `N/A`. These are instrument totals, not individual trades.
 - Bars compare current unrealized P&L, with one common scale and signs around zero. They are **not an equity curve**,
   a return percentage, or today's profit. Historical performance needs historical valuation snapshots.
