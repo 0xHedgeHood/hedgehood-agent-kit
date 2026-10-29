@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (unreleased)
+
+**Upgrade note:** owner-key fills and closes now default to wallet mode, which may approve the market to pull
+premium, fees and collateral from the wallet. Use `--from-balance` (CLI) or `fromBalance: true` (MCP) to retain
+balance mode. Session keys remain balance-only, and transactions remain dry-run unless explicitly enabled.
 
 **One wallet, all markets (no contract change).** Each `CashOptionMarketV2` (one per underlying) keeps its own
 balance, positions and session grant; the kit now reads and trades them like one account.

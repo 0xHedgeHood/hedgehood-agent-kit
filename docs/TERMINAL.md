@@ -5,8 +5,8 @@ active option positions, and signed bars comparing unrealized P&L by position. N
 Claude Code can show the returned display in a fenced `text` block. This is the user's on-chain portfolio; it does
 not include the market maker's brokerage account.
 
-These additions are unreleased. Build this checkout to try them; installing the current npm release does not add
-`dashboard` or `get_dashboard`. No release or deployment is required to test the local build.
+These commands require version 0.4.0 or later. Until 0.4.0 is published to npm, build this checkout to try them;
+older npm releases do not include `dashboard` or `get_dashboard`. No release or deployment is required to test the local build.
 
 ## Terminal
 

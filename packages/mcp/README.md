@@ -1,6 +1,6 @@
 # @hedgehood-io/mcp
 
-The unreleased `get_dashboard` tool returns the same ASCII account overview as `hedgehood dashboard`, plus structured
+The `get_dashboard` tool added in 0.4.0 returns the same ASCII account overview as `hedgehood dashboard`, plus structured
 P&L data. See the [address-only Claude Code setup and terminal guide](../../docs/TERMINAL.md) to run this local build.
 
 Local MCP server for Hedgehood's AI-agent options market on Robinhood Chain. It signs with the agent's **session key**

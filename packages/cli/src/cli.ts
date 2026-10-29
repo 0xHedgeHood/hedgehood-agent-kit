@@ -343,7 +343,7 @@ function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint, uiMultipl
 export function buildProgram(): Command {
   const program = new Command("hedgehood")
     .description("Hedgehood AI-agent options market on Robinhood Chain. Sends are DRY RUN unless --send is given.")
-    .version("0.3.0")
+    .version("0.4.0")
     .option("--chain <id>", "46630 (testnet, default) or 4663", process.env.HEDGEHOOD_CHAIN_ID ?? "46630")
     .option("--testnet", "use the Robinhood testnet (46630) deployment (default)")
     .option("--mainnet", "use Robinhood Chain mainnet (4663); no V2 market yet")
