@@ -163,7 +163,9 @@ export interface GatewayInstructions {
   summary: string;
   endpoint: string;
   method: "POST";
-  asset: { symbol: string; address: Address; decimals: number; network: string; chainId: number };
+  asset: { symbol: string; address: Address; decimals: number; network: string; chainId: number; eip712?: { name: string; version: string } };
+  /** Testnet only (TestUSD): the public faucet call; null elsewhere. */
+  faucet?: { token: Address; function: string; selector: Hex; data: Hex; amountRaw: string; cooldownS: string; note?: string } | null;
   payTo: Address;
   fee: { raw: string };
   limits: { minRaw: string; maxRaw: string; dayCapRaw: string; ratePerS: number; burst: number; feeRaw: string };

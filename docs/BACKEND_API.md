@@ -94,13 +94,16 @@ includes the account's leaderboard row and `agentId`) plus recent fills, and `ge
 
 ## Gateway (x402 deposits)
 
-`GET /v1/instructions` → `{ summary, endpoint, method, body, flow[], asset { symbol, address, decimals, network, chainId },
-payTo, fee { raw }, limits { minRaw, maxRaw, dayCapRaw, ratePerS, burst, feeRaw }, markets[], after[], depositCalldata,
-notice }`.
+`GET /v1/instructions` → `{ summary, endpoint, method, body, flow[], asset { symbol, address, decimals, network, chainId,
+eip712 { name, version } }, faucet, payTo, fee { raw }, limits { minRaw, maxRaw, dayCapRaw, ratePerS, burst, feeRaw },
+markets[], after[], depositCalldata, notice }`. `faucet` is null except on a testnet whose settlement token is TestUSD:
+`{ token, function "faucet()", selector, data, amountRaw, cooldownS, nextAt, sender, cli, note }` (hosted MCP:
+`how_to_get_test_funds`).
 
 `POST /v1/deposit { account, amountRaw | amount, underlying | market }`: without a payment → 402, header
 `PAYMENT-REQUIRED` = body = x402 v2 `PaymentRequired` with one `exact` requirement `{ scheme, network, asset, amount =
-amountRaw + fee, payTo = the float wallet, maxTimeoutSeconds 600, extra { name "Global Dollar", version "1" },
+amountRaw + fee, payTo = the float wallet, maxTimeoutSeconds 600, extra = the token's EIP-712 domain (USDG: { name "Global Dollar", version "1" }; TestUSD: { name
+"Hedgehood Test USD", version "1" }),
 description }`; with `PAYMENT-SIGNATURE` → facilitator verify + settle, then `market.deposit(account, amountRaw)` from
 the float → 200 `{ id, status: prepared|sent|confirmed|queued|failed, account, market, underlying, amountRaw, feeRaw,
 tx, txHash, error, payment { payer, transaction, network }, send, note }` + header `PAYMENT-RESPONSE`. 409 `replay`
@@ -112,16 +115,12 @@ the USDG was collected, the deposit transaction is only prepared.
 published `payTo`, for exactly `amountRaw + fee.raw`, under the payer's cap; and `amountRaw` is within `limits`. The
 signed EIP-3009 window is capped at 600 s.
 
-### Known mismatch on the testnet stack (backend fix needed)
+### Testnet
 
-`gateway/x402.py` hard-codes `NETWORK = 'eip155:4663'` and `gateway/app.py` calls `x402.requirement(total, pay_to, ...)`
-without `asset=` / `network=`, so on the 46630 deployment `/v1/instructions` answers `asset.address` = tUSDG but
-`asset.network: "eip155:4663", chainId: 4663`, and the 402 would carry mainnet USDG `0x5fc5…d168` on `eip155:4663`
-(observed live 2026-10-28). An EIP-3009 signature on that domain could never settle on testnet, so the kit refuses with
-`the gateway's network eip155:4663 is not eip155:46630; nothing was signed`. Fix on the backend: pass
-`asset=reg['usdg'], network=f"eip155:{reg['chainId']}"` to `x402.requirement` and the instructions. Until then
-`deposit_x402` / `hedgehood deposit --x402` cannot run on testnet; `hedgehood deposit --wallet` (approve + deposit from
-the owner key) works.
+The gateway names the registry's token and network (`eip155:46630` on the testnet; fixed on the backend since the
+2026-10-28 observation of `eip155:4663` there). tUSDG has no EIP-3009, so `deposit_x402` only becomes possible on the
+testnet once the markets settle in TestUSD and a facilitator serves `eip155:46630`; `hedgehood deposit --wallet`
+(approve + deposit from the owner key) works either way.
 
 ## Hosted MCP
 

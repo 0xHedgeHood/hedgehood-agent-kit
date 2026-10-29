@@ -7,14 +7,14 @@ import { encodeInstrumentId, marketV2Abi, orderBookV2Abi, orderToJson, Side, sig
 import { createContext } from "../src/context.js";
 import { createServer } from "../src/server.js";
 import { loadConfig, normalizeKey } from "../src/config.js";
-import { CALL220, NAME210P, NAME220C, NVDA_M, ONE, defaultChain, fakeWorld, withGlobalFetch } from "./fakes.js";
+import { CALL220, NAME210P, NAME220C, NVDA_M, ONE, TEST_USD, defaultChain, fakeWorld, withGlobalFetch } from "./fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const OWNER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 const ACCOUNT = "0x3333333333333333333333333333333333333333" as const;
-const BOOK = "0xD33F1302120b41FAb0a58Aa22111a4c079f93B10";
-const MARKET = "0x068639ad7914156Cbcf1adfB30e6Ccb32Db2226F";
+const BOOK = "0xCEa2be1ecC16D347bE1A4fEA589e21de0Ad7E6C3";
+const MARKET = "0x4c475Dd1fd756a086d053510A25dc046231A3D38";
 const EXPIRY = 1793390400n;
 const INSTRUMENT = encodeInstrumentId(EXPIRY, 220_000_000n, false);
 
@@ -54,8 +54,8 @@ describe("mcp server", () => {
     const { client } = await connect();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["authorize_session", "borrow_repay", "borrow_status", "borrow_supply_collateral", "borrow_take", "borrow_withdraw_collateral", "close_position", "decode_instrument", "deposit_x402", "fill_quote", "get_agent_record", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "lend_deposit", "lend_status", "lend_withdraw", "list_instruments", "list_markets", "list_vaults", "my_record", "positions", "redeem", "register_agent", "vault_cancel", "vault_claim", "vault_deposit", "vault_redeem", "vault_status", "withdraw"]);
-    for (const w of ["fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent", "vault_deposit", "vault_redeem", "vault_claim", "vault_cancel", "lend_deposit", "lend_withdraw", "borrow_supply_collateral", "borrow_take", "borrow_repay", "borrow_withdraw_collateral"]) {
+    expect(names).toEqual(["authorize_session", "borrow_repay", "borrow_status", "borrow_supply_collateral", "borrow_take", "borrow_withdraw_collateral", "close_position", "decode_instrument", "deposit_x402", "faucet", "fill_quote", "get_agent_record", "get_history", "get_mark", "get_pnl", "get_quote", "leaderboard", "lend_deposit", "lend_status", "lend_withdraw", "list_instruments", "list_markets", "list_vaults", "my_record", "positions", "redeem", "register_agent", "vault_cancel", "vault_claim", "vault_deposit", "vault_redeem", "vault_status", "withdraw"]);
+    for (const w of ["faucet", "fill_quote", "close_position", "deposit_x402", "redeem", "withdraw", "authorize_session", "register_agent", "vault_deposit", "vault_redeem", "vault_claim", "vault_cancel", "lend_deposit", "lend_withdraw", "borrow_supply_collateral", "borrow_take", "borrow_repay", "borrow_withdraw_collateral"]) {
       const t = tools.find((x) => x.name === w)!;
       const props = (t.inputSchema as { properties: Record<string, unknown> }).properties;
       expect(props.confirm, w).toBeDefined();
@@ -334,5 +334,30 @@ describe("mcp server", () => {
     expect(r.needsConfirm).toBe(true);
     expect(world.backend.filter((x) => x.url.pathname === "/v1/rfq").length).toBe(2);
     void ONE;
+  });
+});
+
+describe("faucet tool (testnet TestUSD)", () => {
+  it("explains without confirm, simulates with confirm, refuses in cooldown and on mainnet", async () => {
+    const world = fakeWorld();
+    const { client } = await connect(world.fetch);
+    const call = (args: Record<string, unknown>) => withGlobalFetch(world.fetch, () => client.callTool({ name: "faucet", arguments: args }));
+    const explain = JSON.parse(text(await call({})));
+    expect(explain).toMatchObject({ ok: false, needsConfirm: true, to: TEST_USD, data: "0xde5f72fd", token: TEST_USD, symbol: "hUSD-test", canDrawNow: true, nextFaucetAt: "0" });
+    expect(world.chain.faucet.calls).toHaveLength(0);
+    const sim = JSON.parse(text(await call({ confirm: true })));
+    expect(sim).toMatchObject({ ok: true, dryRun: true, simulated: true, to: TEST_USD, data: "0xde5f72fd" });
+    expect(world.chain.faucet.calls).toEqual(["0xde5f72fd"]);
+    world.chain.faucet.nextFaucetAt = world.chain.vault.now + 3600n;
+    const cool = JSON.parse(text(await call({ confirm: true })));
+    expect(cool.ok).toBe(false);
+    expect(cool.refused).toMatch(/cooldown/);
+    expect(world.chain.faucet.calls).toHaveLength(1);
+    world.chain.faucet.deployed = false;
+    expect(JSON.parse(text(await call({ confirm: true }))).refused).toMatch(/not deployed/);
+    const { client: main } = await connect(world.fetch, { HEDGEHOOD_CHAIN_ID: "4663" });
+    const r = await withGlobalFetch(world.fetch, () => main.callTool({ name: "faucet", arguments: { confirm: true } }));
+    expect(r.isError).toBe(true);
+    expect(text(r)).toMatch(/no faucet on Robinhood Chain mainnet/);
   });
 });

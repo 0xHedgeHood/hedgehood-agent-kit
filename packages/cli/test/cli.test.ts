@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { decodeFunctionData, type Hex } from "viem";
 import { marketV2Abi, UNLIMITED } from "@hedgehood-io/sdk";
 import { buildProgram, parseCap, parseSince } from "../src/cli.js";
-import { ACCOUNT, NAME210P, NAME220C, NVDA_M, defaultChain, fakeWorld, withGlobalFetch } from "../../mcp/test/fakes.js";
+import { ACCOUNT, NAME210P, NAME220C, NVDA_M, TEST_USD, defaultChain, fakeWorld, withGlobalFetch } from "../../mcp/test/fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const GLOBALS = ["--account", ACCOUNT, "--rfq-url", "https://rfq.test", "--indexer-url", "https://index.test"];
@@ -51,7 +51,7 @@ describe("hedgehood cli", () => {
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();
-    expect(names).toEqual(["borrow", "close", "decode", "deposit", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
+    expect(names).toEqual(["borrow", "close", "decode", "deposit", "faucet", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
     const lend = p.commands.find((c) => c.name() === "lend")!;
     expect(lend.commands.map((c) => c.name()).sort()).toEqual(["deposit", "status", "withdraw"]);
     const borrow = p.commands.find((c) => c.name() === "borrow")!;
@@ -241,5 +241,23 @@ describe("hedgehood cli", () => {
     expect(d.text).toMatch(/2026-10-30 220 C .*strike 220 \(per token 220\.170535, uiMultiplier 1\.000775159164630595\)/);
     const offline = await run(["decode", id.toString(), "--multiplier", NVDA_M.toString()]);
     expect(offline.text).toMatch(/strike 220 /);
+  });
+});
+
+describe("hedgehood faucet (testnet)", () => {
+  it("dry runs faucet() from the owner wallet and refuses during the cooldown", async () => {
+    const { text, world } = await runAsOwner(["--json", "faucet"]);
+    expect(json(text)).toMatchObject({ dryRun: true, to: TEST_USD, data: "0xde5f72fd" });
+    expect(world.chain.faucet.calls).toEqual(["0xde5f72fd"]);
+    const cool = fakeWorld();
+    cool.chain.faucet.nextFaucetAt = cool.chain.vault.now + 60n;
+    const r = await runAsOwner(["--json", "faucet", "--send"], cool);
+    expect(String(json(r.text).refused)).toMatch(/cooldown/);
+    expect(cool.chain.faucet.calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("is refused on mainnet", async () => {
+    await expect(runAsOwner(["--mainnet", "faucet"])).rejects.toThrow(/no faucet on Robinhood Chain mainnet/);
   });
 });

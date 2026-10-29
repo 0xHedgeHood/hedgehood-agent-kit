@@ -4,6 +4,7 @@
 //
 //   node scripts/vendor-abis.mjs <hedgehood-options/contracts/out> [git commit]            # CashOptionMarketV2, book, settlement source
 //   node scripts/vendor-abis.mjs --vaults <hedgehood-vaults/contracts/out> [git commit]    # EpochFund, VaultRegistry, gates
+//   node scripts/vendor-abis.mjs --testusd <hedgehood-options/contracts/out> [git commit]  # TestUSD, the testnet settlement token
 //   node scripts/vendor-abis.mjs --lending <hedgehood-vaults root> [git commit]            # Share lending: Morpho Blue,
 //        AdaptiveCurveIrm, ShareRiskOracle, Morpho Vault V2 + its Blue adapter. Blue and the IRM come from the committed
 //        creation artifacts (contracts/script/artifacts), the oracle from `forge build` (contracts/out), Vault V2 from the
@@ -12,10 +13,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const argv = process.argv.slice(2);
-const mode = argv[0] === "--vaults" ? "vaults" : argv[0] === "--lending" ? "lending" : "market";
+const mode = argv[0] === "--vaults" ? "vaults" : argv[0] === "--lending" ? "lending" : argv[0] === "--testusd" ? "testusd" : "market";
 const [outDir, commit = "unknown"] = mode === "market" ? argv : argv.slice(1);
 if (!outDir) {
-  console.error("usage: vendor-abis.mjs [--vaults|--lending] <forge out dir | repo root> [commit]");
+  console.error("usage: vendor-abis.mjs [--vaults|--lending|--testusd] <forge out dir | repo root> [commit]");
   process.exit(1);
 }
 const vaultV2Out = process.env.VAULT_V2_OUT ?? join(outDir, "local/share-collateral-a/vendor/vault-v2/out");
@@ -28,6 +29,10 @@ const sets = {
       ["CashOptionOrderBookV2.sol/CashOptionOrderBookV2.json", "orderBookV2Abi", "cashOptionOrderBookV2.ts", "CashOptionOrderBookV2.sol"],
       ["ChainlinkExpirySource.sol/ChainlinkExpirySource.json", "chainlinkExpirySourceAbi", "chainlinkExpirySource.ts", "ChainlinkExpirySource.sol"],
     ],
+  },
+  testusd: {
+    repo: "0xHedgeHood/hedgehood-options",
+    targets: [["TestUSD.sol/TestUSD.json", "testUsdAbi", "testUsd.ts", "src/mocks/TestUSD.sol"]],
   },
   vaults: {
     repo: "0xHedgeHood/hedgehood-vaults",

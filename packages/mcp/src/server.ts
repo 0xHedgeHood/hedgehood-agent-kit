@@ -8,6 +8,12 @@ import {
   describeSessionCharge,
   encodeInstrumentId,
   encodeRegisterAgent,
+  drawFaucet,
+  encodeFaucet,
+  faucetRefusal,
+  getFaucet,
+  readFaucet,
+  type FaucetStatus,
   expiryOf,
   formatSessionCap,
   formatShares,
@@ -602,10 +608,46 @@ export function createServer(ctx: KitContext): McpServer {
   );
 
   server.registerTool(
+    "faucet",
+    {
+      title: "Test funds (testnet faucet)",
+      description: "TESTNET only: draws test USD (TestUSD hUSD-test, no value) from its public faucet into the sending wallet (owner key if set, else the session key; deposit(account, amount) is permissionless, so either can then fund the account). faucet() mints 1,000 once per 24 h per address; the answer says when the next draw is allowed. Onboarding: faucet -> deposit (wallet approve + deposit, or x402) -> authorize_session -> get_quote -> fill_quote. Refused on mainnet (USDG has value). dryRun default true. Requires confirm: true.",
+      inputSchema: { confirm: confirmField, dryRun: dryRunField },
+    },
+    async ({ confirm, dryRun }) => {
+      let f;
+      try {
+        f = getFaucet(ctx.chainId);
+      } catch (e) {
+        return fail(errorText(e));
+      }
+      const signer = ctx.owner ?? requireSession(ctx);
+      const dry = dryRun ?? ctx.config.dryRunDefault;
+      try {
+        const viewOf = (st: FaucetStatus) => ({ token: f.token, symbol: f.symbol, wallet: signer.address, balance: formatUsdg(st.balanceRaw), nextFaucetAt: st.nextFaucetAt.toString(), canDrawNow: st.canDrawNow });
+        if (!confirm) {
+          const st = await readFaucet(ctx.chainId, signer.address, { rpcUrl: ctx.config.rpcUrl });
+          const refused = faucetRefusal(st);
+          if (refused) return json({ ok: false, refused, ...viewOf(st) });
+          const tx = encodeFaucet(ctx.chainId);
+          return json({ ok: false, needsConfirm: true, wouldSend: tx.summary, to: tx.to, data: tx.data, dryRun: dry, ...viewOf(st), hint: "call again with confirm: true" });
+        }
+        const d = await drawFaucet(ctx.chainId, signer, { rpcUrl: ctx.config.rpcUrl, dryRun: dry });
+        const view = viewOf(d.before);
+        if (d.refused) return json({ ok: false, refused: d.refused, ...view });
+        if (d.send?.dryRun) return json({ ok: true, dryRun: true, simulated: true, to: d.request.to, data: d.request.data, summary: d.request.summary, ...view, hint: "simulation passed; call again with dryRun: false to broadcast" });
+        return json({ ok: d.status === "success", dryRun: false, txHash: d.send?.hash, status: d.status, ...view, balanceAfter: formatUsdg(d.after?.balanceRaw ?? 0n), nextFaucetAt: d.after?.nextFaucetAt.toString(), next: "deposit the test USD: deposit tool, or approve + deposit(account, amount) from the wallet" });
+      } catch (e) {
+        return fail(`faucet failed: ${errorText(e)}`);
+      }
+    },
+  );
+
+  server.registerTool(
     "register_agent",
     {
       title: "Register agent identity (ERC-8004, optional)",
-      description: "Registers an ERC-8004 agent id for the owner on the Identity Registry (mainnet 4663 only) with a registration file naming this trading account. Optional; the market does not require it. Owner key. dryRun default true. Requires confirm: true.",
+      description: "Registers an ERC-8004 agent id for the owner on the chain's Identity Registry (the ERC-8004 reference deployment: 0x8004A169… on mainnet, 0x8004A818… on testnet) with a registration file naming this trading account. Optional; the market does not require it. Owner key. dryRun default true. Requires confirm: true.",
       inputSchema: {
         name: z.string().min(1).max(80),
         description: z.string().max(400).optional(),
