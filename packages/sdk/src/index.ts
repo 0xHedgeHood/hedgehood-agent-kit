@@ -11,6 +11,7 @@ export * from "./lending.js";
 export * from "./rfq.js";
 export * from "./close.js";
 export * from "./pnl.js";
+export * from "./display.js";
 export * from "./x402.js";
 export * from "./errors.js";
 export * from "./identity.js";

@@ -243,4 +243,4 @@ directories). Contributions: keep PRs focused, never commit keys or `.env` files
 
 ## License
 
-MIT. x402 USDG preset adapted from `@priors/x402` (MIT, Priors contributors).
+[MIT](LICENSE).
