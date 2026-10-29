@@ -360,7 +360,7 @@ const autoDepositField = z.boolean().optional().describe("Account's own key, bal
 const approveField = z.enum(["exact", "max"]).optional().describe("When an approval is needed: exact (default, just what this fill can pull) or max (unlimited)");
 
 export function createServer(ctx: KitContext): McpServer {
-  const server = new McpServer({ name: "hedgehood-options", version: "0.4.0" });
+  const server = new McpServer({ name: "hedgehood-options", version: "0.4.1" });
   const underlying = ctx.marketDeployment?.underlying ?? "NVDA";
 
   server.registerTool(

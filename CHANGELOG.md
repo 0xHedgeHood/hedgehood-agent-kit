@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (2026-10-29)
 
 - Portfolio dashboard: summary card and realized P&L bars for closed / settled positions, including accounts with no
   remaining open positions. Hide the raw-field schema note in human output; JSON is unchanged. Shared by CLI and MCP.
