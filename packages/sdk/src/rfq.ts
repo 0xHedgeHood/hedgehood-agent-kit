@@ -282,7 +282,7 @@ export interface AgentView {
   registry: Address;
 }
 
-/** One open (or settled, not yet redeemed) position as `GET /v1/pnl` marks it. */
+/** One open, closed or settled position from `GET /v1/pnl`. */
 export interface PnlPosition {
   /** `NVDA-20261030-220-C` */
   instrument: string;
@@ -292,6 +292,9 @@ export interface PnlPosition {
   isPut: number | boolean;
   /** Signed 1e18 shares (negative = short). */
   quantityRaw: string;
+  status?: "open" | "closed" | "settled";
+  /** Realized P&L for this instrument, including taker fees; absent on older indexers. */
+  realizedRaw?: string | null;
   /** Signed USDG raw paid (positive) or received (negative), taker fees included. */
   costRaw: string;
   /** Average entry price per share, USDG raw; null when unknown. */
@@ -313,12 +316,12 @@ export interface PnlView {
   account: Address;
   asOf: number;
   positions: PnlPosition[];
-  /** Settled P&L booked so far (signed USDG raw). */
+  /** Closed and settled P&L booked so far, including fees (signed USDG raw). */
   realizedRaw: string;
   /** Sum of the open positions' mark-to-mid P&L; null when any mark is missing. */
   unrealizedRaw: string | null;
   feesPaidRaw: string;
-  /** realized + unrealized - fees (signed USDG raw). */
+  /** realized + unrealized (signed USDG raw); fees are already included. */
   totalRaw: string;
   note?: string;
 }
