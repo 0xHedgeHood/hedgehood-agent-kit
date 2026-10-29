@@ -1,6 +1,6 @@
 {
   "name": "@hedgehood-io/sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript SDK for Hedgehood's cash-settled options market V2 on Robinhood Chain: instrument ids, EIP-712 orders, session keys, RFQ quotes and the x402 deposit gateway",
   "license": "MIT",
   "type": "module",

@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-29)
+
+**Testnet on TestUSD, 20 markets (hedgehood-options #63, deployed 2026-10-29).** The testnet markets were redeployed on
+TestUSD (`hUSD-test`, open faucet) and GOOGL was added: `chains.ts` 46630 lists 20 V2 markets (NVDA, AMD, MU, SNDK, CRWV,
+NBIS, IONQ, INTC, TSM, ASML, TSLA, PLTR, GME, MSTR, COIN, CRCL, RKLB, RGTI, ORCL, GOOGL) with `settlementToken` and `usdg`
+= TestUSD; the old tUSDG markets are no longer listed. Verified live: faucet, deposit, session authorize from a browser
+wallet, session-key buy and close for that account, per-key P&L.
 
 **Testnet faucet and ERC-8004 testnet registry (hedgehood-options `testnet/onboarding-kit` @ `8e860ad`).**
 
@@ -11,8 +17,7 @@
   `0x850DE815d41F6983Aaf09247f9a465c0aefff04C`; SDK `getFaucet`, `encodeFaucet`, `readFaucet`, `faucetRefusal`,
   `drawFaucet`; ABI `testUsdAbi` vendored with `scripts/vendor-abis.mjs --testusd`. Mainnet refuses.
 - CLI `hedgehood faucet [--send]` and MCP tool `faucet` (confirm + dryRun): `faucet()` from the owner key (else the
-  session key), refused during the 24 h cooldown or before the token is deployed. The testnet markets still settle in
-  tUSDG until they are redeployed on TestUSD; the market list and `usdg` move in a follow-up.
+  session key), refused during the 24 h cooldown or before the token is deployed.
 - SKILL.md: testnet onboarding (connect -> faucet -> deposit -> session key -> quote -> fill).
 
 **Breaking: session short-risk budget (hedgehood-options PR #58, `contracts/redteam-fixes` @ `ccbab74`).** Market, book
