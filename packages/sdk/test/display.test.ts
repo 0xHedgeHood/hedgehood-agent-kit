@@ -46,4 +46,25 @@ describe("portable account dashboard", () => {
     expect(table).not.toContain("```");
     expect(table).toMatch(/^[\x20-\x7e\n]+$/);
   });
+
+  it("shows a closed account's realized loss without deducting fees twice or dumping raw-field notes", () => {
+    const input = view({ positions: [row({ quantityRaw: "0", status: "closed", realizedRaw: "-307758", unrealizedRaw: null, markMid: null })],
+      realizedRaw: "-307758", unrealizedRaw: "0", totalRaw: "-307758", feesPaidRaw: "110266", note: "USDG raw (1e6) signed; quantityRaw 1e18 shares" });
+    const before = JSON.stringify(input);
+    const display = renderPnlDashboard(input, 46630);
+    expect(display).toContain("TOTAL P&L   -0.307758   [LOSS]");
+    expect(display).toContain("REALIZED BY CLOSED / SETTLED POSITION");
+    expect(display).toContain("##########|");
+    expect(display).toContain("0.110266 (already included)");
+    expect(display).not.toContain("-0.418024");
+    expect(display).not.toContain("quantityRaw");
+    expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it("does not invent per-position realized results for older indexers", () => {
+    const display = renderPnlDashboard(view({ positions: [row({ quantityRaw: "0" })], unrealizedRaw: "0" }), 46630);
+    expect(display).toContain("CLOSED / SETTLED - P&L UNAVAILABLE");
+    expect(display).toContain("NVDA-20261030-220-C  N/A");
+    expect(display).not.toContain("REALIZED BY CLOSED / SETTLED POSITION");
+  });
 });

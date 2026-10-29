@@ -1,7 +1,8 @@
 # User portfolio in a terminal or Claude Code
 
 `hedgehood dashboard` and the local MCP tool `get_dashboard` use the same ASCII renderer: account-wide P&L,
-active option positions, and signed bars comparing unrealized P&L by position. No terminal colour support is needed.
+active option positions, and signed bars comparing unrealized P&L by position. The next release adds a summary card
+and realized P&L bars for closed / settled positions, so a flat account still shows its results. No terminal colour support is needed.
 Claude Code can show the returned display in a fenced `text` block. This is the user's on-chain portfolio; it does
 not include the market maker's brokerage account.
 
@@ -69,9 +70,11 @@ TypeScript MCP server; the separately deployed Python hosted MCP has not been ch
 - Totals come from the indexer. Fees are shown separately and are not subtracted again by the renderer.
 - A missing open-position mark produces `N/A` and an incomplete total, even if an older backend supplies a partial
   numeric total. Raw JSON remains the original backend response; inspect its nulls and note before using totals.
-- Closed and settled rows are excluded from the active table; they can still contribute to lifetime totals.
+- Closed and settled rows are excluded from the active table. In the next release they also have their own realized
+  P&L chart; older indexers without per-position realized values show `N/A`. These are instrument totals, not individual trades.
 - Bars compare current unrealized P&L, with one common scale and signs around zero. They are **not an equity curve**,
   a return percentage, or today's profit. Historical performance needs historical valuation snapshots.
+- Human output omits the backend's raw-field schema note; `--json` retains the original note and precision.
 - Report time, oldest available mark time, and time to expiry at the report time are shown. A report timestamp does
   not prove the underlying indexer or prices are fresh. Mid valuation is not an executable close price.
 - Amounts and quantities retain backend precision. Quantities use raw token-share units converted from 1e18;

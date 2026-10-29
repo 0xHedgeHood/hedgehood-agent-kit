@@ -84,7 +84,9 @@ adds the on-chain `orderDigest` / `remaining` / `isValidOrderSignature` / `curre
 backend, mocked in the kit's tests): every `*Raw` is a decimal string of signed USDG raw (6 decimals) except
 `quantityRaw` (signed 1e18 shares, negative = short); `markMid` / `markBid` / `markAsk` / `settlementPrice` are floats in
 USDG per share; `avgPriceRaw` and `priceRaw` are per share. `unrealizedRaw` is mark-to-mid and `null` without a mark;
-`totalRaw = realizedRaw + unrealizedRaw - feesPaidRaw`. The SDK reads them with `RfqClient.getPnl(account)` and
+The current indexer includes taker fees in cost and realized P&L, so `totalRaw = realizedRaw + unrealizedRaw`;
+`feesPaidRaw` is a separate disclosure, not an additional deduction. Position rows can also include `status` and
+per-instrument `realizedRaw`; these are optional for compatibility with older indexers. The SDK reads them with `RfqClient.getPnl(account)` and
 `getHistory(account, { limit, since })`; `positionPnl()` joins an on-chain position with its `/v1/pnl` row by instrument
 name for the `positions` views.
 

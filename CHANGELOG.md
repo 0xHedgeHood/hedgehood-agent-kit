@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Portfolio dashboard: summary card and realized P&L bars for closed / settled positions, including accounts with no
+  remaining open positions. Hide the raw-field schema note in human output; JSON is unchanged. Shared by CLI and MCP.
+
 ## 0.4.0 (2026-10-29)
 
 **Upgrade note:** owner-key fills and closes now default to wallet mode, which may approve the market to pull
