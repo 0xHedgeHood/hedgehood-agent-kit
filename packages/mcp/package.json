@@ -1,6 +1,6 @@
 {
   "name": "@hedgehood-io/mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local MCP server for Hedgehood's AI-agent options market: quotes, fills, deposits and positions, signed with the agent's own session key (stdio + streamable HTTP)",
   "license": "MIT",
   "type": "module",

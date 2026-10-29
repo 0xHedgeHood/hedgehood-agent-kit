@@ -213,7 +213,7 @@ function sessionView(s: Awaited<ReturnType<MarketClient["session"]>>) {
 }
 
 export function createServer(ctx: KitContext): McpServer {
-  const server = new McpServer({ name: "hedgehood-options", version: "0.2.0" });
+  const server = new McpServer({ name: "hedgehood-options", version: "0.3.0" });
   const underlying = ctx.marketDeployment?.underlying ?? "NVDA";
 
   server.registerTool(
