@@ -80,6 +80,12 @@ leaderboard groups your accounts under it.
 
 ## Using the tools well
 
+- If `get_dashboard` is available and the user asks for a portfolio overview or terminal-style visualization, call it
+  and reproduce its `display` verbatim in a fenced `text` block. This shares the CLI's renderer. Do not turn the bars
+  into a historical return chart or label lifetime totals as today's P&L. Preserve N/A, network and report/mark times;
+  explain missing inputs separately. It is a read-only query and needs no signing key. On older servers without this
+  tool, use `get_pnl` / `positions` and keep unavailable values explicit. See [terminal setup](../../docs/TERMINAL.md).
+
 - Start with `list_markets` (addresses, open expiries, strikes, fee) and `positions` (balance, free collateral, session
   status: `riskLeft`, `spendLeft`, `authorizedAt`). If `session.active` is false, stop: the owner must
   `authorize_session` first. Before filling, read the quote's `sessionCharge`: if `withinBudget` is false the fill

@@ -51,7 +51,7 @@ describe("hedgehood cli", () => {
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();
-    expect(names).toEqual(["borrow", "close", "decode", "deposit", "faucet", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
+    expect(names).toEqual(["borrow", "close", "dashboard", "decode", "deposit", "faucet", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
     const lend = p.commands.find((c) => c.name() === "lend")!;
     expect(lend.commands.map((c) => c.name()).sort()).toEqual(["deposit", "status", "withdraw"]);
     const borrow = p.commands.find((c) => c.name() === "borrow")!;
@@ -96,6 +96,33 @@ describe("hedgehood cli", () => {
     expect(j.totalRaw).toBe("1182600");
     expect((j.positions as unknown[]).length).toBe(2);
     expect(world.backend[0]!.url.toString()).toBe(`https://index.test/v1/pnl?account=${ACCOUNT}`);
+  });
+
+  it("dashboard is address-only and shares the ASCII P&L display without changing JSON", async () => {
+    const previous = process.env.HEDGEHOOD_OWNER_KEY_FILE;
+    process.env.HEDGEHOOD_OWNER_KEY_FILE = "/nonexistent/must-not-read-dashboard-key";
+    let human: Awaited<ReturnType<typeof run>>;
+    try {
+      human = await run(["dashboard"]);
+    } finally {
+      if (previous === undefined) delete process.env.HEDGEHOOD_OWNER_KEY_FILE;
+      else process.env.HEDGEHOOD_OWNER_KEY_FILE = previous;
+    }
+    expect(human.text).toContain("HEDGEHOOD / OPTIONS / TESTNET");
+    expect(human.text).toContain("UNREALIZED BY POSITION");
+    expect(human.world.backend).toHaveLength(1);
+    expect(human.world.backend[0]!.url.pathname).toBe("/v1/pnl");
+    expect((await run(["pnl", "--ascii"])).text).toBe(human.text);
+    const data = json((await run(["dashboard", "--json"])).text);
+    expect(data.chainId).toBe(46630);
+    expect(data.totalRaw).toBe("1182600");
+    expect(data.display).toBeUndefined();
+    await expect(run(["dashboard"], fakeWorld({ indexerDown: true }))).rejects.toThrow();
+  });
+
+  it("list and positions support bordered ASCII tables", async () => {
+    expect((await run(["list", "--ascii"])).text).toContain("| Expiry (UTC)");
+    expect((await run(["positions", "--ascii"])).text).toContain("| instrument");
   });
 
   it("history lists events newest first and passes --limit / --since to the indexer", async () => {

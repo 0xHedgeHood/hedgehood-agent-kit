@@ -41,7 +41,7 @@ describe("share lending tools", () => {
     const tools = (await client.listTools()).tools;
     const names = tools.map((t) => t.name);
     for (const n of ["lend_status", "lend_deposit", "lend_withdraw", "borrow_status", "borrow_supply_collateral", "borrow_take", "borrow_repay", "borrow_withdraw_collateral"]) expect(names).toContain(n);
-    expect(tools).toHaveLength(33);
+    expect(tools).toHaveLength(34);
     for (const w of WRITES) {
       const t = tools.find((x) => x.name === w)!;
       expect(Object.keys(t.inputSchema.properties ?? {})).toEqual(expect.arrayContaining(["confirm", "dryRun"]));

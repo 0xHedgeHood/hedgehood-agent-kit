@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- User portfolio ASCII dashboard shared by SDK `renderPnlDashboard`, CLI `dashboard` / `pnl --ascii`, and MCP
+  `get_dashboard` (text plus structured data). Shows account-wide totals, active positions, signed snapshot bars,
+  report/mark times and unknown marks without a fabricated equity curve. Dashboard queries need only an address.
+- CLI `markets` alias `list`; `--ascii` tables for markets and positions. Existing JSON commands retain their shapes.
+- Local-build, address-only Claude Code setup and synthetic preview: [terminal guide](docs/TERMINAL.md).
+
 ## 0.3.0 (2026-10-29)
 
 **Testnet on TestUSD, 20 markets (hedgehood-options #63, deployed 2026-10-29).** The testnet markets were redeployed on

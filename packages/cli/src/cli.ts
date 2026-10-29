@@ -5,6 +5,8 @@ import { Command, Option } from "commander";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import type { Address, Hex } from "viem";
 import {
+  asciiTable,
+  renderPnlDashboard,
   buildRegistrationFile,
   dataUri,
   decodeInstrumentId,
@@ -76,6 +78,7 @@ interface GlobalOpts {
   ownerKeyFile?: string;
   vaultApiUrl?: string;
   json?: boolean;
+  ascii?: boolean;
 }
 
 function envFrom(o: GlobalOpts): NodeJS.ProcessEnv {
@@ -103,6 +106,14 @@ function ctxFrom(cmd: Command, readOnly = false): KitContext {
   const o = cmd.optsWithGlobals() as GlobalOpts;
   const env = envFrom(o);
   if (readOnly && !env.HEDGEHOOD_ACCOUNT && !env.HEDGEHOOD_SESSION_KEY_FILE && !env.HEDGEHOOD_SESSION_KEY && !env.HEDGEHOOD_OWNER_KEY_FILE && !env.HEDGEHOOD_OWNER_KEY) env.HEDGEHOOD_ACCOUNT = ZERO;
+  return createContext(loadConfig(env));
+}
+
+/** The overview needs an address only, even when unrelated trading keys are configured. */
+function dashboardContext(cmd: Command): KitContext {
+  const env = envFrom(cmd.optsWithGlobals() as GlobalOpts);
+  for (const name of ["HEDGEHOOD_SESSION_KEY", "HEDGEHOOD_SESSION_KEY_FILE", "HEDGEHOOD_OWNER_KEY", "HEDGEHOOD_OWNER_KEY_FILE"]) delete env[name];
+  if (!env.HEDGEHOOD_ACCOUNT) throw new Error("dashboard needs --account <address> or HEDGEHOOD_ACCOUNT; no private key is required");
   return createContext(loadConfig(env));
 }
 
@@ -277,7 +288,8 @@ export function buildProgram(): Command {
     .option("--session-key-file <path>", `session key file (default ${DEFAULT_SESSION_KEY_FILE} when present)`)
     .option("--owner-key-file <path>", "owner key file, only for deposit/withdraw/session/join and every vault action")
     .option("--vault-api-url <url|off>", "Stock Yield fund snapshot API for `vaults` (default: hedgehood.app on mainnet; off = chain only)")
-    .option("--json", "machine-readable output");
+    .option("--json", "machine-readable output")
+    .option("--ascii", "ASCII tables for markets, positions and P&L (same renderer as the MCP dashboard)");
 
   program
     .command("join")
@@ -333,6 +345,7 @@ export function buildProgram(): Command {
 
   program
     .command("markets")
+    .alias("list")
     .description("Markets, open expiries and strikes")
     .action(async (_o: unknown, cmd: Command) => {
       const ctx = ctxFrom(cmd, true);
@@ -341,7 +354,10 @@ export function buildProgram(): Command {
       const infos = await Promise.all(expiries.map((e) => m.expiryInfo(e)));
       const fee = await m.protocolFeeBps();
       const human = [`${ctx.deployment.underlying} on chain ${ctx.chainId}  market ${m.market}  book ${m.orderBook}  taker fee ${fee} bps`, ...infos.map((i) => `  expiry ${i.expiry} ${new Date(Number(i.expiry) * 1000).toISOString().slice(0, 16)}Z  ${i.settled ? `settled @ ${formatUsdg(i.settlementPrice)}` : i.tradingOpen ? "trading" : "closed"}  anchor ${formatUsdg(i.anchor)}${i.uiMultiplier === UNIT_MULTIPLIER ? "" : ` (per token; uiMultiplier ${formatUnits(i.uiMultiplier, 18)})`}  strikes ${i.shareStrikes.map(formatStrike).join(" ")}`)];
-      out(cmd, { chainId: ctx.chainId, market: m.market, orderBook: m.orderBook, takerFeeBps: fee, expiries: infos }, human.join("\n"));
+      const display = (cmd.optsWithGlobals() as GlobalOpts).ascii
+        ? human[0] + "\n" + asciiTable(["Expiry (UTC)", "State", "Listed strikes"], infos.map((i) => [new Date(Number(i.expiry) * 1000).toISOString(), i.settled ? "settled" : i.tradingOpen ? "trading" : "closed", i.shareStrikes.map(formatStrike).join(" ")]))
+        : human.join("\n");
+      out(cmd, { chainId: ctx.chainId, market: m.market, orderBook: m.orderBook, takerFeeBps: fee, expiries: infos }, display);
     });
 
   program
@@ -481,7 +497,7 @@ export function buildProgram(): Command {
         `account ${s.account}`,
         `collateral ${formatUsdg(s.collateralRaw)}  locked ${formatUsdg(s.requirementRaw)}  free ${formatUsdg(s.freeCollateralRaw)}  wallet USDG ${formatUsdg(s.walletUsdgRaw)}`,
         positions.length
-          ? table(
+          ? ((cmd.optsWithGlobals() as GlobalOpts).ascii ? asciiTable : table)(
               ["instrument", "qty", "avg", "mark", "unrealized", "expires in", "id"],
               positions.map((p) => [p.instrument, `${p.quantityRaw > 0n ? "+" : ""}${formatShares(p.quantityRaw)}`, p.avgPrice ?? "-", p.mark == null ? "-" : String(p.mark), p.unrealized ?? "-", p.expiresIn, p.instrumentId.toString()]),
             )
@@ -502,7 +518,16 @@ export function buildProgram(): Command {
     .action(async (_o: unknown, cmd: Command) => {
       const ctx = ctxFrom(cmd);
       const p = await ctx.rfq.getPnl(ctx.account);
-      out(cmd, p, pnlHuman(p));
+      out(cmd, p, (cmd.optsWithGlobals() as GlobalOpts).ascii ? renderPnlDashboard(p, ctx.chainId) : pnlHuman(p));
+    });
+
+  program
+    .command("dashboard")
+    .description("Read-only ASCII account overview: open positions, P&L and signed bars (all indexed markets)")
+    .action(async (_o: unknown, cmd: Command) => {
+      const ctx = dashboardContext(cmd);
+      const p = await ctx.rfq.getPnl(ctx.account);
+      out(cmd, { chainId: ctx.chainId, ...p }, renderPnlDashboard(p, ctx.chainId));
     });
 
   program
