@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-29)
 
 **Upgrade note:** owner-key fills and closes now default to wallet mode, which may approve the market to pull
 premium, fees and collateral from the wallet. Use `--from-balance` (CLI) or `fromBalance: true` (MCP) to retain
