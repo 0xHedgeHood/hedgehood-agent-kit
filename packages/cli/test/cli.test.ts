@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi, onTestFinished } from "vitest";
 import { decodeFunctionData, type Hex } from "viem";
 import { marketV2Abi, UNLIMITED } from "@hedgehood-io/sdk";
 import { buildProgram, parseCap, parseSince } from "../src/cli.js";
@@ -99,6 +99,11 @@ describe("hedgehood cli", () => {
   });
 
   it("dashboard is address-only and shares the ASCII P&L display without changing JSON", async () => {
+    // The two renders below are compared byte for byte and the fake indexer stamps marks with the wall clock: pin the
+    // clock so a second boundary between the renders cannot change "Mark timestamps" (flaky in CI otherwise).
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-29T20:00:00Z"));
+    onTestFinished(() => { vi.useRealTimers(); });
     const previous = process.env.HEDGEHOOD_OWNER_KEY_FILE;
     process.env.HEDGEHOOD_OWNER_KEY_FILE = "/nonexistent/must-not-read-dashboard-key";
     let human: Awaited<ReturnType<typeof run>>;
