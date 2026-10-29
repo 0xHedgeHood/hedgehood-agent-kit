@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-29)
 
 **Upgrade note:** owner-key fills and closes now default to wallet mode, which may approve the market to pull
 premium, fees and collateral from the wallet. Use `--from-balance` (CLI) or `fromBalance: true` (MCP) to retain
@@ -40,7 +40,7 @@ balance, positions and session grant; the kit now reads and trades them like one
 - CLI `markets` alias `list`; `--ascii` tables for markets and positions. Existing JSON commands retain their shapes.
 - Local-build, address-only Claude Code setup and synthetic preview: [terminal guide](docs/TERMINAL.md).
 
-## 0.3.0 (2026-10-29)
+## 0.3.0 (tagged 2026-10-29, never published to npm; everything below ships in 0.4.0)
 
 **Testnet on TestUSD, 20 markets (hedgehood-options #63, deployed 2026-10-29).** The testnet markets were redeployed on
 TestUSD (`hUSD-test`, open faucet) and GOOGL was added: `chains.ts` 46630 lists 20 V2 markets (NVDA, AMD, MU, SNDK, CRWV,
