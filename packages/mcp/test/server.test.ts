@@ -7,7 +7,7 @@ import { encodeInstrumentId, marketV2Abi, orderBookV2Abi, orderToJson, renderPnl
 import { createContext } from "../src/context.js";
 import { createServer } from "../src/server.js";
 import { loadConfig, normalizeKey } from "../src/config.js";
-import { CALL220, NAME210P, NAME220C, NVDA_M, ONE, TEST_USD, defaultChain, fakeWorld, withGlobalFetch } from "./fakes.js";
+import { CALL220, NAME210P, NAME220C, NVDA_M, ONE, TEST_USD, defaultChain, fakeWorld, useFixtureClock, withGlobalFetch } from "./fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const OWNER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
@@ -50,6 +50,7 @@ describe("config", () => {
 });
 
 describe("mcp server", () => {
+  useFixtureClock();
   it("lists the expected tools with confirm/dryRun on every write tool", async () => {
     const { client } = await connect();
     const { tools } = await client.listTools();

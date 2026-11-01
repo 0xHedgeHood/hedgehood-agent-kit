@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi, onTestFinished } from "vitest";
 import { decodeFunctionData, type Hex } from "viem";
 import { marketV2Abi, UNLIMITED } from "@hedgehood-io/sdk";
 import { buildProgram, parseCap, parseSince } from "../src/cli.js";
-import { ACCOUNT, NAME210P, NAME220C, NVDA_M, TEST_USD, defaultChain, fakeWorld, withGlobalFetch } from "../../mcp/test/fakes.js";
+import { ACCOUNT, NAME210P, NAME220C, NVDA_M, TEST_USD, defaultChain, fakeWorld, useFixtureClock, withGlobalFetch } from "../../mcp/test/fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const GLOBALS = ["--account", ACCOUNT, "--rfq-url", "https://rfq.test", "--indexer-url", "https://index.test"];
@@ -48,6 +48,7 @@ afterEach(() => {
 });
 
 describe("hedgehood cli", () => {
+  useFixtureClock();
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();

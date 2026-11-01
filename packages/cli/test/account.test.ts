@@ -3,7 +3,7 @@ import { decodeFunctionData, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { erc20Abi, instrumentName, marketV2Abi, orderBookV2Abi } from "@hedgehood-io/sdk";
 import { buildProgram } from "../src/cli.js";
-import { AMD_MARKET, EXPIRY, GOOGL_BOOK, GOOGL_MARKET, MARKET, NAME220C, fakeWorld, multiMarketChain, withGlobalFetch, type FakeWorld } from "../../mcp/test/fakes.js";
+import { AMD_MARKET, EXPIRY, GOOGL_BOOK, GOOGL_MARKET, MARKET, NAME220C, fakeWorld, multiMarketChain, useFixtureClock, withGlobalFetch, type FakeWorld } from "../../mcp/test/fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const OWNER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
@@ -42,6 +42,7 @@ afterEach(() => {
 });
 
 describe("hedgehood account / one wallet, all markets", () => {
+  useFixtureClock();
   it("account prints every market, the totals, where the session key can trade and the market it could not read", async () => {
     const world = fakeWorld({ chain: multiMarketChain() });
     const text = await run("session", ["account"], world);
