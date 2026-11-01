@@ -49,7 +49,7 @@ command), within two cumulative budgets: a sell that opens a short draws `riskLe
 the worst case of the shorts it closes. `quote`, `fill` and `close` print the leg's `session charge` and say when it
 would revert `SessionLimit`. `--max-requirement` was removed and errors with a pointer to `--max-short-risk`. Vaults: an address, a
 share symbol (`hhNVDA-CC`, `NVDA-CC`) or a ticker that names one fund (`GOOGL`).
-Global options: `--testnet` (default) | `--mainnet` | `--chain <id>`, `--rpc`, `--rfq-url`, `--indexer-url`, `--gateway-url`,
+Global options: `--testnet` (default) | `--mainnet` (real USDG) | `--chain <id>`, `--rpc`, `--rfq-url`, `--indexer-url`, `--gateway-url`,
 `--vault-api-url <url|off>`, `--account <owner>`, `--underlying NVDA`, `--session-key-file`, `--owner-key-file`, `--json`.
 Environment variables of `@hedgehood-io/mcp` are honoured too.
 

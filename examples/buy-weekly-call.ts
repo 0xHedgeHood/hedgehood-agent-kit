@@ -10,7 +10,7 @@ const session = privateKeyToAccount(key);
 const account = (process.env.HEDGEHOOD_ACCOUNT ?? session.address) as Address;
 
 const market = new MarketClient({ chainId: 46630, underlying: "NVDA", account, signer: session });
-const rfq = new RfqClient({ chainId: 46630 }); // public hosts: agent-api / agent-index / agent-pay.hedgehood.io
+const rfq = new RfqClient({ chainId: 46630 }); // testnet hosts: testnet-agent-api / -index / -pay.hedgehood.io
 
 // nearest expiry that is still trading
 const infos = await Promise.all((await market.openedExpiries()).map((e) => market.expiryInfo(e)));

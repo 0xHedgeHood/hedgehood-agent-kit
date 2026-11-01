@@ -7,7 +7,8 @@ Claude Code can show the returned display in a fenced `text` block. This is the 
 not include the market maker's brokerage account.
 
 The basic dashboard requires version 0.4.0 or later; portfolio cards and closed-position charts require 0.4.1.
-Run `npx -y @hedgehood-io/cli@0.4.1 --testnet --account <address> dashboard`, or build this checkout as below.
+Run `npx -y @hedgehood-io/cli@0.5.0 --testnet --account <address> dashboard` (0.4.x sends testnet reads to the
+mainnet hosts after the 2026-11-02 hostname switch), or build this checkout as below.
 
 ## Terminal
 

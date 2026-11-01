@@ -11,8 +11,10 @@ SDK, local MCP server, CLI, Claude Code plugin and examples for **Hedgehood's AI
 cash-settled weekly calls and puts on tokenized stocks (NVDA first) on Robinhood Chain, traded by agents through an
 RFQ maker and filled on chain with a **session key that can never withdraw**.
 
-> **Non-US only.** The market is for agents and operators outside the United States. Testnet (chain 46630) is live for
-> integration; the mainnet (4663) listing follows the audit of `CashOptionMarketV2`.
+> **Non-US only.** The market is for agents and operators outside the United States. Mainnet (chain 4663) lists seven
+> V2 markets (NVDA, TSLA, MU, GOOGL, CRCL, MSTR, AMD) settled in real USDG; the testnet (46630) settles in a test token
+> with no value. **The kit defaults to the testnet**: pass `--mainnet` (or set `HEDGEHOOD_CHAIN_ID=4663`) to trade real
+> funds.
 
 | package | what | install |
 |---|---|---|
@@ -156,8 +158,11 @@ oracle migration (new market id) needs no kit release; `--market <id>` / `market
   (bundles the skill and the server), or `claude mcp add hedgehood -e HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key -e HEDGEHOOD_ACCOUNT=0x... -- npx -y @hedgehood-io/mcp`.
 - **Codex CLI**: `codex mcp add hedgehood --env HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key --env HEDGEHOOD_ACCOUNT=0x... -- npx -y @hedgehood-io/mcp`
   (or the same block under `[mcp_servers.hedgehood]` in `~/.codex/config.toml`).
-- **Hosted, read-only, no keys** (any MCP host that takes a URL): `https://mcp.hedgehood.io/mcp` serves markets,
-  instruments, marks, quotes (as calldata for your own wallet), positions and leaderboard; signing tools are local only.
+- **Mainnet**: the same block with `"HEDGEHOOD_CHAIN_ID": "4663"` (or `npx -y @hedgehood-io/mcp --mainnet`); the
+  session key and account are per chain, so authorize a session on each market you trade there.
+- **Hosted, read-only, no keys** (any MCP host that takes a URL): `https://mcp.hedgehood.io/mcp` (mainnet) or
+  `https://testnet-mcp.hedgehood.io/mcp` (testnet) serves markets, instruments, marks, quotes (as calldata for your own
+  wallet), positions and leaderboard; signing tools are local only.
 - **Claude Desktop / Cursor / Windsurf / OpenClaw**: paste the JSON above into the host's MCP config. Streamable HTTP for
   hosts that want a URL: `npx -y @hedgehood-io/mcp --http 7402` serves `http://127.0.0.1:7402/mcp` (localhost only; it signs).
 - `npx -y @hedgehood-io/mcp --check` prints the resolved configuration (keys shown as set/missing).
@@ -231,13 +236,23 @@ and return the unsigned transaction(s) unless `dryRun: false`, and then report t
   string is tested against the contract's `ORDER_TYPEHASH`.
 - Testnet 46630 (RPC `https://rpc.testnet.chain.robinhood.com`): market `0xC289617d613C9865a6595B365DaD88277282e0Ac`,
   book `0x7288a3D12e15379C3b64988b54Ab4Da759638cf5`, tNVDA2 `0x267ddeE02B44FDF4D073E124869DaA5BDbF1759D`, tUSDG
-  `0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d`. Fixture feeds; not mainnet configuration. Mainnet 4663: no market yet.
-- Backend (hedgehood-options `feat/rfq-backend`, PR #38): RFQ `https://agent-api.hedgehood.io`, indexer
-  `https://agent-index.hedgehood.io`, x402 deposit gateway `https://agent-pay.hedgehood.io`, hosted read-only MCP
-  `https://mcp.hedgehood.io/mcp`; routes and shapes in [docs/BACKEND_API.md](docs/BACKEND_API.md). The same hosts serve
-  both chains; `--testnet` (default) / `--mainnet` select the deployment. The public stack runs in **dry-run mode**
-  today (placeholder quote signatures, fixture pricing, gateway `SEND=0`): quotes verify but are not fillable until the
-  desk mounts its key.
+  `0x539574139BB4Ac74Fd2183ba0E38ed777E30B58d`. Fixture feeds; not mainnet configuration.
+- Mainnet 4663: seven V2 markets deployed 2026-10-29 (NVDA, TSLA, MU, GOOGL, CRCL, MSTR, AMD; the list of
+  hedgehood-options `config/agent_markets.json`), settled in USDG `0x5fc5…d168`, taker fee 5 bps; addresses, books,
+  settlement sources and deploy blocks in `deployments[4663].markets` (`chains.ts`).
+- Backend (hedgehood-options; routes and shapes in [docs/BACKEND_API.md](docs/BACKEND_API.md)), one stack per chain:
+
+  | service | mainnet 4663 | testnet 46630 |
+  |---|---|---|
+  | RFQ | `https://agent-api.hedgehood.io` | `https://testnet-agent-api.hedgehood.io` |
+  | indexer | `https://agent-index.hedgehood.io` | `https://testnet-agent-index.hedgehood.io` |
+  | x402 deposit gateway | `https://agent-pay.hedgehood.io` | `https://testnet-agent-pay.hedgehood.io` |
+  | hosted read-only MCP | `https://mcp.hedgehood.io/mcp` | `https://testnet-mcp.hedgehood.io/mcp` |
+
+  `--testnet` (default) / `--mainnet` select the deployment and its hosts (`HEDGEHOOD_API` / `HEDGEHOOD_TESTNET_API`).
+  Until the 2026-11-02 hostname switch the unprefixed names served the testnet, so kit 0.4.x on the testnet needs the
+  `testnet-` hosts passed with `--rfq-url` / `--indexer-url` / `--gateway-url`, or an upgrade to 0.5.0. A desk running
+  without its signer key answers dry-run quotes (placeholder signatures): they verify but are not fillable.
 - Agent identity: ERC-8004 Identity Registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` on 4663 (optional).
 - Stock Yield vaults (hedgehood-vaults `contracts/src/v2`, tag `audit-v2-freeze-2026-10-21`; ABIs vendored in
   `packages/sdk/src/abi/{epochFund,vaultRegistry,openDepositGate,stakeThresholdGate}.ts`). Mainnet 4663:

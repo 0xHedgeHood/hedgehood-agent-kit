@@ -2,16 +2,18 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import type { Address, Hex } from "viem";
+import { DEFAULT_CHAIN_ID } from "@hedgehood-io/sdk";
 
 /**
  * Configuration of the local server, from the environment. Keys are read once, kept in memory, and never
  * logged, echoed in tool output or included in error messages.
  *
- *   HEDGEHOOD_CHAIN_ID          46630 (default) or 4663
+ *   HEDGEHOOD_CHAIN_ID          46630 (testnet) or 4663 (mainnet); default DEFAULT_CHAIN_ID (46630)
  *   HEDGEHOOD_RPC_URL           override the chain's public RPC
- *   HEDGEHOOD_RFQ_URL           override the quote service host (default https://agent-api.hedgehood.io)
- *   HEDGEHOOD_INDEXER_URL       override the indexer host (default https://agent-index.hedgehood.io)
- *   HEDGEHOOD_GATEWAY_URL       override the x402 deposit gateway host (default https://agent-pay.hedgehood.io)
+ *   HEDGEHOOD_RFQ_URL           override the quote service host (default per chain: https://agent-api.hedgehood.io on
+ *                               mainnet, https://testnet-agent-api.hedgehood.io on the testnet)
+ *   HEDGEHOOD_INDEXER_URL       override the indexer host (default agent-index / testnet-agent-index .hedgehood.io)
+ *   HEDGEHOOD_GATEWAY_URL       override the x402 deposit gateway host (default agent-pay / testnet-agent-pay .hedgehood.io)
  *   HEDGEHOOD_UNDERLYING        NVDA (default: first market on the chain)
  *   HEDGEHOOD_ACCOUNT           the trading account (owner address) the session key acts for; defaults to the
  *                               owner key's address, else the session key's own address (self-custody mode)
@@ -84,7 +86,7 @@ function keyFrom(env: NodeJS.ProcessEnv, fileVar: string, rawVar: string): Hex |
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): KitConfig {
-  const chainId = Number(envValue(env, "HEDGEHOOD_CHAIN_ID") ?? 46630);
+  const chainId = Number(envValue(env, "HEDGEHOOD_CHAIN_ID") ?? DEFAULT_CHAIN_ID);
   if (chainId !== 46630 && chainId !== 4663) throw new Error(`HEDGEHOOD_CHAIN_ID must be 46630 or 4663 (got ${env.HEDGEHOOD_CHAIN_ID})`);
   const account = envValue(env, "HEDGEHOOD_ACCOUNT");
   if (account && !/^0x[0-9a-fA-F]{40}$/.test(account)) throw new Error("HEDGEHOOD_ACCOUNT is not an address");

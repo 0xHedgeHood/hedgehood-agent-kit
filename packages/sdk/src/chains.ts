@@ -26,6 +26,15 @@ export const chains: Record<number, Chain> = {
 
 export type SupportedChainId = 4663 | 46630;
 
+/**
+ * The chain the local MCP server (`HEDGEHOOD_CHAIN_ID` unset) and the CLI (no `--chain` / `--testnet` / `--mainnet`)
+ * use when none is named: the Robinhood testnet (46630), where test funds come from the faucet and nothing has value.
+ * Mainnet (4663, real USDG) is an explicit choice: `HEDGEHOOD_CHAIN_ID=4663`, `--mainnet` or `--chain 4663`. Flipping
+ * the default is this one constant plus the explicit `HEDGEHOOD_CHAIN_ID` in `.claude-plugin/plugin.json`,
+ * `smithery.yaml` and `packages/mcp/server.json`.
+ */
+export const DEFAULT_CHAIN_ID: SupportedChainId = 46630;
+
 /** One underlying's V2 market: a CashOptionMarketV2 and the CashOptionOrderBookV2 bound to it. */
 export interface MarketDeployment {
   /** Ticker of the underlying stock token, e.g. "NVDA". */
@@ -42,6 +51,11 @@ export interface MarketDeployment {
   deployBlock?: bigint;
   /** Protocol fee the book charges takers, in bps of their pro rata premium. */
   protocolFeeBps?: number;
+  /**
+   * The underlying token's `uiMultiplier` (1e18 = one share per token) the market's strikes were first written under,
+   * from the deployment registry. Each expiry snapshots its own on chain (`expiryInfo`); that value is authoritative.
+   */
+  uiMultiplierRaw?: bigint;
   /** Provenance note (deployment record, date). */
   note?: string;
 }
@@ -59,7 +73,7 @@ export interface ChainDeployment {
   identityRegistry?: Address;
   /** Testnet only: the public test-token faucet (TestUSD `faucet()`), when deployed. */
   faucet?: FaucetDeployment;
-  /** Hedgehood agent-market backend hosts (the same hosts serve both chains; the chain id selects the deployment). */
+  /** Hedgehood agent-market backend hosts of this chain (`HEDGEHOOD_API` mainnet, `HEDGEHOOD_TESTNET_API` testnet). */
   api: BackendHosts;
   markets: MarketDeployment[];
   /** The Stock Yield vaults (v2 `EpochFund` hub) on this chain, when deployed. */
@@ -161,7 +175,11 @@ export interface BackendHosts {
   mcp: string;
 }
 
-/** Planned public hostnames (not reachable yet as of 2026-10-28; the stack runs on the host in testnet dry-run mode). */
+/**
+ * Mainnet (4663) backend: the unprefixed public hostnames. They served the testnet until the 2026-11-02 hostname switch
+ * (Plan A); kit 0.4.x and earlier still send testnet requests to them, so those versions need `--rfq-url` /
+ * `--indexer-url` / `--gateway-url` set to `HEDGEHOOD_TESTNET_API` (or an upgrade) to keep working on the testnet.
+ */
 export const HEDGEHOOD_API: BackendHosts = {
   rfq: "https://agent-api.hedgehood.io",
   indexer: "https://agent-index.hedgehood.io",
@@ -169,11 +187,20 @@ export const HEDGEHOOD_API: BackendHosts = {
   mcp: "https://mcp.hedgehood.io/mcp",
 };
 
+/** Testnet (46630) backend: the same four services under a `testnet-` prefix since the 2026-11-02 hostname switch. */
+export const HEDGEHOOD_TESTNET_API: BackendHosts = {
+  rfq: "https://testnet-agent-api.hedgehood.io",
+  indexer: "https://testnet-agent-index.hedgehood.io",
+  gateway: "https://testnet-agent-pay.hedgehood.io",
+  mcp: "https://testnet-mcp.hedgehood.io/mcp",
+};
+
 /**
  * Deployment registry. Testnet 46630 lists the 19 CashOptionMarketV2 deployments redeployed 2026-10-29 from
  * hedgehood-options main after the red-team round 2 (#58) (same list as its config/agent_markets.testnet.json): fixture
- * tokens and keeper-pushed fixture feeds, protocol fee 150 bps to a testnet FeeSweeper: not mainnet configuration. Mainnet 4663 has no V2 market yet (empty list on
- * purpose; the USDG and identity-registry addresses are real).
+ * tokens and keeper-pushed fixture feeds, protocol fee 150 bps to a testnet FeeSweeper: not mainnet configuration.
+ * Mainnet 4663 lists the first V2 batch (NVDA TSLA MU GOOGL CRCL MSTR AMD, deployed 2026-10-29), the same list as
+ * hedgehood-options config/agent_markets.json at main 59e7c20, settled in real USDG with a 5 bps taker fee.
  */
 export const deployments: Record<SupportedChainId, ChainDeployment> = {
   46630: {
@@ -196,7 +223,7 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
       eip712: { name: "Hedgehood Test USD", version: "1" },
       note: "TestUSD, CREATE2 address pinned by hedgehood-options DeployTestUSD.EXPECTED; the settlement token of the 19 testnet markets since their 2026-10-29 redeploy",
     },
-    api: HEDGEHOOD_API,
+    api: HEDGEHOOD_TESTNET_API,
     markets: [
       {
         underlying: "NVDA",
@@ -456,7 +483,92 @@ export const deployments: Record<SupportedChainId, ChainDeployment> = {
     usdgEip712: { name: "Global Dollar", version: "1" },
     identityRegistry: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
     api: HEDGEHOOD_API,
-    markets: [], // V2 not deployed on mainnet yet (pending audit)
+    markets: [
+      {
+        underlying: "NVDA",
+        market: "0x99AfB93D21B4369207f090f80Fad6551b5316163",
+        orderBook: "0x9b6F60B018E6800d269395922F02b102ab07a191",
+        underlyingToken: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+        settlementToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        source: "0x1BC854cFb8C2782404076478eb2Dc78fD87E12ff",
+        deployBlock: 101263991n,
+        protocolFeeBps: 5,
+        uiMultiplierRaw: 1000775159164630595n,
+        note: "first V2 batch deployed 2026-10-29 (hedgehood-options config/agent_markets.json); book, source, settlement token and protocolFeeBps read on chain at block 103563628 (2026-11-01), when the market was paused pending the options Safe's unpause",
+      },
+      {
+        underlying: "TSLA",
+        market: "0x205E146a5Bfc4213399a6e01D347ac1F443bb1Ab",
+        orderBook: "0xBeE38aF4Fc4f50A0C04bDdA45Bec6cBABFf476b9",
+        underlyingToken: "0x322F0929c4625eD5bAd873c95208D54E1c003b2d",
+        settlementToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        source: "0x9b254fCACC08ECeA944144a8f4700aF17F9AB7eB",
+        deployBlock: 101264045n,
+        protocolFeeBps: 5,
+        uiMultiplierRaw: 1000000000000000000n,
+        note: "first V2 batch deployed 2026-10-29 (hedgehood-options config/agent_markets.json); book, source, settlement token and protocolFeeBps read on chain at block 103563628 (2026-11-01), when the market was paused pending the options Safe's unpause",
+      },
+      {
+        underlying: "MU",
+        market: "0x6bc821D2E305C0486f1a2c40A4CaBA67F32E9Fce",
+        orderBook: "0xd279625F70034497aC578BE2408D94500e0eC919",
+        underlyingToken: "0xfF080c8ce2E5feadaCa0Da81314Ae59D232d4afD",
+        settlementToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        source: "0x9dd31b642ced6EA9e8d6819c11743de712425fEE",
+        deployBlock: 101264096n,
+        protocolFeeBps: 5,
+        uiMultiplierRaw: 1000183456682946507n,
+        note: "first V2 batch deployed 2026-10-29 (hedgehood-options config/agent_markets.json); book, source, settlement token and protocolFeeBps read on chain at block 103563628 (2026-11-01), when the market was paused pending the options Safe's unpause",
+      },
+      {
+        underlying: "GOOGL",
+        market: "0xF00Db795444EE30ad3dBE836BCd82A5f18D39Afd",
+        orderBook: "0xf9ee442Ff299380AfeA7eeF8140DD47368C6A3dA",
+        underlyingToken: "0x2e0847E8910a9732eB3fb1bb4b70a580ADAD4FE3",
+        settlementToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        source: "0x4afEE26277FAd0CC57da204126ceCC4Ae694a5B7",
+        deployBlock: 101264149n,
+        protocolFeeBps: 5,
+        uiMultiplierRaw: 1000193924414112587n,
+        note: "first V2 batch deployed 2026-10-29 (hedgehood-options config/agent_markets.json); book, source, settlement token and protocolFeeBps read on chain at block 103563628 (2026-11-01), when the market was paused pending the options Safe's unpause",
+      },
+      {
+        underlying: "CRCL",
+        market: "0x348dc1b94099CfbFf5A142f78a41542a42f4b2C7",
+        orderBook: "0xEfD43EE18c60907b040c76e61c7FD86a52f5940A",
+        underlyingToken: "0xdF0992E440dD0be65BD8439b609d6D4366bf1CB5",
+        settlementToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        source: "0x2a7CC7E34a1CFAda9e3aeA978e805dbaB05D83b4",
+        deployBlock: 101264203n,
+        protocolFeeBps: 5,
+        uiMultiplierRaw: 1000000000000000000n,
+        note: "first V2 batch deployed 2026-10-29 (hedgehood-options config/agent_markets.json); book, source, settlement token and protocolFeeBps read on chain at block 103563628 (2026-11-01), when the market was paused pending the options Safe's unpause",
+      },
+      {
+        underlying: "MSTR",
+        market: "0x39B338A02B33766C56C91049A5965ba7694754DF",
+        orderBook: "0x9186D35Ffa24FeE77ee81319d728a98d1B276082",
+        underlyingToken: "0xec262a75e413fAfD0dF80480274532C79D42da09",
+        settlementToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        source: "0x16c9Ce1E92ADfA38585b5B66DCD08bFf2388CF8E",
+        deployBlock: 101264260n,
+        protocolFeeBps: 5,
+        uiMultiplierRaw: 1000000000000000000n,
+        note: "first V2 batch deployed 2026-10-29 (hedgehood-options config/agent_markets.json); book, source, settlement token and protocolFeeBps read on chain at block 103563628 (2026-11-01), when the market was paused pending the options Safe's unpause",
+      },
+      {
+        underlying: "AMD",
+        market: "0x4698Dd37664ade58c173FFd10C3A4DCE6d33241D",
+        orderBook: "0x2C616984eac4342d35dBACe50893ce8535f0Ce98",
+        underlyingToken: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+        settlementToken: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+        source: "0x1C8A82Ad188274CdD5c97e73b51728940534cc81",
+        deployBlock: 101264321n,
+        protocolFeeBps: 5,
+        uiMultiplierRaw: 1000000000000000000n,
+        note: "first V2 batch deployed 2026-10-29 (hedgehood-options config/agent_markets.json); book, source, settlement token and protocolFeeBps read on chain at block 103563628 (2026-11-01), when the market was paused pending the options Safe's unpause",
+      },
+    ],
     vaults: {
       registry: "0x868502F926AE068B61EA9CC55042A9F962651e76",
       openGate: "0x337B27c931873e6Ef087e8f84034b96F1d6eeFA5",

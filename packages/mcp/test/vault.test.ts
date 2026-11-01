@@ -126,20 +126,22 @@ describe("vault tools", () => {
     expect(unknown.txt).toMatch(/unknown vault/);
   });
 
-  it("the server starts on mainnet, where only the vault tools have a deployment", async () => {
+  it("the server starts on mainnet with the V2 markets, the vaults and the mainnet backend hosts", async () => {
     const config = loadConfig({ HEDGEHOOD_CHAIN_ID: "4663", HEDGEHOOD_OWNER_KEY: OWNER_KEY });
     const ctx = createContext(config, { fetch: fakeWorld().fetch });
-    expect(ctx.marketDeployment).toBeUndefined();
+    expect(ctx.marketDeployment).toMatchObject({ underlying: "NVDA", market: "0x99AfB93D21B4369207f090f80Fad6551b5316163", orderBook: "0x9b6F60B018E6800d269395922F02b102ab07a191" });
     expect(ctx.vaults?.funds.length).toBe(8);
-    expect(() => ctx.deployment).toThrow(/no V2 market/);
+    expect(ctx.rfq.hosts).toMatchObject({ rfq: "https://agent-api.hedgehood.io", indexer: "https://agent-index.hedgehood.io", gateway: "https://agent-pay.hedgehood.io" });
+    const testnet = createContext(loadConfig({ HEDGEHOOD_OWNER_KEY: OWNER_KEY }), { fetch: fakeWorld().fetch });
+    expect(testnet.chainId).toBe(46630);
+    expect(testnet.rfq.hosts).toMatchObject({ rfq: "https://testnet-agent-api.hedgehood.io", indexer: "https://testnet-agent-index.hedgehood.io", gateway: "https://testnet-agent-pay.hedgehood.io" });
     const server = createServer(ctx);
     const [a, b] = InMemoryTransport.createLinkedPair();
     await server.connect(a);
     const client = new Client({ name: "test", version: "0" });
     await client.connect(b);
-    expect((await client.listTools()).tools.some((t) => t.name === "list_vaults")).toBe(true);
-    const markets = await client.callTool({ name: "list_markets", arguments: {} });
-    expect(markets.isError).toBe(true);
-    expect(text(markets)).toMatch(/no V2 market/);
+    const tools = (await client.listTools()).tools.map((t) => t.name);
+    expect(tools).toContain("list_vaults");
+    expect(tools).toContain("get_quote");
   });
 });

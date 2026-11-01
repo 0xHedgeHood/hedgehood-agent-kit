@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { DEFAULT_CHAIN_ID } from "@hedgehood-io/sdk";
 import { loadConfig, describeConfig } from "./config.js";
 import { createContext } from "./context.js";
 import { serveHttp } from "./http.js";
@@ -12,7 +13,8 @@ if (args.includes("--help") || args.includes("-h")) {
   hedgehood-mcp                 stdio transport (for Claude Code, Codex, Claude Desktop)
   hedgehood-mcp --http [port]   streamable HTTP on 127.0.0.1 (default port 7402, path /mcp)
   hedgehood-mcp --check         print the resolved configuration (keys shown as set/missing) and exit
-  --testnet | --mainnet         select the 46630 / 4663 deployment (same public backend hosts); default testnet
+  --testnet | --mainnet         select the 46630 / 4663 deployment and its backend hosts (testnet-agent-* / agent-*
+                                .hedgehood.io); default ${DEFAULT_CHAIN_ID === 4663 ? "mainnet" : "testnet"} (${DEFAULT_CHAIN_ID})
 
 Environment: HEDGEHOOD_CHAIN_ID, HEDGEHOOD_RPC_URL, HEDGEHOOD_RFQ_URL, HEDGEHOOD_INDEXER_URL, HEDGEHOOD_GATEWAY_URL,
 HEDGEHOOD_VAULT_API_URL, HEDGEHOOD_UNDERLYING, HEDGEHOOD_ACCOUNT, HEDGEHOOD_SESSION_KEY_FILE (or HEDGEHOOD_SESSION_KEY),

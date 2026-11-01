@@ -3,20 +3,21 @@
 Reconciled with hedgehood-options branch `feat/rfq-backend` (PR #38, head `0cd8d23`): `docs/AGENT_MARKET_BACKEND.md`,
 `rfq/app.py`, `rfq/service.py`, `indexer/app.py`, `gateway/app.py`, `gateway/x402.py`, `mcp_server/tools.py`,
 `rfq/abi_v2.py`. The SDK client lives in `packages/sdk/src/rfq.ts` (`RfqPaths`, types) and `x402.ts` (gateway flow);
-the hosts are in `packages/sdk/src/chains.ts` (`HEDGEHOOD_API`). Verified live on 2026-10-28 against the public
+the hosts are in `packages/sdk/src/chains.ts` (`HEDGEHOOD_API` mainnet, `HEDGEHOOD_TESTNET_API` testnet). Verified live on 2026-10-28 against the public
 testnet deployment (dry-run mode: placeholder signatures, `SEND=0` gateway, fixture pricing).
 
 ## Hosts
 
-| service | host | env override |
-|---|---|---|
-| RFQ quote service | `https://agent-api.hedgehood.io` | `HEDGEHOOD_RFQ_URL` / `--rfq-url` |
-| indexer (fills, positions, leaderboard, agents) | `https://agent-index.hedgehood.io` | `HEDGEHOOD_INDEXER_URL` / `--indexer-url` |
-| x402 deposit gateway | `https://agent-pay.hedgehood.io` | `HEDGEHOOD_GATEWAY_URL` / `--gateway-url` |
-| hosted read-only MCP (streamable HTTP) | `https://mcp.hedgehood.io/mcp` | (`server.json` remotes) |
+| service | mainnet 4663 | testnet 46630 | env override |
+|---|---|---|---|
+| RFQ quote service | `https://agent-api.hedgehood.io` | `https://testnet-agent-api.hedgehood.io` | `HEDGEHOOD_RFQ_URL` / `--rfq-url` |
+| indexer (fills, positions, leaderboard, agents) | `https://agent-index.hedgehood.io` | `https://testnet-agent-index.hedgehood.io` | `HEDGEHOOD_INDEXER_URL` / `--indexer-url` |
+| x402 deposit gateway | `https://agent-pay.hedgehood.io` | `https://testnet-agent-pay.hedgehood.io` | `HEDGEHOOD_GATEWAY_URL` / `--gateway-url` |
+| hosted read-only MCP (streamable HTTP) | `https://mcp.hedgehood.io/mcp` | `https://testnet-mcp.hedgehood.io/mcp` | (`server.json` remotes: mainnet) |
 
-The same hosts serve both chains; the chain id (`--testnet` 46630 default, `--mainnet` 4663) selects the deployment the
-kit reads and the `chainId` it expects in quotes. Today the backend's registry holds only the testnet NVDA market.
+One backend stack per chain since the 2026-11-02 hostname switch (before it, the unprefixed names served the testnet).
+The chain id (`--testnet` 46630 default, `--mainnet` 4663) selects the deployment the kit reads, the `chainId` it
+expects in quotes and the hosts above; an override applies to whichever chain is selected.
 
 Conventions: JSON; integers that may exceed 2^53 are decimal strings (`*Raw`: USDG raw 6 decimals, shares 18 decimals);
 prices per share (`bid`/`ask`/`mid`, `price.start/end`, `markPrice`) are JSON numbers in USDG per share; times unix
