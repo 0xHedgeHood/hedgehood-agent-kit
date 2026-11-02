@@ -36,13 +36,15 @@ then fill; `fromBalance`, `autoDeposit`, `approve` adjust it); `get_quote`,
 `fill_quote` and `close_position` return the leg's `sessionCharge` (budget, charge, left, `withinBudget`) and
 `positions` shows `riskLeft` / `spendLeft`. Vault requests queue until the fund's next epoch freeze and are claimed afterwards; a redeem can take up
 to a week; lending is instant (borrows are refused below health factor 1 and warned above 70% of LLTV). The server also
-runs on mainnet 4663, where today the vaults and share lending are deployed (no option market yet).
+runs on mainnet 4663 (`HEDGEHOOD_CHAIN_ID=4663` or `--mainnet`): seven option markets, the vaults and share lending.
 
-Environment: `HEDGEHOOD_CHAIN_ID` (46630|4663), `HEDGEHOOD_SESSION_KEY_FILE` | `HEDGEHOOD_SESSION_KEY`,
+Environment: `HEDGEHOOD_CHAIN_ID` (46630 default | 4663), `HEDGEHOOD_SESSION_KEY_FILE` | `HEDGEHOOD_SESSION_KEY`,
 `HEDGEHOOD_ACCOUNT`, `HEDGEHOOD_OWNER_KEY_FILE` | `HEDGEHOOD_OWNER_KEY`, `HEDGEHOOD_RPC_URL`, `HEDGEHOOD_RFQ_URL`,
-`HEDGEHOOD_INDEXER_URL`, `HEDGEHOOD_GATEWAY_URL` (defaults: agent-api / agent-index / agent-pay.hedgehood.io),
+`HEDGEHOOD_INDEXER_URL`, `HEDGEHOOD_GATEWAY_URL` (defaults per chain: agent-api / agent-index / agent-pay.hedgehood.io
+on mainnet, testnet-agent-api / testnet-agent-index / testnet-agent-pay.hedgehood.io on the testnet),
 `HEDGEHOOD_VAULT_API_URL` (default hedgehood.app's fund snapshot API on mainnet; `off` = chain only),
 `HEDGEHOOD_UNDERLYING`, `HEDGEHOOD_DRY_RUN`, `HEDGEHOOD_MAX_DEPOSIT`. `--testnet` / `--mainnet` pick the chain. Keys are
-never logged. A hosted read-only server (no signing) is at `https://mcp.hedgehood.io/mcp`.
+never logged. A hosted read-only server (no signing) is at `https://mcp.hedgehood.io/mcp` (mainnet) and
+`https://testnet-mcp.hedgehood.io/mcp` (testnet).
 
 Docs, skill and plugin: https://github.com/0xHedgeHood/hedgehood-agent-kit. MIT.

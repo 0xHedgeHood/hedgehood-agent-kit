@@ -5,8 +5,8 @@ description: Trade USDG cash-settled weekly stock options (NVDA first) on Robinh
 
 # Hedgehood options for agents
 
-Hedgehood runs one `CashOptionMarketV2` per tokenized stock on Robinhood Chain (testnet 46630 now, mainnet 4663 after
-audit). Instruments are European calls and puts, cash-settled in USDG at the 16:00 New York close of a weekday, strikes on
+Hedgehood runs one `CashOptionMarketV2` per tokenized stock on Robinhood Chain (mainnet 4663: NVDA, TSLA, MU, GOOGL,
+CRCL, MSTR, AMD in real USDG; testnet 46630 with test funds, the kit's default chain). Instruments are European calls and puts, cash-settled in USDG at the 16:00 New York close of a weekday, strikes on
 a fixed grid of listed per-share strikes around the price when the expiry was opened. There is no order book to watch: the agent asks the maker for a
 firm quote (RFQ), receives a signed order addressed to its account that lives for seconds, and fills it on chain from its
 session key. Collateral is the worst case of the position inside the expiry's price band (no liquidations, no margin
@@ -58,8 +58,9 @@ leaderboard groups your accounts under it.
 2. **Deposit.** USDG goes into the market balance (`deposit(account, amount)` by the owner wallet, or the x402 gateway:
    tool `deposit_x402`). In balance mode the agent never needs an ERC-20 approval.
 3. **Quote.** `get_quote(instrument, side, quantity)` returns a verified quote: price per share, premium, taker fee
-   (50 bps of the premium, rounded up), seconds left, `canFill`, and a `digest`. Quotes decay linearly between
-   `startTime` and `validUntil`; the contract evaluates the premium at the fill block.
+   (the book's `protocolFeeBps` of the premium, rounded up: 5 bps on mainnet, 150 on the testnet), seconds left,
+   `canFill`, and a `digest`. Quotes decay linearly between `startTime` and `validUntil`; the contract evaluates the
+   premium at the fill block.
 4. **Fill.** `fill_quote(digest, confirm: true)` simulates (dry run) and, with `dryRun: false`, sends
    `fillOrderAs(account, order, sig, qty, fromBalance = true)` from the session key. The tool returns the tx hash. A
    session key always fills with `fromBalance = true` (the market reverts `SessionWalletMode` otherwise). `get_quote`,
@@ -242,9 +243,10 @@ Manual (Claude Code, Claude Desktop, Codex, OpenClaw and any MCP host):
 
 Codex CLI: `codex mcp add hedgehood --env HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key --env HEDGEHOOD_ACCOUNT=0x... -- npx -y @hedgehood-io/mcp`.
 OpenClaw: add the same `mcpServers` block to the agent's MCP config. Create the session key with `npx @hedgehood-io/cli join`.
-Chain: `--testnet` (46630, default) or `--mainnet` (4663) on the `npx` command, or `HEDGEHOOD_CHAIN_ID`. The backend hosts
-default to `agent-api` / `agent-index` / `agent-pay.hedgehood.io`; a hosted read-only MCP (no keys, no fills) is at
-`https://mcp.hedgehood.io/mcp`. Add `HEDGEHOOD_OWNER_KEY_FILE` only on a machine you trust with funds (it unlocks `withdraw`, `deposit_x402` from the owner
+Chain: `--testnet` (46630, default) or `--mainnet` (4663, real USDG) on the `npx` command, or `HEDGEHOOD_CHAIN_ID`. The
+backend hosts follow the chain: `agent-api` / `agent-index` / `agent-pay.hedgehood.io` on mainnet, `testnet-agent-api` /
+`testnet-agent-index` / `testnet-agent-pay.hedgehood.io` on the testnet; a hosted read-only MCP (no keys, no fills) is at
+`https://mcp.hedgehood.io/mcp` (mainnet) and `https://testnet-mcp.hedgehood.io/mcp` (testnet). Add `HEDGEHOOD_OWNER_KEY_FILE` only on a machine you trust with funds (it unlocks `withdraw`, `deposit_x402` from the owner
 wallet, `authorize_session`, `register_agent`, the vault writes and the lend / borrow writes). `npx @hedgehood-io/mcp --check` prints the resolved configuration with keys
 shown only as set/missing.
 

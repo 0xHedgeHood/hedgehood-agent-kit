@@ -9,13 +9,13 @@
     "subfolder": "packages/mcp"
   },
   "websiteUrl": "https://hedgehood.app",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@hedgehood-io/mcp",
-      "version": "0.4.1",
+      "version": "0.5.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -56,19 +56,19 @@
         },
         {
           "name": "HEDGEHOOD_RFQ_URL",
-          "description": "Quote service override (default https://agent-api.hedgehood.io)",
+          "description": "Quote service override (default per chain: https://agent-api.hedgehood.io on mainnet, https://testnet-agent-api.hedgehood.io on the testnet)",
           "isRequired": false,
           "format": "string"
         },
         {
           "name": "HEDGEHOOD_INDEXER_URL",
-          "description": "Indexer override (default https://agent-index.hedgehood.io)",
+          "description": "Indexer override (default per chain: https://agent-index.hedgehood.io on mainnet, https://testnet-agent-index.hedgehood.io on the testnet)",
           "isRequired": false,
           "format": "string"
         },
         {
           "name": "HEDGEHOOD_GATEWAY_URL",
-          "description": "x402 deposit gateway override (default https://agent-pay.hedgehood.io)",
+          "description": "x402 deposit gateway override (default per chain: https://agent-pay.hedgehood.io on mainnet, https://testnet-agent-pay.hedgehood.io on the testnet)",
           "isRequired": false,
           "format": "string"
         },

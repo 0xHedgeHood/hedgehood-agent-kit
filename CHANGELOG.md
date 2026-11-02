@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0 (unreleased: publish after the 2026-11-02 hostname switch)
+
+**Upgrade note:** the backend hosts are now per chain. Mainnet (4663) uses `agent-api` / `agent-index` / `agent-pay` /
+`mcp` .hedgehood.io; the testnet (46630) moved to the same names under a `testnet-` prefix. Kit 0.4.x keeps sending
+testnet requests to the unprefixed names, which serve mainnet after the switch: upgrade, or pass the `testnet-` hosts
+with `--rfq-url` / `--indexer-url` / `--gateway-url` (`HEDGEHOOD_RFQ_URL` / `_INDEXER_URL` / `_GATEWAY_URL`).
+
+- Mainnet 4663 lists the first V2 batch: NVDA, TSLA, MU, GOOGL, CRCL, MSTR, AMD (`CashOptionMarketV2` +
+  `CashOptionOrderBookV2`, deployed 2026-10-29, the list of hedgehood-options `config/agent_markets.json` at `59e7c20`):
+  market, order book, stock token, settlement source, deploy block, `protocolFeeBps` 5, settled in USDG. Book,
+  source, settlement token and fee were read on chain at block 103563628 (the markets were still paused then).
+- `MarketDeployment.uiMultiplierRaw`: the stock token's `uiMultiplier` the strikes were first written under (NVDA
+  1.000775159164630595, MU, GOOGL; 1e18 for the others). Each expiry's on-chain snapshot stays authoritative.
+- SDK: `HEDGEHOOD_API` is the mainnet hosts, `HEDGEHOOD_TESTNET_API` the testnet hosts, and each chain's
+  `deployments[id].api` (used by `RfqClient`, the x402 payer, the MCP server and the CLI) names its own.
+- `DEFAULT_CHAIN_ID` (46630) is the one place the MCP server (`HEDGEHOOD_CHAIN_ID` unset) and the CLI (no chain flag)
+  take their default from. **The default stays the testnet**; mainnet (real USDG) needs `--mainnet`,
+  `--chain 4663` or `HEDGEHOOD_CHAIN_ID=4663`. `--testnet` / `--mainnet` work as before. The faucet stays testnet-only.
+- Docs (README, BACKEND_API, MCP / CLI READMEs, SKILL.md, REGISTRIES, `server.json` / `smithery.yaml` descriptions):
+  per-chain hosts and the mainnet markets. The registry `remotes` entry `https://mcp.hedgehood.io/mcp` is the mainnet
+  server; the testnet one is `https://testnet-mcp.hedgehood.io/mcp`.
+- Tests: SDK `chains.test.ts` (the mainnet list, per-chain hosts, the default chain); the MCP mainnet test now starts
+  with the NVDA market and the mainnet hosts, and checks the testnet default's hosts.
+
 ## 0.4.1 (2026-10-29)
 
 - Portfolio dashboard: summary card and realized P&L bars for closed / settled positions, including accounts with no

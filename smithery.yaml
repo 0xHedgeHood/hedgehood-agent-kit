@@ -18,7 +18,7 @@ startCommand:
         description: "Owner (trading) account the session key acts for; defaults to the session key address"
       rfqUrl:
         type: string
-        description: "Quote service override (default https://agent-api.hedgehood.io)"
+        description: "Quote service override (default per chain: https://agent-api.hedgehood.io mainnet, https://testnet-agent-api.hedgehood.io testnet)"
       rpcUrl:
         type: string
         description: "RPC override"

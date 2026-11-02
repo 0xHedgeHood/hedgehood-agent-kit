@@ -6,6 +6,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import type { Address, Hex } from "viem";
 import {
   asciiTable,
+  DEFAULT_CHAIN_ID,
   renderPnlDashboard,
   buildRegistrationFile,
   dataUri,
@@ -343,14 +344,14 @@ function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint, uiMultipl
 export function buildProgram(): Command {
   const program = new Command("hedgehood")
     .description("Hedgehood AI-agent options market on Robinhood Chain. Sends are DRY RUN unless --send is given.")
-    .version("0.4.1")
-    .option("--chain <id>", "46630 (testnet, default) or 4663", process.env.HEDGEHOOD_CHAIN_ID ?? "46630")
-    .option("--testnet", "use the Robinhood testnet (46630) deployment (default)")
-    .option("--mainnet", "use Robinhood Chain mainnet (4663); no V2 market yet")
+    .version("0.5.0")
+    .option("--chain <id>", "46630 (testnet) or 4663 (mainnet)", process.env.HEDGEHOOD_CHAIN_ID ?? String(DEFAULT_CHAIN_ID))
+    .option("--testnet", `use the Robinhood testnet (46630) deployment${DEFAULT_CHAIN_ID === 46630 ? " (default)" : ""}`)
+    .option("--mainnet", `use Robinhood Chain mainnet (4663, real USDG)${DEFAULT_CHAIN_ID === 4663 ? " (default)" : ""}`)
     .option("--rpc <url>", "RPC URL override")
-    .option("--rfq-url <url>", "quote service override (default https://agent-api.hedgehood.io)")
-    .option("--indexer-url <url>", "indexer override (default https://agent-index.hedgehood.io)")
-    .option("--gateway-url <url>", "x402 deposit gateway override (default https://agent-pay.hedgehood.io)")
+    .option("--rfq-url <url>", "quote service override (default per chain: agent-api.hedgehood.io mainnet, testnet-agent-api.hedgehood.io testnet)")
+    .option("--indexer-url <url>", "indexer override (default agent-index / testnet-agent-index .hedgehood.io)")
+    .option("--gateway-url <url>", "x402 deposit gateway override (default agent-pay / testnet-agent-pay .hedgehood.io)")
     .option("--account <address>", "trading account (owner) the session key acts for")
     .option("--underlying <ticker>", "NVDA")
     .option("--session-key-file <path>", `session key file (default ${DEFAULT_SESSION_KEY_FILE} when present)`)
