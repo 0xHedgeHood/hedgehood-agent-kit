@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { decodeFunctionData, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { erc20Abi, fundingAdvice, getDeployment, MarketClient, marketV2Abi, orderBookV2Abi, planDeposit, planFillFunding, planRebalance, planWithdrawAll, readAccount, resolveMarket, Side, UNLIMITED, type Order } from "../src/index.js";
-import { AMD_MARKET, CALL220, GOOGL_BOOK, GOOGL_MARKET, ONE, fakeWorld, maker, multiMarketChain, withGlobalFetch } from "../../mcp/test/fakes.js";
+import { AMD_MARKET, CALL220, GOOGL_BOOK, GOOGL_MARKET, ONE, fakeWorld, maker, multiMarketChain, useFixtureClock, withGlobalFetch } from "../../mcp/test/fakes.js";
 
 const owner = privateKeyToAccount("0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a");
 const session = privateKeyToAccount("0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba");
@@ -22,6 +22,7 @@ function googlOrder(side: "buy" | "sell", quantityRaw = ONE): Order {
 const call = (data: Hex) => decodeFunctionData({ abi: [...marketV2Abi, ...orderBookV2Abi, ...erc20Abi], data });
 
 describe("one account across markets", () => {
+  useFixtureClock();
   it("resolves a market by ticker or address", () => {
     expect(resolveMarket(46630, "googl").market).toBe(GOOGL_MARKET);
     expect(resolveMarket(46630, GOOGL_BOOK.toLowerCase()).underlying).toBe("GOOGL");
@@ -98,6 +99,7 @@ describe("one account across markets", () => {
 });
 
 describe("fill funding", () => {
+  useFixtureClock();
   const googl = (signer = owner) => new MarketClient({ chainId: 46630, underlying: "GOOGL", account: owner.address, signer });
 
   it("wallet mode (owner): pays from the wallet, approving only what the fill can pull", async () => {

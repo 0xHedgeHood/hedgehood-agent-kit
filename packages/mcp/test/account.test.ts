@@ -7,7 +7,7 @@ import { erc20Abi, instrumentName, marketV2Abi, orderBookV2Abi, UNLIMITED } from
 import { createContext } from "../src/context.js";
 import { createServer } from "../src/server.js";
 import { loadConfig } from "../src/config.js";
-import { AMD_MARKET, EXPIRY, GOOGL_BOOK, GOOGL_MARKET, MARKET, NAME220C, fakeWorld, multiMarketChain, withGlobalFetch, type FakeWorld } from "./fakes.js";
+import { AMD_MARKET, EXPIRY, GOOGL_BOOK, GOOGL_MARKET, MARKET, NAME220C, fakeWorld, multiMarketChain, useFixtureClock, withGlobalFetch, type FakeWorld } from "./fakes.js";
 
 const SESSION_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 const OWNER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
@@ -33,6 +33,7 @@ async function connect(world: FakeWorld, as: "session" | "owner") {
 }
 
 describe("one account across markets (MCP)", () => {
+  useFixtureClock();
   it("get_account shows every market, marks the unreadable one and lists where the session key can trade", async () => {
     const call = await connect(fakeWorld({ chain: multiMarketChain() }), "session");
     const { body } = await call("get_account");

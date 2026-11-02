@@ -3,6 +3,7 @@
  * quoting both sides of every instrument, and an indexer with /v1/pnl and /v1/history rows. Everything goes through one
  * `fetch` so no network is touched.
  */
+import { afterEach, beforeEach, vi } from "vitest";
 import { decodeFunctionData, encodeAbiParameters, encodeErrorResult, encodeFunctionResult, multicall3Abi, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { adaptiveCurveIrmAbi, getDeployment, MULTICALL3, testUsdAbi, encodeFillOrderAs, encodeInstrumentId, tokenStrikeOf, epochFundAbi, erc20Abi, instrumentName, marketIdOf, marketV2Abi, morphoBlueAbi, morphoMarketV1AdapterV2Abi, openDepositGateAbi, orderBookV2Abi, orderDigest, orderToJson, shareRiskOracleAbi, Side, signOrder, vaultRegistryAbi, vaultV2Abi, type Order, type QuoteResponse } from "@hedgehood-io/sdk";
@@ -12,6 +13,20 @@ export const BOOK = "0xCEa2be1ecC16D347bE1A4fEA589e21de0Ad7E6C3" as Address;
 export const MARKET = "0x4c475Dd1fd756a086d053510A25dc046231A3D38" as Address;
 export const maker = privateKeyToAccount("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 export const EXPIRY = 1793390400n; // 2026-10-30 16:00 New York
+/** The fixtures' "now": Wednesday 2026-10-28 16:00 New York, two days before EXPIRY. */
+export const FIXTURE_NOW = Number(EXPIRY) - 2 * 86400;
+
+/**
+ * Pins Date (only Date: timers stay real) at FIXTURE_NOW for each test of the calling describe block, so EXPIRY stays
+ * ahead and the sessions, quotes and marks the fakes stamp from Date.now() stay consistent with it whatever the real date.
+ */
+export function useFixtureClock(at: number = FIXTURE_NOW): void {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at * 1000);
+  });
+  afterEach(() => { vi.useRealTimers(); });
+}
 export const STRIKES = [210_000_000n, 220_000_000n];
 /** NVDA's mainnet uiMultiplier (2026-10-28): per-token strikes are then not whole dollars. */
 export const NVDA_M = 1_000_775_159_164_630_595n;
