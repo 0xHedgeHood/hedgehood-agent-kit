@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.1 (unreleased)
+
+**`hedgehood init`: connect an agent to an owner's account in one command (mode A).** The human owns the account in
+their own wallet; the agent holds a session key the owner authorizes per market with a budget, and optionally a payment
+wallet that funds the owner's market balances over x402.
+
+- CLI `init [--with-payer] [--markets NVDA,TSLA] [--max-spend <usdg>] [--days <n>] [--site-url <url>] [--wait
+  [--timeout 900] [--interval 10]] [--no-qr]`: creates `~/.hedgehood/session.key` (and with `--with-payer`
+  `~/.hedgehood/payer.key`), mode 600 in a 700 directory, only when missing (never overwritten, never printed); prints
+  each address with a terminal QR code, the payment wallet's USDG balance, the owner's authorize link
+  `<site>/options/account?agent=<session key>&chain=<4663|46630>[&markets=..][&maxSpend=..][&days=..]` with its QR code,
+  and the MCP config (Claude Code `claude mcp add`, Claude Desktop / Cursor JSON, the hosted read-only URL). Without
+  `--account` it still creates the keys and says where to set the owner. `--wait` polls the chain (Ctrl-C safe, nothing
+  is sent) until the key is authorized with the trade scope on at least one market, then prints `READY` and a first
+  quote + buy of one share. Exit codes: 1 on timeout, 130 on Ctrl-C.
+- CLI `status [--qr]`: owner, session key, payment wallet (USDG), and per market the authorization, spend / short-risk
+  budget left, expiry and balance; `--qr` prints the QR codes again.
+- Settings file `~/.hedgehood/config.json` (non-secret: chain, owner account, key paths, site URL), written by `init`
+  and read by the CLI and the MCP server: flags > environment > settings file > defaults. `HEDGEHOOD_CONFIG=<path|off>`,
+  `HEDGEHOOD_HOME` (default `~/.hedgehood`). The CLI's `--chain` no longer defaults on the command line, so the saved
+  chain applies when no flag or `HEDGEHOOD_CHAIN_ID` is given.
+- Agent payment wallet: `HEDGEHOOD_PAYER_KEY_FILE` / `HEDGEHOOD_PAYER_KEY` (MCP and CLI; CLI `--payer-key-file`,
+  default `~/.hedgehood/payer.key` when present). `deposit_x402` and `hedgehood deposit --x402` pay from it before the
+  owner key and the session key (`x402Payer`). It only signs EIP-3009 authorizations: no ETH needed.
+- `scripts/install.sh`: checks Node >= 20 and runs `npx -y @hedgehood-io/cli@latest init "$@"` (no sudo, no global
+  install, idempotent), for `curl -fsSL https://raw.githubusercontent.com/0xHedgeHood/hedgehood-agent-kit/main/scripts/install.sh | sh -s -- ...`.
+- Dependency: `qrcode-generator` 2.0.4 (MIT, no dependencies) in the CLI.
+- Tests: CLI `init.test.ts` (key creation idempotency and modes, settings merge, link building and validation, QR
+  matrix round trip, MCP snippets, wait/poll with a fake chain and clock, status lines, `init` / `status` end to end
+  with a fake chain reader, flag > env > settings precedence); MCP `settings.test.ts` and a `deposit_x402` payer test.
+
 ## 0.5.0 (unreleased: publish after the 2026-11-02 hostname switch)
 
 **Upgrade note:** the backend hosts are now per chain. Mainnet (4663) uses `agent-api` / `agent-index` / `agent-pay` /

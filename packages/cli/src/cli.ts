@@ -7,6 +7,7 @@ import type { Address, Hex } from "viem";
 import {
   asciiTable,
   DEFAULT_CHAIN_ID,
+  getDeployment,
   renderPnlDashboard,
   buildRegistrationFile,
   dataUri,
@@ -66,9 +67,13 @@ import {
   type Order,
 } from "@hedgehood-io/sdk";
 import { formatUnits } from "viem";
-import { createContext, loadConfig, requireOwner, requireSession, tradeSigner, type KitContext } from "@hedgehood-io/mcp";
+import { createContext, hedgehoodHome, loadConfig, requireOwner, requireSession, settingsPath, tradeSigner, withSettings, x402Payer, type KitContext } from "@hedgehood-io/mcp";
+import { authorizedMarkets, chainReader, DEFAULT_SITE_URL, ensureKeyFile, marketStatusLines, mcpSnippets, ownerLink, parseMarkets, qr, readyLines, waitForAuthorization, writeSettings, type ChainReader } from "./init.js";
 
 const DEFAULT_SESSION_KEY_FILE = "~/.hedgehood/session.key";
+const DEFAULT_PAYER_KEY_FILE = "~/.hedgehood/payer.key";
+/** Key files under HEDGEHOOD_HOME (default ~/.hedgehood). */
+const homeFile = (env: NodeJS.ProcessEnv, name: "session.key" | "payer.key") => resolve(hedgehoodHome(env), name);
 
 function expand(p: string): string {
   return p.startsWith("~") ? resolve(homedir(), p.slice(2)) : resolve(p);
@@ -86,13 +91,15 @@ interface GlobalOpts {
   underlying?: string;
   sessionKeyFile?: string;
   ownerKeyFile?: string;
+  payerKeyFile?: string;
   vaultApiUrl?: string;
   json?: boolean;
   ascii?: boolean;
 }
 
+/** Flags > environment > ~/.hedgehood/config.json (`hedgehood init`) > defaults. */
 function envFrom(o: GlobalOpts): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  let env: NodeJS.ProcessEnv = { ...process.env };
   if (o.chain) env.HEDGEHOOD_CHAIN_ID = o.chain;
   if (o.testnet) env.HEDGEHOOD_CHAIN_ID = "46630";
   if (o.mainnet) env.HEDGEHOOD_CHAIN_ID = "4663";
@@ -103,7 +110,10 @@ function envFrom(o: GlobalOpts): NodeJS.ProcessEnv {
   if (o.account) env.HEDGEHOOD_ACCOUNT = o.account;
   if (o.underlying) env.HEDGEHOOD_UNDERLYING = o.underlying;
   if (o.sessionKeyFile) env.HEDGEHOOD_SESSION_KEY_FILE = o.sessionKeyFile;
-  else if (!env.HEDGEHOOD_SESSION_KEY_FILE && !env.HEDGEHOOD_SESSION_KEY && existsSync(expand(DEFAULT_SESSION_KEY_FILE))) env.HEDGEHOOD_SESSION_KEY_FILE = DEFAULT_SESSION_KEY_FILE;
+  if (o.payerKeyFile) env.HEDGEHOOD_PAYER_KEY_FILE = o.payerKeyFile;
+  env = withSettings(env);
+  if (!env.HEDGEHOOD_SESSION_KEY_FILE && !env.HEDGEHOOD_SESSION_KEY && existsSync(homeFile(env, "session.key"))) env.HEDGEHOOD_SESSION_KEY_FILE = homeFile(env, "session.key");
+  if (!env.HEDGEHOOD_PAYER_KEY_FILE && !env.HEDGEHOOD_PAYER_KEY && existsSync(homeFile(env, "payer.key"))) env.HEDGEHOOD_PAYER_KEY_FILE = homeFile(env, "payer.key");
   if (o.ownerKeyFile) env.HEDGEHOOD_OWNER_KEY_FILE = o.ownerKeyFile;
   if (o.vaultApiUrl) env.HEDGEHOOD_VAULT_API_URL = o.vaultApiUrl;
   return env;
@@ -122,7 +132,7 @@ function ctxFrom(cmd: Command, readOnly = false): KitContext {
 /** The overview needs an address only, even when unrelated trading keys are configured. */
 function dashboardContext(cmd: Command): KitContext {
   const env = envFrom(cmd.optsWithGlobals() as GlobalOpts);
-  for (const name of ["HEDGEHOOD_SESSION_KEY", "HEDGEHOOD_SESSION_KEY_FILE", "HEDGEHOOD_OWNER_KEY", "HEDGEHOOD_OWNER_KEY_FILE"]) delete env[name];
+  for (const name of ["HEDGEHOOD_SESSION_KEY", "HEDGEHOOD_SESSION_KEY_FILE", "HEDGEHOOD_OWNER_KEY", "HEDGEHOOD_OWNER_KEY_FILE", "HEDGEHOOD_PAYER_KEY", "HEDGEHOOD_PAYER_KEY_FILE"]) delete env[name];
   if (!env.HEDGEHOOD_ACCOUNT) throw new Error("dashboard needs --account <address> or HEDGEHOOD_ACCOUNT; no private key is required");
   return createContext(loadConfig(env));
 }
@@ -341,11 +351,150 @@ function quoteHuman(q: VerifiedQuote, underlying: string, qty: bigint, uiMultipl
   ].join("\n");
 }
 
+/** Injectable for tests: the chain reads `init`, `status` and `--wait` make. */
+export const initDeps: { chainReader: (chainId: number, rpcUrl?: string) => ChainReader; sampleTimeoutMs: number } = { chainReader, sampleTimeoutMs: 8000 };
+
+interface InitOpts {
+  withPayer?: boolean;
+  markets?: string;
+  maxSpend?: string;
+  days?: string;
+  siteUrl?: string;
+  wait?: boolean;
+  timeout: string;
+  interval: string;
+  qr?: boolean;
+}
+
+interface InitSetup {
+  chainId: number;
+  settingsFile?: string;
+  account?: Address;
+  session: { path: string; address: Address; created: boolean };
+  payer?: { path: string; address: Address; created: boolean; usdgRaw?: bigint };
+  link: string;
+  mcp: ReturnType<typeof mcpSnippets>;
+  view?: AccountView;
+  reader: ChainReader;
+}
+
+/** The x402 deposit token: USDG on mainnet, the testnet's TestUSD (no value). */
+const tokenName = (chainId: number) => (chainId === 4663 ? "USDG" : "TestUSD");
+
+const useAnsi = () => !!process.stdout.isTTY && !process.env.NO_COLOR;
+
+async function initSetup(env: NodeJS.ProcessEnv, opts: InitOpts): Promise<InitSetup> {
+  if (env.HEDGEHOOD_SESSION_KEY?.trim() || env.HEDGEHOOD_PAYER_KEY?.trim()) throw new Error("init manages key files: unset HEDGEHOOD_SESSION_KEY / HEDGEHOOD_PAYER_KEY (or point --session-key-file / --payer-key-file at a file)");
+  const chainId = Number(env.HEDGEHOOD_CHAIN_ID ?? DEFAULT_CHAIN_ID);
+  if (chainId !== 46630 && chainId !== 4663) throw new Error(`chain must be 46630 or 4663, got ${env.HEDGEHOOD_CHAIN_ID}`);
+  const account = env.HEDGEHOOD_ACCOUNT?.trim() || undefined;
+  if (account && !/^0x[0-9a-fA-F]{40}$/.test(account)) throw new Error(`--account must be the owner's wallet address, got ${account}`);
+  const markets = parseMarkets(opts.markets, chainId);
+  const days = opts.days === undefined ? undefined : Number(opts.days);
+  const session = ensureKeyFile(expand(env.HEDGEHOOD_SESSION_KEY_FILE ?? homeFile(env, "session.key")));
+  const payerPath = env.HEDGEHOOD_PAYER_KEY_FILE ? expand(env.HEDGEHOOD_PAYER_KEY_FILE) : opts.withPayer ? homeFile(env, "payer.key") : undefined;
+  const payer = payerPath ? ensureKeyFile(payerPath) : undefined;
+  if (account && account.toLowerCase() === session.address.toLowerCase()) throw new Error("--account is the owner's own wallet, not the agent's session key");
+  if (account && payer && account.toLowerCase() === payer.address.toLowerCase()) throw new Error("--account is the owner's own wallet, not the agent's payment wallet");
+  const link = ownerLink({ siteUrl: opts.siteUrl ?? env.HEDGEHOOD_SITE_URL, agent: session.address, chainId, markets, maxSpend: opts.maxSpend, days });
+  const settingsFile = settingsPath(env);
+  if (settingsFile) writeSettings(settingsFile, { chainId, account: account as Address | undefined, sessionKeyFile: session.path, payerKeyFile: payer?.path, siteUrl: opts.siteUrl });
+  const mcp = mcpSnippets({ chainId, sessionKeyFile: session.path, payerKeyFile: payer?.path, account: account as Address | undefined, hostedMcpUrl: getDeployment(chainId).api.mcp });
+  const reader = initDeps.chainReader(chainId, env.HEDGEHOOD_RPC_URL);
+  const [usdgRaw, view] = await Promise.all([payer ? reader.usdgBalance(payer.address).catch(() => undefined) : undefined, account ? reader.accountView(account as Address, session.address).catch(() => undefined) : undefined]);
+  return { chainId, settingsFile, account: account as Address | undefined, session, payer: payer ? { ...payer, usdgRaw } : undefined, link, mcp, view, reader };
+}
+
+const indent = (text: string, pad: string) => text.split("\n").map((l) => pad + l).join("\n");
+
+function initHuman(s: InitSetup, showQr: boolean): string {
+  const ansi = useAnsi();
+  const code = (payload: string) => (showQr ? [indent(qr(payload, { ansi }).text, "   ")] : []);
+  const net = s.chainId === 4663 ? "Robinhood Chain mainnet (4663)" : "Robinhood Chain testnet (46630)";
+  const lines = [
+    `Hedgehood agent setup on ${net}`,
+    "",
+    "1) Agent session key: trades for the owner within the budget the owner signs; it cannot withdraw",
+    `   ${s.session.created ? "created" : "using"} ${s.session.path} (chmod 600; never share or commit it)`,
+    `   address ${s.session.address}`,
+    ...code(s.session.address),
+  ];
+  if (s.payer) {
+    lines.push(
+      "",
+      "2) Agent payment wallet: pays x402 deposits into the owner's market balances, nothing else",
+      `   ${s.payer.created ? "created" : "using"} ${s.payer.path} (chmod 600)`,
+      `   address ${s.payer.address}`,
+      `   ${tokenName(s.chainId)} balance ${s.payer.usdgRaw === undefined ? "unavailable (chain read failed)" : formatUsdg(s.payer.usdgRaw)}`,
+      `   fund it: send ${tokenName(s.chainId)} on Robinhood Chain (${s.chainId}) to this address. No ETH needed: an x402 deposit is an`,
+      "   EIP-3009 signature; the facilitator submits it and pays the gas.",
+      "   then: hedgehood deposit 25 --market NVDA --send  (credited to the owner's NVDA balance; 1 to 1000 USDG per",
+      "   deposit, 5000 per account per day)",
+      ...code(s.payer.address),
+    );
+  }
+  lines.push(
+    "",
+    `${s.payer ? "3" : "2"}) Owner: authorize the agent once, from your own wallet`,
+    `   owner account ${s.account ?? "not set: re-run with --account 0xYourWallet (saved for the CLI and the MCP server)"}`,
+    "   open this where your wallet is (or scan it with the wallet's browser), pick markets, budget and days, sign:",
+    `   ${s.link}`,
+    ...code(s.link),
+    "   Session keys are per market; the owner can revoke them any time and withdraws on the site (the key cannot).",
+    "",
+    `${s.payer ? "4" : "3"}) Connect the agent (MCP)`,
+    "   Claude Code:",
+    `     ${s.mcp.claudeCode}`,
+    "   Claude Desktop (claude_desktop_config.json) / Cursor (.cursor/mcp.json):",
+    indent(JSON.stringify(s.mcp.json, null, 2), "     "),
+    `   Hosted, read-only (no keys): ${s.mcp.hosted}`,
+    `     ${s.mcp.hostedClaudeCode}`,
+  );
+  if (s.view) lines.push("", "Markets (this session key):", ...marketStatusLines(s.view).map((l) => `   ${l}`));
+  lines.push("", `Saved ${s.settingsFile ?? "nothing (HEDGEHOOD_CONFIG=off)"} (no secrets). \`hedgehood status\` shows this again; \`hedgehood init --wait\` waits for the owner.`);
+  return lines.join("\n");
+}
+
+function initJson(s: InitSetup) {
+  return { chainId: s.chainId, settingsFile: s.settingsFile ?? null, account: s.account ?? null, session: s.session, payer: s.payer ?? null, ownerLink: s.link, mcp: s.mcp, authorized: s.view ? authorizedMarkets(s.view) : null, markets: s.view?.markets ?? null };
+}
+
+async function waitFor(s: InitSetup, timeoutMs: number, intervalMs: number, say: (t: string) => void) {
+  if (!(timeoutMs > 0) || !(intervalMs > 0)) throw new Error("--timeout and --interval must be positive seconds");
+  const ac = new AbortController();
+  const onInt = () => ac.abort();
+  process.once("SIGINT", onInt);
+  let last = "";
+  say(`\nwaiting for the owner to authorize ${s.session.address} (every ${intervalMs / 1000}s, up to ${Math.round(timeoutMs / 1000)}s; Ctrl-C stops, nothing is sent)`);
+  try {
+    const r = await waitForAuthorization({
+      read: () => s.reader.accountView(s.account!, s.session.address),
+      intervalMs,
+      timeoutMs,
+      signal: ac.signal,
+      onTick: (v, e) => {
+        const now = v ? marketStatusLines(v).join("\n") : `read failed: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`;
+        if (now !== last) say(indent(now, "   "));
+        last = now;
+      },
+    });
+    if (r.status === "ready") {
+      const first = r.view!.markets.find((m) => r.authorized.includes(m.underlying) && m.freeCollateralRaw > 0n)?.underlying ?? r.authorized[0]!;
+      const sample = s.reader.sampleInstrument ? await Promise.race([s.reader.sampleInstrument(first).catch(() => undefined), new Promise<undefined>((res) => (setTimeout(res, initDeps.sampleTimeoutMs) as unknown as { unref?: () => void }).unref?.())]) : undefined;
+      say(["", ...readyLines(r.view!, sample)].join("\n"));
+    } else if (r.status === "timeout") say(`\nnot authorized after ${Math.round(timeoutMs / 1000)}s. The owner opens ${s.link}; check again with \`hedgehood status\` or \`hedgehood init --wait\`.`);
+    else say("\nstopped waiting; nothing was changed. `hedgehood status` checks again.");
+    return r;
+  } finally {
+    process.removeListener("SIGINT", onInt);
+  }
+}
+
 export function buildProgram(): Command {
   const program = new Command("hedgehood")
     .description("Hedgehood AI-agent options market on Robinhood Chain. Sends are DRY RUN unless --send is given.")
-    .version("0.5.0")
-    .option("--chain <id>", "46630 (testnet) or 4663 (mainnet)", process.env.HEDGEHOOD_CHAIN_ID ?? String(DEFAULT_CHAIN_ID))
+    .version("0.5.1")
+    .option("--chain <id>", `46630 (testnet) or 4663 (mainnet); default HEDGEHOOD_CHAIN_ID, else the chain saved by \`init\` (~/.hedgehood/config.json), else ${DEFAULT_CHAIN_ID}`)
     .option("--testnet", `use the Robinhood testnet (46630) deployment${DEFAULT_CHAIN_ID === 46630 ? " (default)" : ""}`)
     .option("--mainnet", `use Robinhood Chain mainnet (4663, real USDG)${DEFAULT_CHAIN_ID === 4663 ? " (default)" : ""}`)
     .option("--rpc <url>", "RPC URL override")
@@ -356,6 +505,7 @@ export function buildProgram(): Command {
     .option("--underlying <ticker>", "NVDA")
     .option("--session-key-file <path>", `session key file (default ${DEFAULT_SESSION_KEY_FILE} when present)`)
     .option("--owner-key-file <path>", "owner key file, only for deposit/withdraw/session/join and every vault action")
+    .option("--payer-key-file <path>", `agent payment wallet for x402 deposits (default ${DEFAULT_PAYER_KEY_FILE} when present; \`init --with-payer\` creates it)`)
     .option("--vault-api-url <url|off>", "Stock Yield fund snapshot API for `vaults` (default: hedgehood.app on mainnet; off = chain only)")
     .option("--json", "machine-readable output")
     .option("--ascii", "ASCII tables for markets, positions and P&L (same renderer as the MCP dashboard)");
@@ -371,7 +521,7 @@ export function buildProgram(): Command {
     .action(async (opts: { days: string; maxSpend?: string; maxShortRisk: string; maxRequirement?: string; send?: boolean }, cmd: Command) => {
       if (opts.maxRequirement !== undefined) throw new Error(MAX_REQUIREMENT_GONE);
       const g = cmd.optsWithGlobals() as GlobalOpts;
-      const file = expand(g.sessionKeyFile ?? process.env.HEDGEHOOD_SESSION_KEY_FILE ?? DEFAULT_SESSION_KEY_FILE);
+      const file = expand(g.sessionKeyFile ?? process.env.HEDGEHOOD_SESSION_KEY_FILE ?? homeFile(process.env, "session.key"));
       let created = false;
       if (!existsSync(file) && !process.env.HEDGEHOOD_SESSION_KEY) {
         mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
@@ -410,6 +560,70 @@ export function buildProgram(): Command {
       process.stdout.write(lines.join("\n") + "\n");
       const tx = ctx.market("owner").authorizeSession(session.address, Math.floor(Date.now() / 1000) + Number(opts.days) * 86400, { trade: true, cancel: true, maxShortRisk, maxSpend });
       await send(cmd, ctx, "owner", tx, opts.send);
+    });
+
+  program
+    .command("init")
+    .description("Connect an agent to an owner's account (mode A): create the agent's session key (and with --with-payer a payment wallet for x402 deposits), print addresses + QR codes, the owner's authorize link, the MCP config, and save the settings; --wait until the owner authorizes")
+    .option("--with-payer", `also create the agent payment wallet (${DEFAULT_PAYER_KEY_FILE}): it only pays x402 deposits into the owner's market balances`)
+    .option("--markets <tickers>", "markets to preselect on the authorize page, comma-separated (NVDA,TSLA); default: the page's choice")
+    .option("--max-spend <usdg>", "suggested spend budget for the authorize page (USDG)")
+    .option("--days <n>", "suggested session validity for the authorize page (days)")
+    .option("--site-url <url>", `site hosting the authorize page (default HEDGEHOOD_SITE_URL, else ${DEFAULT_SITE_URL}); saved when given`)
+    .option("--wait", "poll the chain until the owner has authorized the session key on at least one market")
+    .option("--timeout <seconds>", "--wait: give up after this long", "900")
+    .option("--interval <seconds>", "--wait: seconds between polls", "10")
+    .option("--no-qr", "skip the QR codes")
+    .action(async (opts: InitOpts, cmd: Command) => {
+      const g = cmd.optsWithGlobals() as GlobalOpts;
+      const env = envFrom(g);
+      const s = await initSetup(env, opts);
+      const say = (t: string) => (g.json ? undefined : process.stdout.write(t + "\n"));
+      say(initHuman(s, opts.qr !== false));
+      if (!opts.wait) {
+        if (g.json) out(cmd, initJson(s));
+        return;
+      }
+      if (!s.account) throw new Error("--wait needs the owner address: hedgehood init --account 0xYourWallet --wait");
+      const r = await waitFor(s, Number(opts.timeout) * 1000, Number(opts.interval) * 1000, say);
+      if (g.json) out(cmd, { ...initJson(s), wait: { status: r.status, authorized: r.authorized, polls: r.polls, markets: r.view?.markets } });
+      if (r.status !== "ready") process.exitCode = r.status === "aborted" ? 130 : 1;
+    });
+
+  program
+    .command("status")
+    .description("The agent setup: owner account, session key, payment wallet (USDG), and per market the authorization, budget left, expiry and balance; --qr re-prints the QR codes")
+    .option("--qr", "re-print the QR codes (owner link, session key, payment wallet)")
+    .option("--site-url <url>", `site hosting the authorize page (default HEDGEHOOD_SITE_URL, else ${DEFAULT_SITE_URL})`)
+    .action(async (opts: { qr?: boolean; siteUrl?: string }, cmd: Command) => {
+      const g = cmd.optsWithGlobals() as GlobalOpts;
+      const env = envFrom(g);
+      const cfg = loadConfig(env);
+      const session = cfg.sessionKey ? privateKeyToAccount(cfg.sessionKey).address : undefined;
+      const payer = cfg.payerKey ? privateKeyToAccount(cfg.payerKey).address : undefined;
+      const account = cfg.account;
+      const reader = initDeps.chainReader(cfg.chainId, cfg.rpcUrl);
+      const [payerUsdgRaw, view] = await Promise.all([payer ? reader.usdgBalance(payer).catch(() => undefined) : undefined, account && session ? reader.accountView(account, session).catch(() => undefined) : undefined]);
+      const link = session ? ownerLink({ siteUrl: opts.siteUrl ?? env.HEDGEHOOD_SITE_URL, agent: session, chainId: cfg.chainId }) : undefined;
+      const ansi = useAnsi();
+      const lines = [
+        `chain ${cfg.chainId} (${cfg.chainId === 4663 ? "mainnet" : "testnet"})  settings ${settingsPath(env) ?? "off"}`,
+        `owner account   ${account ?? "not set: hedgehood init --account 0xYourWallet"}`,
+        `session key     ${session ? `${session}  (${env.HEDGEHOOD_SESSION_KEY_FILE ?? "HEDGEHOOD_SESSION_KEY"})` : "none: run hedgehood init"}`,
+        `payment wallet  ${payer ? `${payer}  ${tokenName(cfg.chainId)} ${payerUsdgRaw === undefined ? "unavailable" : formatUsdg(payerUsdgRaw)}  (${env.HEDGEHOOD_PAYER_KEY_FILE ?? "HEDGEHOOD_PAYER_KEY"})` : "none (hedgehood init --with-payer creates one)"}`,
+      ];
+      if (view) {
+        lines.push("markets:", ...marketStatusLines(view).map((l) => `  ${l}`));
+        const auth = authorizedMarkets(view);
+        lines.push(auth.length ? `authorized on ${auth.join(" ")}` : `not authorized yet: the owner opens ${link}`);
+      } else if (account && session) lines.push("markets: chain read failed (try again, or --rpc <url>)");
+      if (link) lines.push(`owner link      ${link}`);
+      if (opts.qr) {
+        if (link) lines.push("", "owner link (scan with the wallet's browser):", qr(link, { ansi }).text);
+        if (session) lines.push("", `session key ${session}:`, qr(session, { ansi }).text);
+        if (payer) lines.push("", `payment wallet ${payer} (send ${tokenName(cfg.chainId)} on Robinhood Chain ${cfg.chainId}):`, qr(payer, { ansi }).text);
+      }
+      out(cmd, { chainId: cfg.chainId, settingsFile: settingsPath(env) ?? null, account: account ?? null, sessionKey: session ?? null, sessionKeyFile: env.HEDGEHOOD_SESSION_KEY_FILE ?? null, payer: payer ?? null, payerKeyFile: env.HEDGEHOOD_PAYER_KEY_FILE ?? null, payerUsdgRaw: payerUsdgRaw ?? null, ownerLink: link ?? null, authorized: view ? authorizedMarkets(view) : null, markets: view?.markets ?? null }, lines.join("\n"));
     });
 
   program
@@ -641,7 +855,7 @@ export function buildProgram(): Command {
 
   program
     .command("deposit")
-    .description("Deposit USDG into one market's balance (--market, default --underlying): --x402 through the gateway (default), or --wallet approve+deposit from the owner wallet. Balances are per market: a session key fills from the balance of the market it trades only")
+    .description("Deposit USDG into one market's balance (--market, default --underlying): --x402 through the gateway (default; paid by the agent payment wallet when configured, else the owner key, else the session key; gasless, it only signs), or --wallet approve+deposit from the owner wallet. Balances are per market: a session key fills from the balance of the market it trades only")
     .argument("<amount>", "USDG")
     .option("--market <id>", "market to credit: ticker (GOOGL) or market address")
     .option("--x402", "pay through the x402 deposit gateway (default)")
@@ -659,7 +873,7 @@ export function buildProgram(): Command {
         await runSteps(cmd, m, plan, [plan.summary], { market: m.deployment.underlying, account: ctx.account }, opts.send);
         return;
       }
-      const payer = ctx.owner ?? requireSession(ctx);
+      const payer = x402Payer(ctx) ?? requireSession(ctx);
       const target = ctx.marketFor(opts.market, "none").deployment;
       const r = await depositViaGateway({ account: ctx.account, market: target.market, amountRaw }, { signer: payer, chainId: ctx.chainId, gatewayUrl: ctx.config.gatewayUrl, dryRun: !opts.send, maxAmountRaw: parseUsdg(ctx.config.maxDepositUsdg) });
       out(cmd, r, r.dryRun ? `DRY RUN: gateway asks ${formatUsdg(BigInt(r.requirement!.amount))} USDG from ${payer.address} to ${r.requirement!.payTo} (fee ${formatUsdg(BigInt(r.instructions!.fee.raw))}); add --send to pay` : `paid; gateway deposit status ${r.deposit?.status}${r.depositTxHash ? ` tx ${r.depositTxHash}` : ""}  settlement ${JSON.stringify(r.settlement)}`);

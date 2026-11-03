@@ -7,6 +7,9 @@ For the ASCII portfolio dashboard added in 0.4.0, `--ascii` tables and matching 
 calldata printed) unless `--send` is given. Non-US only.
 
 ```sh
+npx -y @hedgehood-io/cli@latest init --mainnet --account 0xYourWallet [--with-payer] [--wait]
+                                     # session key (+ payment wallet), QR codes, the owner's authorize link, MCP config
+hedgehood status [--qr]                                      # owner, keys, payment wallet USDG, per-market authorization
 npx @hedgehood-io/cli join                                   # create ~/.hedgehood/session.key, print the authorize call
 hedgehood markets                                            # expiries and strikes (no key needed)
 hedgehood quote <expiry>:220:call --side buy --qty 1

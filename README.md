@@ -20,9 +20,49 @@ RFQ maker and filled on chain with a **session key that can never withdraw**.
 |---|---|---|
 | [`@hedgehood-io/sdk`](packages/sdk) | viem-based TypeScript SDK: deployments, ABIs, instrument ids, EIP-712 orders, `fillOrderAs` calldata, RFQ client with local quote verification, `closePosition`, one-account view and funding plans across markets (`readAccount`, `planFillFunding`, `planRebalance`), P&L and history readers, x402 USDG payer, ERC-8004 helpers, `VaultClient` for the Stock Yield vaults, `LendingClient` for share lending (lend USDG / borrow against fund shares) | `pnpm add @hedgehood-io/sdk viem` |
 | [`@hedgehood-io/mcp`](packages/mcp) | local MCP server (stdio + streamable HTTP) signing with the agent's key; 37 tools (23 market + 6 vault + 8 lending), every write needs `confirm: true` and is a dry run by default | `npx -y @hedgehood-io/mcp` |
-| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `join`, `account`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw [--all]`, `rebalance`, `session authorize\|revoke\|status`, `vaults`, `vault status\|deposit\|redeem\|claim\|cancel`, `lend status\|deposit\|withdraw`, `borrow status\|collateral\|take\|repay\|withdraw-collateral` | `npx @hedgehood-io/cli --help` |
+| [`@hedgehood-io/cli`](packages/cli) | `hedgehood` binary: `init`, `status`, `join`, `account`, `deposit`, `quote`, `fill`, `close`, `positions`, `pnl`, `history`, `redeem`, `withdraw [--all]`, `rebalance`, `session authorize\|revoke\|status`, `vaults`, `vault status\|deposit\|redeem\|claim\|cancel`, `lend status\|deposit\|withdraw`, `borrow status\|collateral\|take\|repay\|withdraw-collateral` | `npx @hedgehood-io/cli --help` |
 | [`skills/hedgehood-options`](skills/hedgehood-options/SKILL.md) | the skill an agent reads: market model, the loop, the Stock Yield vaults, share lending, key hygiene, troubleshooting | `/plugin marketplace add 0xHedgeHood/hedgehood-agent-kit` |
 | [`examples/`](examples) | a 30-line "agent buys a weekly call" script and an MCP config snippet | `pnpm tsx examples/buy-weekly-call.ts` |
+
+## Connect an agent in 2 minutes
+
+You keep the account in your own wallet (for example a browser wallet on hedgehood.io). The agent gets a **session key**
+with a budget you sign: it can trade, it can never withdraw. Optionally it also gets a small **payment wallet** that
+tops up your market balances over x402.
+
+**Agent machine, one command** (Node 20+):
+
+```sh
+npx -y @hedgehood-io/cli@latest init --mainnet --account 0xYourWallet --with-payer
+# or: curl -fsSL https://raw.githubusercontent.com/0xHedgeHood/hedgehood-agent-kit/main/scripts/install.sh | sh -s -- --mainnet --account 0xYourWallet --with-payer
+```
+
+It creates `~/.hedgehood/session.key` (and with `--with-payer` `~/.hedgehood/payer.key`), mode 600, only if missing;
+prints each address with a QR code, the payment wallet's USDG balance, your authorize link (with its QR code) and the
+MCP config for Claude Code, Claude Desktop / Cursor and the hosted read-only server; and saves the non-secret
+settings (chain, owner, key paths) to `~/.hedgehood/config.json`, so later `hedgehood` and `hedgehood-mcp` runs need
+no flags (flags > environment > that file). Private keys are never printed.
+
+**Owner, once:** open the link on the device with your wallet, or scan its QR code with the wallet's browser:
+
+```
+https://hedgehood.io/options/account?agent=<session key address>&chain=4663[&markets=NVDA,TSLA][&maxSpend=100][&days=30]
+```
+
+pick the markets, the spend budget and the days, and sign (session keys are per market). Pass `--markets`,
+`--max-spend` and `--days` to `init` to prefill them; `--site-url` (or `HEDGEHOOD_SITE_URL`) changes the site; on the
+testnet the link says `chain=46630`.
+
+**Done:** `hedgehood init --wait` (or `hedgehood status`) shows per market whether the key is authorized, the budget
+left, the expiry and the balance, and prints `READY` with a first quote + buy of one share. `hedgehood status --qr`
+prints the QR codes again. (Without a global install, `hedgehood` is `npx -y @hedgehood-io/cli`; or
+`npm i -g @hedgehood-io/cli`.)
+
+Funding: you deposit on the site, or send USDG on Robinhood Chain to the payment wallet and let the agent pay a
+deposit in (`hedgehood deposit 25 --market NVDA --send`, or the MCP tool `deposit_x402`). The payment wallet needs
+**no ETH**: an x402 deposit is an EIP-3009 signature that the facilitator submits. The gateway takes 1 to 1,000 USDG per
+deposit and 5,000 per account per day. Week-1 limits: 2 shares per option, 2.5 per underlying, opening premium at
+least 5 USDG, quotes in US regular hours.
 
 ## Quickstart (testnet, 5 minutes)
 
@@ -166,6 +206,9 @@ oracle migration (new market id) needs no kit release; `--market <id>` / `market
 - **Claude Desktop / Cursor / Windsurf / OpenClaw**: paste the JSON above into the host's MCP config. Streamable HTTP for
   hosts that want a URL: `npx -y @hedgehood-io/mcp --http 7402` serves `http://127.0.0.1:7402/mcp` (localhost only; it signs).
 - `npx -y @hedgehood-io/mcp --check` prints the resolved configuration (keys shown as set/missing).
+- `HEDGEHOOD_PAYER_KEY_FILE` (optional) is the agent payment wallet: `deposit_x402` pays from it before the owner key
+  and the session key. Variables left unset fall back to `~/.hedgehood/config.json` (`hedgehood init`;
+  `HEDGEHOOD_CONFIG=<path|off>`, `HEDGEHOOD_HOME` for the directory).
 
 Tools: `list_markets`, `list_instruments`, `get_mark`, `get_quote`, `fill_quote`, `close_position`, `get_account` (every
 market at once), `deposit` (owner wallet into one market), `rebalance` (between markets, owner key), `deposit_x402`,

@@ -21,6 +21,8 @@ import { DEFAULT_CHAIN_ID } from "@hedgehood-io/sdk";
  *   HEDGEHOOD_SESSION_KEY       the key itself (prefer the file)
  *   HEDGEHOOD_OWNER_KEY_FILE    optional owner key for deposit / withdraw / authorize_session / register_agent, or
  *   HEDGEHOOD_OWNER_KEY         (keep the owner key offline where you can; the session key is enough to trade)
+ *   HEDGEHOOD_PAYER_KEY_FILE    optional agent payment wallet (`hedgehood init --with-payer`): pays x402 deposits into
+ *   HEDGEHOOD_PAYER_KEY         the account's market balances, nothing else (EIP-3009: it only signs, holds USDG, no ETH)
  *   HEDGEHOOD_DRY_RUN           "false" to make sends real by default (tools still need confirm: true)
  *   HEDGEHOOD_MAX_DEPOSIT       cap per x402 deposit, USDG (default 1000)
  *   HEDGEHOOD_VAULT_API_URL     Stock Yield fund snapshot API for list_vaults (default: the chain's registry entry,
@@ -36,6 +38,8 @@ export interface KitConfig {
   account?: Address;
   sessionKey?: Hex;
   ownerKey?: Hex;
+  /** The agent payment wallet: pays x402 deposits (before the owner key and the session key). */
+  payerKey?: Hex;
   dryRunDefault: boolean;
   maxDepositUsdg: string;
   /** Stock Yield fund snapshot API; `false` = chain reads only. Undefined = the chain's registry default (mainnet only). */
@@ -101,6 +105,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): KitConfig {
     account: account as Address | undefined,
     sessionKey: keyFrom(env, "HEDGEHOOD_SESSION_KEY_FILE", "HEDGEHOOD_SESSION_KEY"),
     ownerKey: keyFrom(env, "HEDGEHOOD_OWNER_KEY_FILE", "HEDGEHOOD_OWNER_KEY"),
+    payerKey: keyFrom(env, "HEDGEHOOD_PAYER_KEY_FILE", "HEDGEHOOD_PAYER_KEY"),
     dryRunDefault: (envValue(env, "HEDGEHOOD_DRY_RUN") ?? "true").toLowerCase() !== "false",
     maxDepositUsdg: envValue(env, "HEDGEHOOD_MAX_DEPOSIT") ?? "1000",
     vaultApiUrl: vaultApi === undefined ? undefined : /^(off|false|0|none)$/i.test(vaultApi) ? false : vaultApi,
@@ -119,8 +124,78 @@ export function describeConfig(cfg: KitConfig): Record<string, unknown> {
     account: cfg.account ?? "(derived from keys)",
     sessionKey: cfg.sessionKey ? "set" : "missing",
     ownerKey: cfg.ownerKey ? "set" : "missing",
+    payerKey: cfg.payerKey ? "set" : "missing",
     dryRunDefault: cfg.dryRunDefault,
     maxDepositUsdg: cfg.maxDepositUsdg,
     vaultApiUrl: cfg.vaultApiUrl === false ? "off (chain only)" : (cfg.vaultApiUrl ?? "(registry default)"),
   };
+}
+
+/**
+ * Non-secret settings `hedgehood init` saves in `~/.hedgehood/config.json` (HEDGEHOOD_CONFIG overrides the path,
+ * "off" disables it), so the CLI and the MCP server find the account, chain and key files without flags. Precedence:
+ * flags > environment > this file > built-in defaults. It never holds a private key: only paths to key files.
+ */
+export interface SettingsFile {
+  chainId?: number;
+  account?: Address;
+  sessionKeyFile?: string;
+  payerKeyFile?: string;
+  siteUrl?: string;
+  underlying?: string;
+}
+
+/** The kit's home directory: HEDGEHOOD_HOME, default ~/.hedgehood. */
+export function hedgehoodHome(env: NodeJS.ProcessEnv = process.env): string {
+  return resolve(expandHome(envValue(env, "HEDGEHOOD_HOME") ?? "~/.hedgehood"));
+}
+
+export function expandHome(p: string): string {
+  return p === "~" ? homedir() : p.startsWith("~/") ? resolve(homedir(), p.slice(2)) : resolve(p);
+}
+
+/** The settings file path, or undefined when HEDGEHOOD_CONFIG is "off". */
+export function settingsPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const v = envValue(env, "HEDGEHOOD_CONFIG");
+  if (v && /^(off|false|0|none)$/i.test(v)) return undefined;
+  return v ? expandHome(v) : resolve(hedgehoodHome(env), "config.json");
+}
+
+/** Reads the settings file; {} when it does not exist. Throws on a file that is not a JSON object. */
+export function readSettings(path: string | undefined): SettingsFile {
+  if (!path) return {};
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return {};
+  }
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    throw new Error(`settings file ${path} is not valid JSON`);
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error(`settings file ${path} is not a JSON object`);
+  return v as SettingsFile;
+}
+
+/**
+ * The environment with the settings file filled in where the environment is silent. A key given in the environment
+ * (file or raw) always wins over the file's key path.
+ */
+export function withSettings(env: NodeJS.ProcessEnv = process.env, settings: SettingsFile = readSettings(settingsPath(env))): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  const fill = (name: string, v: unknown, unlessAlso?: string) => {
+    if (v === undefined || v === null || v === "") return;
+    if (envValue(out, name) !== undefined || (unlessAlso && envValue(out, unlessAlso) !== undefined)) return;
+    out[name] = String(v);
+  };
+  fill("HEDGEHOOD_CHAIN_ID", settings.chainId);
+  fill("HEDGEHOOD_ACCOUNT", settings.account);
+  fill("HEDGEHOOD_SESSION_KEY_FILE", settings.sessionKeyFile, "HEDGEHOOD_SESSION_KEY");
+  fill("HEDGEHOOD_PAYER_KEY_FILE", settings.payerKeyFile, "HEDGEHOOD_PAYER_KEY");
+  fill("HEDGEHOOD_SITE_URL", settings.siteUrl);
+  fill("HEDGEHOOD_UNDERLYING", settings.underlying);
+  return out;
 }

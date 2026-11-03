@@ -52,7 +52,7 @@ describe("hedgehood cli", () => {
   it("registers the documented commands", () => {
     const p = buildProgram();
     const names = p.commands.map((c) => c.name()).sort();
-    expect(names).toEqual(["account", "borrow", "close", "dashboard", "decode", "deposit", "faucet", "fill", "history", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "rebalance", "redeem", "register", "session", "vault", "vaults", "withdraw"]);
+    expect(names).toEqual(["account", "borrow", "close", "dashboard", "decode", "deposit", "faucet", "fill", "history", "init", "instruments", "join", "lend", "markets", "pnl", "positions", "quote", "rebalance", "redeem", "register", "session", "status", "vault", "vaults", "withdraw"]);
     const lend = p.commands.find((c) => c.name() === "lend")!;
     expect(lend.commands.map((c) => c.name()).sort()).toEqual(["deposit", "status", "withdraw"]);
     const borrow = p.commands.find((c) => c.name() === "borrow")!;
