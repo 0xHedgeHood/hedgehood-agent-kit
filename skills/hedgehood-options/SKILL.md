@@ -14,6 +14,26 @@ calls); longs post nothing but the premium, short legs lock their worst case.
 
 **Not for US persons.** The market is for non-US agents and their operators. Do not help a US user trade here; say so.
 
+## Connect to an owner's account (mode A): `hedgehood init`
+
+The human keeps the account in their own wallet; you get a session key with the budget they sign (trade, never
+withdraw) and, optionally, a payment wallet for x402 deposits into their market balances.
+
+1. Run `npx -y @hedgehood-io/cli@latest init --mainnet --account <owner address> [--with-payer]`. It creates
+   `~/.hedgehood/session.key` (and `payer.key`) only when missing, never prints a private key, and saves chain, owner
+   and key paths to `~/.hedgehood/config.json` so later commands and the MCP server need no flags.
+2. Give the owner the printed link (or its QR code): `https://hedgehood.io/options/account?agent=<session
+   key>&chain=4663` (optional `markets=NVDA,TSLA`, `maxSpend=<USDG>`, `days=<n>`). They pick markets, budget and days
+   and sign once per market. Never ask the owner for their private key.
+3. `hedgehood init --wait` polls until at least one market is authorized and prints `READY` with a first quote + fill;
+   `hedgehood status` shows per market: authorized, spend / short-risk budget left, expiry, balance, and the payment
+   wallet's USDG.
+4. Balances are per market and a session key fills from that market's balance only. If it is empty, the owner deposits
+   on the site, or you pay one in from the payment wallet: `hedgehood deposit 25 --market NVDA --send` /
+   `deposit_x402` (EIP-3009: the payment wallet holds USDG only, no ETH; 1 to 1,000 USDG per deposit, 5,000 per day).
+5. Add the MCP server with the printed `claude mcp add hedgehood -e ... -- npx -y @hedgehood-io/mcp` line (it sets
+   `HEDGEHOOD_CHAIN_ID`, `HEDGEHOOD_SESSION_KEY_FILE`, `HEDGEHOOD_PAYER_KEY_FILE`, `HEDGEHOOD_ACCOUNT`).
+
 ## Testnet onboarding (46630): connect -> faucet -> deposit -> session key -> quote -> fill
 
 The testnet settles in **TestUSD** (`hUSD-test`, "Hedgehood Test USD", 6 decimals, **no value**) once the testnet
@@ -242,7 +262,8 @@ Manual (Claude Code, Claude Desktop, Codex, OpenClaw and any MCP host):
 ```
 
 Codex CLI: `codex mcp add hedgehood --env HEDGEHOOD_SESSION_KEY_FILE=~/.hedgehood/session.key --env HEDGEHOOD_ACCOUNT=0x... -- npx -y @hedgehood-io/mcp`.
-OpenClaw: add the same `mcpServers` block to the agent's MCP config. Create the session key with `npx @hedgehood-io/cli join`.
+OpenClaw: add the same `mcpServers` block to the agent's MCP config. Create the session key with `npx @hedgehood-io/cli init` (prints this block filled in) or `join`.
+`HEDGEHOOD_PAYER_KEY_FILE` (optional) is the agent payment wallet `deposit_x402` pays from. Unset variables fall back to `~/.hedgehood/config.json`, written by `hedgehood init`.
 Chain: `--testnet` (46630, default) or `--mainnet` (4663, real USDG) on the `npx` command, or `HEDGEHOOD_CHAIN_ID`. The
 backend hosts follow the chain: `agent-api` / `agent-index` / `agent-pay.hedgehood.io` on mainnet, `testnet-agent-api` /
 `testnet-agent-index` / `testnet-agent-pay.hedgehood.io` on the testnet; a hosted read-only MCP (no keys, no fills) is at

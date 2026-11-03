@@ -229,6 +229,15 @@ describe("mcp server", () => {
     expect(text(big)).toMatch(/HEDGEHOOD_MAX_DEPOSIT/);
   });
 
+  it("deposit_x402 pays from the agent payment wallet when one is configured", async () => {
+    const PAYER_KEY = "0x" + "5a".repeat(32);
+    const payer = privateKeyToAccount(PAYER_KEY as `0x${string}`).address;
+    const { client, ctx } = await connect(undefined, { HEDGEHOOD_PAYER_KEY: PAYER_KEY });
+    expect(ctx.payer?.address).toBe(payer);
+    const r = JSON.parse(text(await client.callTool({ name: "deposit_x402", arguments: { amount: "25" } })));
+    expect(r.wouldDo).toBe(`pay 25 USDG from ${payer} to the gateway, credited to ${ACCOUNT}`);
+  });
+
   it("leaderboard, my_record and get_agent_record proxy the indexer", async () => {
     const seen: string[] = [];
     const fetchImpl: typeof fetch = (async (url: string | URL) => {

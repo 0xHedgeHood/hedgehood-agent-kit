@@ -18,6 +18,8 @@ export interface KitContext {
   account: Address;
   session?: LocalAccount;
   owner?: LocalAccount;
+  /** The agent payment wallet (HEDGEHOOD_PAYER_KEY_FILE): pays x402 deposits only. */
+  payer?: LocalAccount;
   rfq: RfqClient;
   /** A market client signing with the session key (trades, redeemFor) or the owner key (deposit, withdraw, sessions). */
   market: (signer?: "session" | "owner" | "none") => MarketClient;
@@ -52,6 +54,7 @@ export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; 
   const lendingDeployment = extra.lending ?? dep.lending;
   const session = config.sessionKey ? privateKeyToAccount(config.sessionKey) : undefined;
   const owner = config.ownerKey ? privateKeyToAccount(config.ownerKey) : undefined;
+  const payer = config.payerKey ? privateKeyToAccount(config.payerKey) : undefined;
   const account = config.account ?? owner?.address ?? session?.address;
   if (!account) throw new Error("no account: set HEDGEHOOD_ACCOUNT, or a session/owner key");
   const rfqOpts: ConstructorParameters<typeof RfqClient>[0] = { chainId, hosts: { ...(config.rfqUrl ? { rfq: config.rfqUrl } : {}), ...(config.indexerUrl ? { indexer: config.indexerUrl } : {}), ...(config.gatewayUrl ? { gateway: config.gatewayUrl } : {}) } };
@@ -95,6 +98,7 @@ export function createContext(config: KitConfig, extra: { fetch?: typeof fetch; 
     account,
     session,
     owner,
+    payer,
     rfq,
     market,
     markets,
@@ -137,4 +141,9 @@ export function tradeSigner(ctx: KitContext, prefer?: "session" | "owner"): Trad
   const role = signer.address.toLowerCase() === ctx.account.toLowerCase() ? "owner" : "session";
   if (pick === "owner" && role !== "owner") throw new Error(`the owner key ${signer.address} is not the trading account ${ctx.account}: it cannot fill for it`);
   return { who: pick, role, signer };
+}
+
+/** Who pays an x402 deposit: the payment wallet when configured, else the owner key, else the session key. */
+export function x402Payer(ctx: KitContext): LocalAccount | undefined {
+  return ctx.payer ?? ctx.owner ?? ctx.session;
 }

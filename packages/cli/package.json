@@ -1,6 +1,6 @@
 {
   "name": "@hedgehood-io/cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "hedgehood: command line for Hedgehood's AI-agent options market (join, deposit, quote, fill, positions, redeem, withdraw, session)",
   "license": "MIT",
   "type": "module",
@@ -35,10 +35,11 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@hedgehood-io/mcp": "workspace:*",
     "@hedgehood-io/sdk": "workspace:*",
     "commander": "^14.0.0",
-    "viem": "^2.48.11",
-    "@hedgehood-io/mcp": "workspace:*"
+    "qrcode-generator": "2.0.4",
+    "viem": "^2.48.11"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -66,7 +66,7 @@ import { formatUnits } from "viem";
 import type { Address, Chain, Hex } from "viem";
 import type { MarketClient } from "@hedgehood-io/sdk";
 import { z } from "zod";
-import { requireOwner, requireSession, tradeSigner, type KitContext, type TradeSigner } from "./context.js";
+import { requireOwner, requireSession, tradeSigner, x402Payer, type KitContext, type TradeSigner } from "./context.js";
 import { describeConfig } from "./config.js";
 
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "address").transform((s) => s as Address);
@@ -360,7 +360,7 @@ const autoDepositField = z.boolean().optional().describe("Account's own key, bal
 const approveField = z.enum(["exact", "max"]).optional().describe("When an approval is needed: exact (default, just what this fill can pull) or max (unlimited)");
 
 export function createServer(ctx: KitContext): McpServer {
-  const server = new McpServer({ name: "hedgehood-options", version: "0.5.0" });
+  const server = new McpServer({ name: "hedgehood-options", version: "0.5.1" });
   const underlying = ctx.marketDeployment?.underlying ?? "NVDA";
 
   server.registerTool(
@@ -541,14 +541,14 @@ export function createServer(ctx: KitContext): McpServer {
     "deposit_x402",
     {
       title: "Deposit USDG via x402",
-      description: "Funds your market balance through the x402 deposit gateway: signs an EIP-3009 USDG transfer from the paying key's wallet (owner key if set, else session key) and the gateway calls market.deposit(account, amount). dryRun (default true) fetches the 402 and shows what would be signed. Requires confirm: true.",
+      description: "Funds your market balance through the x402 deposit gateway: signs an EIP-3009 USDG transfer from the paying key's wallet (the agent payment wallet HEDGEHOOD_PAYER_KEY_FILE if set, else the owner key, else the session key; gasless for the payer: it only signs, the facilitator submits) and the gateway calls market.deposit(account, amount). dryRun (default true) fetches the 402 and shows what would be signed. Requires confirm: true.",
       inputSchema: { amount: decimalAmount.describe("USDG, e.g. \"25\""), market: marketField, confirm: confirmField, dryRun: dryRunField },
     },
     async ({ amount, market, confirm, dryRun }) => {
       const amountRaw = parseUsdg(amount);
       const cap = parseUsdg(ctx.config.maxDepositUsdg);
       if (amountRaw > cap) return fail(`amount ${amount} exceeds HEDGEHOOD_MAX_DEPOSIT ${ctx.config.maxDepositUsdg} USDG`);
-      const payer = ctx.owner ?? ctx.session;
+      const payer = x402Payer(ctx);
       if (!payer) return fail("no key to pay with");
       const dry = dryRun ?? ctx.config.dryRunDefault;
       if (!confirm) return json({ ok: false, needsConfirm: true, wouldDo: `pay ${amount} USDG from ${payer.address} to the gateway, credited to ${ctx.account}`, dryRun: dry });

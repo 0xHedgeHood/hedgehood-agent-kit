@@ -7,5 +7,5 @@ export default defineConfig({
       "@hedgehood-io/mcp": fileURLToPath(new URL("../mcp/src/index.ts", import.meta.url)),
     },
   },
-  test: { include: ["test/**/*.test.ts"] },
+  test: { include: ["test/**/*.test.ts"], env: { HEDGEHOOD_CONFIG: "off" } },
 });
